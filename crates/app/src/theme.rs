@@ -43,7 +43,32 @@ impl Colors {
 }
 
 /// 任务栏是否浅色主题（注册表 AppsUseLightTheme）。
+///
+/// 绘制路径上每帧都会问一次（动画时 60fps），注册表读一次要几十微秒，
+/// 这里缓存 2 秒：主题切换最多慢 2 秒生效，但省掉每帧一次 RegGetValueW。
 pub fn taskbar_is_light() -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const TTL: Duration = Duration::from_secs(2);
+
+    static CACHE: OnceLock<Mutex<(bool, Instant)>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new((true, Instant::now() - TTL)));
+
+    if let Ok(mut guard) = cell.lock() {
+        if guard.1.elapsed() < TTL {
+            return guard.0;
+        }
+
+        let value = read_theme();
+        *guard = (value, Instant::now());
+        return value;
+    }
+
+    read_theme()
+}
+
+fn read_theme() -> bool {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
     let name = wide("AppsUseLightTheme");
     let mut value: u32 = 1;
@@ -61,7 +86,7 @@ pub fn taskbar_is_light() -> bool {
         )
     };
 
-    // debug: ("registry status={status} value={value}"));
+    // debug: ("registry status={status} value={value}")); 
     status == 0 && value == 1
 }
 

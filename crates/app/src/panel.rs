@@ -1,4 +1,4 @@
-﻿//! 任务栏子窗口面板：GDI 绘制、视图切换、指示条。
+//! 任务栏子窗口面板：GDI 绘制、视图切换、指示条。
 
 use netspeed_core::ai::{
     format_speed as format_ai_speed, format_tokens, AiEngine, AiSnapshot, Sources,
@@ -76,6 +76,10 @@ pub struct Panel {
     last_anim: std::time::Instant,
     /// 上一次真正采样/重绘的时间（用来按设置的间隔限流）
     last_refresh: std::time::Instant,
+    /// 任务栏底色缓存：每帧 8 次 GetPixel 读屏没必要，位置没变就复用
+    bg_color: u32,
+    bg_rect: (i32, i32, i32, i32),
+    bg_at: std::time::Instant,
 }
 
 impl Panel {
@@ -116,6 +120,9 @@ impl Panel {
             gauge_target: 0.0,
             last_anim: std::time::Instant::now(),
             last_refresh: std::time::Instant::now(),
+            bg_color: 0,
+            bg_rect: (0, 0, 0, 0),
+            bg_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
         };
 
         panel.ensure_buffer();
@@ -478,63 +485,37 @@ impl Panel {
         }
     }
 
-    /// 采样任务栏背景色，让面板“融进”任务栏；顺带用亮度判断明暗主题，
-    /// 比读注册表更可靠（注册表读取在某些精简系统上会失败）。
-    fn sample_background(&mut self) {
-        unsafe {
-            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            GetWindowRect(self.hwnd, &mut rect);
-            let screen = GetDC(std::ptr::null_mut());
-            if screen.is_null() {
-                return;
-            }
-
-            let y = (rect.top + rect.bottom) / 2;
-            let mut pixel = u32::MAX;
-            // 往左找一段任务栏底色（避开图标）
-            for step in [12, 24, 40, 60, 90] {
-                let x = (rect.left - step).max(2);
-                let candidate = GetPixel(screen, x, y);
-                if candidate != u32::MAX && candidate != 0xFFFF_FFFF {
-                    pixel = candidate;
-                    break;
-                }
-            }
-
-            ReleaseDC(std::ptr::null_mut(), screen);
-            if pixel == u32::MAX || pixel == 0xFFFF_FFFF {
-                return;
-            }
-
-            // 主题以注册表为准；采样只用来微调底色，避免采到图标导致整块变黑/变白
-            let light = taskbar_is_light();
-            let standard = if light { 0x00F3F3F3 } else { 0x001F1F1F };
-            let r = (pixel & 0xFF) as f32;
-            let g = ((pixel >> 8) & 0xFF) as f32;
-            let b = ((pixel >> 16) & 0xFF) as f32;
-            let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-            let plausible = if light { luminance > 150.0 } else { luminance < 110.0 };
-            self.colors = Colors::for_theme(light, if plausible { pixel } else { standard });
-        }
-    }
-
     /// 分层窗口：把背缓冲整块推给 DWM（不依赖 WM_PAINT，任务栏重绘也刷不掉）。
     pub fn paint(&mut self) {
-        unsafe {
-            self.render(std::ptr::null_mut());
-        }
+        self.render(std::ptr::null_mut());
     }
 
     /// 画到任意 DC：WM_PAINT 和 WM_PRINTCLIENT（截图/打印）共用。
     pub fn render(&mut self, hdc: HDC) {
         unsafe {
             self.ensure_buffer();
-            // 采样任务栏底色（取面板左右两侧的空隙，避开图标）
+            // 采样任务栏底色（取面板左右两侧的空隙，避开图标）。
+            // 动画时一帧一次太亏：位置没变就复用 2 秒内的结果（主题切换靠 TTL 兜底）
+            let mut frame = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetWindowRect(self.hwnd, &mut frame);
+            let key = (frame.left, frame.top, frame.right, frame.bottom);
+            let now = std::time::Instant::now();
+            if key != self.bg_rect || now.duration_since(self.bg_at).as_secs() >= 2 {
+                let light = taskbar_is_light();
+                let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
+                self.bg_color = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
+                self.bg_rect = key;
+                self.bg_at = now;
+            }
+
             let light = taskbar_is_light();
-            let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
-            let background = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
-            if self.colors.background != background {
-                self.colors = Colors::for_theme(light, background);
+            if self.colors.background != self.bg_color {
+                self.colors = Colors::for_theme(light, self.bg_color);
             }
 
 
@@ -892,16 +873,44 @@ impl AiWorker {
 
         std::thread::spawn(move || {
             let mut engine = AiEngine::new(sources);
+            // 排查采集开销用：设了 NST_AI_PROFILE 就每 10 秒往调试日志写一次均值
+            let profile = std::env::var_os("NST_AI_PROFILE").is_some();
+            let mut polls = 0_u32;
+            let mut total_us = 0_u128;
+            let mut max_us = 0_u128;
+            let mut last_report = std::time::Instant::now();
+
             while !stop.load(Ordering::Relaxed) {
                 let now = netspeed_core::ai::now_ms();
+                let started = std::time::Instant::now();
                 engine.poll(now);
+                let cost = started.elapsed().as_micros();
                 let next = engine.snapshot(now);
+
+                if profile {
+                    polls += 1;
+                    total_us += cost;
+                    max_us = max_us.max(cost);
+                    if last_report.elapsed().as_secs() >= 10 {
+                        crate::debug_log(&format!(
+                            "ai poll avg={}us max={}us n={polls}",
+                            total_us / polls.max(1) as u128,
+                            max_us
+                        ));
+                        polls = 0;
+                        total_us = 0;
+                        max_us = 0;
+                        last_report = std::time::Instant::now();
+                    }
+                }
 
                 if let Ok(mut slot) = snapshot.lock() {
                     *slot = next;
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(700));
+                // 在生成就 700ms 一轮（速度跟手），空闲退到 1.5s（少唤醒几次 CPU）
+                let busy = next.generating || next.speed > 0.0;
+                std::thread::sleep(std::time::Duration::from_millis(if busy { 700 } else { 1500 }));
             }
         });
 

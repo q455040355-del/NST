@@ -15,7 +15,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, HICON, ICONINFO,
 };
 
-const SIZE: i32 = 32;
 /// 每个像素 8×8 超采样（抗锯齿够用，启动时只算一次）
 const SS: i32 = 8;
 
@@ -78,13 +77,13 @@ fn in_badge(px: f64, py: f64) -> bool {
 }
 
 /// 算出一整张 32bpp BGRA（自上而下）像素表
-fn render() -> Vec<u8> {
-    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+fn render(size: i32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
     let samples = (SS * SS) as f64;
     let half_stroke = STROKE / 2.0;
 
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    for y in 0..size {
+        for x in 0..size {
             let mut r = 0.0;
             let mut g = 0.0;
             let mut b = 0.0;
@@ -92,8 +91,8 @@ fn render() -> Vec<u8> {
 
             for sy in 0..SS {
                 for sx in 0..SS {
-                    let px = (x as f64 + (sx as f64 + 0.5) / SS as f64) / SIZE as f64;
-                    let py = (y as f64 + (sy as f64 + 0.5) / SS as f64) / SIZE as f64;
+                    let px = (x as f64 + (sx as f64 + 0.5) / SS as f64) / size as f64;
+                    let py = (y as f64 + (sy as f64 + 0.5) / SS as f64) / size as f64;
                     if !in_badge(px, py) {
                         continue;
                     }
@@ -121,7 +120,7 @@ fn render() -> Vec<u8> {
                 }
             }
 
-            let index = ((y * SIZE + x) * 4) as usize;
+            let index = ((y * size + x) * 4) as usize;
             if cover == 0.0 {
                 continue;
             }
@@ -136,12 +135,12 @@ fn render() -> Vec<u8> {
 }
 
 /// 单色 mask：透明处为 1（bit 顺序和 GDI 一致，每行按字节对齐）
-fn render_mask(pixels: &[u8]) -> Vec<u8> {
-    let stride = ((SIZE + 7) / 8) as usize;
-    let mut mask = vec![0u8; stride * SIZE as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let alpha = pixels[((y * SIZE + x) * 4 + 3) as usize];
+fn render_mask(pixels: &[u8], size: i32) -> Vec<u8> {
+    let stride = ((size + 7) / 8) as usize;
+    let mut mask = vec![0u8; stride * size as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let alpha = pixels[((y * size + x) * 4 + 3) as usize];
             if alpha == 0 {
                 let byte = (y as usize) * stride + (x as usize) / 8;
                 mask[byte] |= 0x80 >> (x % 8);
@@ -151,7 +150,27 @@ fn render_mask(pixels: &[u8]) -> Vec<u8> {
     mask
 }
 
+/// 图标尺寸：窗口图标用 32，托盘按系统的小图标尺寸出图
+const DEFAULT_SIZE: i32 = 32;
+
 pub fn create_icon() -> HICON {
+    create_at(DEFAULT_SIZE)
+}
+
+/// 托盘图标：按 `SM_CXSMICON` 出图。
+///
+/// 以前只有 32×32 一张，150% 缩放时托盘要 24×24，靠系统缩放会糊；
+/// 现在直接按目标尺寸算像素（设计坐标是 0..1 归一化的，换尺寸不用改参数）。
+pub fn create_tray_icon() -> HICON {
+    let size = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+        )
+    };
+    create_at(size.clamp(16, DEFAULT_SIZE))
+}
+
+fn create_at(size: i32) -> HICON {
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -162,8 +181,8 @@ pub fn create_icon() -> HICON {
 
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = SIZE;
-        info.bmiHeader.biHeight = -SIZE; // top-down
+        info.bmiHeader.biWidth = size;
+        info.bmiHeader.biHeight = -size; // top-down
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = 0;
@@ -176,17 +195,17 @@ pub fn create_icon() -> HICON {
             return std::ptr::null_mut();
         }
 
-        let pixels = render();
+        let pixels = render(size);
         std::ptr::copy_nonoverlapping(
             pixels.as_ptr(),
             bits as *mut u8,
             pixels.len(),
         );
 
-        let mask_bits = render_mask(&pixels);
+        let mask_bits = render_mask(&pixels, size);
         let mask = CreateBitmap(
-            SIZE,
-            SIZE,
+            size,
+            size,
             1,
             1,
             mask_bits.as_ptr() as *const std::ffi::c_void,

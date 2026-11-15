@@ -6,7 +6,7 @@
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub const SOURCE_OPENCODE: &str = "opencode";
@@ -114,7 +114,11 @@ pub fn load_opencode() -> Vec<UsageRecord> {
     records
 }
 
-/// 读文件来源（DSH / WorkBuddy），可能要几秒到几十秒，放在第二批。
+/// 读文件来源（DSH / WorkBuddy）。
+///
+/// 13,000+ 个文件、3 GB，全量解析要二三十秒。所以这里落一个磁盘索引：
+/// 路径 → (mtime, 长度, 该文件的全部记录)。没变过的文件直接复用上次结果，
+/// 变过的才重新解析；解析按 CPU 核心数并行（文件大小差异大，按字节数装箱分配）。
 pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
     let now = super::ai::now_ms();
     let from_ms = if days <= 0 {
@@ -122,13 +126,331 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
     } else {
         super::ai::local_midnight_ms(now) - (days - 1) * DAY_MS
     };
+    let min_day = super::ai::day_index(from_ms) - 1;
 
-    let mut records = Vec::new();
     let home = home_dir();
-    load_files(&mut records, &home.join(".dsh").join("sessions"), "zstd", SOURCE_DSH, from_ms);
-    load_files(&mut records, &home.join(".workbuddy").join("projects"), "jsonl", SOURCE_WORKBUDDY, from_ms);
-    load_files(&mut records, &home.join(".workbuddy-ai").join("projects"), "jsonl", SOURCE_WORKBUDDY_AI, from_ms);
-    records
+    let roots = [
+        (home.join(".dsh").join("sessions"), "zstd", SOURCE_DSH),
+        (home.join(".workbuddy").join("projects"), "jsonl", SOURCE_WORKBUDDY),
+        (home.join(".workbuddy-ai").join("projects"), "jsonl", SOURCE_WORKBUDDY_AI),
+    ];
+
+    // (路径, (mtime, 长度), 后缀, 来源)
+    let mut files: Vec<(PathBuf, (u64, u64), &'static str, &'static str)> = Vec::new();
+    for (root, suffix, source) in roots {
+        if !root.exists() {
+            continue;
+        }
+
+        files.extend(
+            collect_stamped(&root, suffix, from_ms - DAY_MS)
+                .into_iter()
+                .map(|(path, stamp)| (path, stamp, suffix, source)),
+        );
+    }
+
+    // 1) 索引里还新鲜的文件直接复用
+    let mut index = Index::load();
+    let mut entries: Vec<(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)> = Vec::new();
+    let mut todo: Vec<(PathBuf, (u64, u64), &'static str, &'static str)> = Vec::new();
+    // 有文件是新出现或变过的才值得重写索引（12 MB 写一遍 200ms+）
+    let mut dirty = false;
+
+    for (path, stamp, suffix, source) in files {
+        match index.take(&path, stamp, source) {
+            Some(records) => entries.push((path, stamp, source, records)),
+            None => {
+                dirty = true;
+                todo.push((path, stamp, suffix, source));
+            }
+        }
+    }
+
+    // 2) 剩下的并行解析
+    if !todo.is_empty() {
+        let workers = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4)
+            .clamp(1, 8);
+
+        // 按文件大小装箱：大文件先放，尽量让每个线程的总字节数接近
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); workers];
+        let mut load = vec![0_u64; workers];
+        let mut order: Vec<usize> = (0..todo.len()).collect();
+        order.sort_by_key(|index| std::cmp::Reverse(todo[*index].1 .1));
+        for index in order {
+            let target = load
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, bytes)| **bytes)
+                .map(|(slot, _)| slot)
+                .unwrap_or(0);
+            load[target] += todo[index].1 .1.max(1);
+            buckets[target].push(index);
+        }
+
+        let mut parsed: Vec<Option<Vec<UsageRecord>>> = vec![None; todo.len()];
+        let todo_ref = &todo;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for bucket in &buckets {
+                handles.push(scope.spawn(move || {
+                    bucket
+                        .iter()
+                        .map(|&slot| {
+                            let (path, _, suffix, source) = &todo_ref[slot];
+                            let records = if *suffix == "zstd" {
+                                parse_dsh(path, source)
+                            } else {
+                                parse_workbuddy(path, source)
+                            };
+                            (slot, records)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+
+            for handle in handles {
+                if let Ok(part) = handle.join() {
+                    for (slot, records) in part {
+                        parsed[slot] = Some(records);
+                    }
+                }
+            }
+        });
+
+        for (slot, (path, stamp, _, source)) in todo.into_iter().enumerate() {
+            let records = parsed[slot].take().unwrap_or_default();
+            entries.push((path, stamp, source, records));
+        }
+    }
+
+    // 3) 先把索引写回去（下次打开就只剩目录扫描），再按天数过滤出结果
+    if dirty {
+        Index::save(&entries);
+    }
+
+    let mut out = Vec::new();
+    for (_, _, _, records) in entries {
+        for record in records {
+            if record.day >= min_day {
+                out.push(record);
+            }
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------ 磁盘索引
+
+const INDEX_VERSION: u32 = 1;
+const INDEX_MAGIC: &[u8; 4] = b"NSUI";
+
+struct IndexEntry {
+    stamp: (u64, u64),
+    source: &'static str,
+    records: Vec<UsageRecord>,
+}
+
+/// 假设索引文件没坏时的样子；读失败就当空的（退化成全量解析）
+struct Index {
+    entries: HashMap<PathBuf, IndexEntry>,
+}
+
+impl Index {
+    fn path() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|dir| PathBuf::from(dir).join("NetSpeedTaskbar").join("usage-index.bin"))
+    }
+
+    fn load() -> Self {
+        let mut entries = HashMap::new();
+        if let Some(path) = Self::path() {
+            if let Ok(loaded) = read_index(&path) {
+                entries = loaded;
+            }
+        }
+        Self { entries }
+    }
+
+    /// 取出一个文件的记录：mtime、长度、来源都对得上才算新鲜
+    fn take(&mut self, path: &Path, stamp: (u64, u64), source: &'static str) -> Option<Vec<UsageRecord>> {
+        let entry = self.entries.remove(path)?;
+        if entry.stamp != stamp || entry.source != source {
+            return None;
+        }
+        Some(entry.records)
+    }
+
+    fn save(entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)]) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // 先写临时文件再改名：写一半崩掉也不会留下坏索引
+        let temp = path.with_extension("bin.tmp");
+        let Ok(file) = std::fs::File::create(&temp) else {
+            return;
+        };
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        if write_index(&mut writer, entries).is_ok() {
+            use std::io::Write;
+            let _ = writer.flush();
+            drop(writer);
+            let _ = std::fs::rename(&temp, &path);
+        } else {
+            drop(writer);
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+}
+
+fn source_code(source: &str) -> u8 {
+    match source {
+        SOURCE_DSH => 1,
+        SOURCE_WORKBUDDY => 2,
+        SOURCE_WORKBUDDY_AI => 3,
+        _ => 0,
+    }
+}
+
+fn source_of_code(code: u8) -> &'static str {
+    match code {
+        1 => SOURCE_DSH,
+        2 => SOURCE_WORKBUDDY,
+        3 => SOURCE_WORKBUDDY_AI,
+        _ => SOURCE_OPENCODE,
+    }
+}
+
+fn write_index(
+    writer: &mut impl std::io::Write,
+    entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)],
+) -> std::io::Result<()> {
+    writer.write_all(INDEX_MAGIC)?;
+    put_u32(writer, INDEX_VERSION)?;
+    put_u32(writer, entries.len() as u32)?;
+
+    for (path, stamp, source, records) in entries {
+        put_u8(writer, source_code(source))?;
+        put_str(writer, &path.to_string_lossy())?;
+        put_u64(writer, stamp.0)?;
+        put_u64(writer, stamp.1)?;
+        put_u32(writer, records.len() as u32)?;
+
+        for record in records {
+            put_i64(writer, record.day)?;
+            put_u8(writer, record.hour)?;
+            put_str(writer, &record.model)?;
+            put_i64(writer, record.output)?;
+            put_i64(writer, record.input)?;
+            put_i64(writer, record.cache_read)?;
+            put_i64(writer, record.duration_ms)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn read_index(path: &Path) -> std::io::Result<HashMap<PathBuf, IndexEntry>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != INDEX_MAGIC {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "magic"));
+    }
+    if get_u32(&mut reader)? != INDEX_VERSION {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "version"));
+    }
+
+    let count = get_u32(&mut reader)? as usize;
+    let mut entries = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let source = source_of_code(get_u8(&mut reader)?);
+        let path = PathBuf::from(get_str(&mut reader)?);
+        let stamp = (get_u64(&mut reader)?, get_u64(&mut reader)?);
+        let record_count = get_u32(&mut reader)? as usize;
+
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            records.push(UsageRecord {
+                day: get_i64(&mut reader)?,
+                hour: get_u8(&mut reader)?,
+                source,
+                model: get_str(&mut reader)?,
+                output: get_i64(&mut reader)?,
+                input: get_i64(&mut reader)?,
+                cache_read: get_i64(&mut reader)?,
+                duration_ms: get_i64(&mut reader)?,
+            });
+        }
+
+        entries.insert(path, IndexEntry { stamp, source, records });
+    }
+
+    Ok(entries)
+}
+
+fn put_u8(writer: &mut impl std::io::Write, value: u8) -> std::io::Result<()> {
+    writer.write_all(&[value])
+}
+
+fn put_u32(writer: &mut impl std::io::Write, value: u32) -> std::io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn put_u64(writer: &mut impl std::io::Write, value: u64) -> std::io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn put_i64(writer: &mut impl std::io::Write, value: i64) -> std::io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn put_str(writer: &mut impl std::io::Write, value: &str) -> std::io::Result<()> {
+    let bytes = value.as_bytes();
+    put_u32(writer, bytes.len() as u32)?;
+    writer.write_all(bytes)
+}
+
+fn get_u8(reader: &mut impl std::io::Read) -> std::io::Result<u8> {
+    let mut buf = [0_u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn get_u32(reader: &mut impl std::io::Read) -> std::io::Result<u32> {
+    let mut buf = [0_u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn get_u64(reader: &mut impl std::io::Read) -> std::io::Result<u64> {
+    let mut buf = [0_u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn get_i64(reader: &mut impl std::io::Read) -> std::io::Result<i64> {
+    let mut buf = [0_u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(i64::from_le_bytes(buf))
+}
+
+fn get_str(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    let len = get_u32(reader)? as usize;
+    // 防御坏文件：单条字符串上限 1 MB
+    if len > 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "string too long"));
+    }
+    let mut buf = vec![0_u8; len];
+    reader.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// 读取最近 `days` 天的记录（days <= 0 表示全部）。
@@ -193,72 +515,10 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
     }
 }
 
-fn load_files(
-    records: &mut Vec<UsageRecord>,
-    root: &Path,
-    suffix: &str,
-    source: &'static str,
-    from_ms: i64,
-) {
-    if !root.exists() {
-        return;
-    }
-
-    for path in collect_files(root, suffix, from_ms - DAY_MS) {
-        let parsed = match suffix {
-            "zstd" => parse_dsh(&path, source),
-            _ => parse_workbuddy(&path, source),
-        };
-
-        for record in parsed {
-            if record.day >= super::ai::day_index(from_ms) - 1 {
-                records.push(record);
-            }
-        }
-    }
-}
-
-pub(crate) fn collect_files(root: &Path, suffix: &str, modified_after_ms: i64) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-
-            if !path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case(suffix))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let modified = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(0);
-
-            if modified < modified_after_ms {
-                continue;
-            }
-
-            result.push(path);
-        }
-    }
-
-    result
+/// 遍历目录，返回 (路径, (mtime 秒, 长度))：索引比对和过滤都要用。
+fn collect_stamped(root: &Path, suffix: &str, modified_after_ms: i64) -> Vec<(PathBuf, (u64, u64))> {
+    // 和 AI 采集共用同一套目录枚举（一次拿齐元数据，见 ai::walk_files）
+    super::ai::walk_files(root, suffix, modified_after_ms)
 }
 
 fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
@@ -266,33 +526,27 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
         return Vec::new();
     };
 
-    let Ok(mut decoder) = ruzstd::decoding::StreamingDecoder::new(file) else {
+    let Ok(decoder) = ruzstd::decoding::StreamingDecoder::new(file) else {
         return Vec::new();
     };
 
-    let mut text = Vec::new();
-    if decoder.read_to_end(&mut text).is_err() {
-        return Vec::new();
-    }
-
-    let text = String::from_utf8_lossy(&text);
     let mut records = Vec::new();
     let mut pending_start = 0_i64;
 
-    for line in text.lines() {
+    for_each_line(BufReader::new(decoder), |line| {
         if line.contains("\"step/start\"") {
             if let Ok(value) = serde_json::from_str::<Value>(line) {
                 pending_start = value["time"].as_i64().unwrap_or(0);
             }
-            continue;
+            return;
         }
 
         if !line.contains("\"assistant/message\"") {
-            continue;
+            return;
         }
 
         let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return;
         };
 
         let usage = &value["data"]["usage"];
@@ -302,7 +556,7 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             + cache_read
             + usage["cacheWriteTokens"].as_i64().unwrap_or(0);
         if output <= 0 && input <= 0 {
-            continue;
+            return;
         }
 
         let time = value["time"].as_i64().unwrap_or(0);
@@ -327,31 +581,31 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
         });
 
         pending_start = 0;
-    }
+    });
 
     records
 }
 
 fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
 
     let mut map: HashMap<String, UsageRecord> = HashMap::new();
     let mut last_ts = 0_i64;
 
-    for line in text.lines() {
+    for_each_line(BufReader::new(file), |line| {
         if !line.contains("\"rawUsage\"") || line.contains("\"isPartialAborted\":true") {
-            continue;
+            return;
         }
 
         let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return;
         };
 
         let provider = &value["providerData"];
         let Some(message_id) = provider["messageId"].as_str() else {
-            continue;
+            return;
         };
 
         let raw = &provider["rawUsage"];
@@ -363,7 +617,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             .or_else(|| raw["cache_read_input_tokens"].as_i64())
             .unwrap_or(0);
         if output <= 0 && input <= 0 {
-            continue;
+            return;
         }
 
         let timestamp = value["timestamp"].as_i64().unwrap_or(0);
@@ -411,9 +665,26 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
         if timestamp > last_ts {
             last_ts = timestamp;
         }
-    }
+    });
 
     map.into_values().collect()
+}
+
+/// 逐行读文件（流式）：每个文件最多只占「一行」的内存，坏字节只影响一行
+fn for_each_line<R: BufRead>(mut reader: R, mut visit: impl FnMut(&str)) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buf.len() > super::ai::MAX_LINE {
+            continue;
+        }
+        let line = super::ai::trim_line(&buf);
+        visit(line.as_ref());
+    }
 }
 
 fn home_dir() -> PathBuf {

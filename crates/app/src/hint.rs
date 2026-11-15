@@ -118,13 +118,31 @@ pub fn visible() -> bool {
 }
 
 fn measure(text: &str, scale: f32) -> (i32, i32) {
-    unsafe {
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<Option<(String, i32, i32)>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(guard) = cell.lock() {
+        if let Some((cached, width, height)) = guard.as_ref() {
+            if cached == text {
+                return (*width, *height);
+            }
+        }
+    }
+
+    let size = unsafe {
         let screen = GetDC(std::ptr::null_mut());
         let p = Painter::new(screen, scale);
         let width = p.text_width(text, font(9.5, 400, scale)) + ui::s(PAD_X * 2.0, scale);
         ReleaseDC(std::ptr::null_mut(), screen);
         (width.max(ui::s(40.0, scale)), ui::s(HEIGHT, scale))
+    };
+
+    if let Ok(mut guard) = cell.lock() {
+        *guard = Some((text.to_string(), size.0, size.1));
     }
+    size
 }
 
 /// 在 `anchor`（屏幕坐标，一般传面板的窗口矩形）上方显示气泡；重复调用只更新内容。
@@ -155,7 +173,25 @@ pub unsafe fn show(anchor: RECT, text: &str) {
     }
 
     if !HINT.is_null() && IsWindow(HINT) != 0 {
+        // 鼠标在指示条上每移动一像素都会调进来：文字和位置都没变就别折腾窗口
+        let mut current = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(HINT, &mut current);
         let state = state_of(HINT);
+        let same_text = !state.is_null() && (*state).text == text;
+        if same_text
+            && current.left == left
+            && current.top == top
+            && current.right - current.left == width
+            && current.bottom - current.top == height
+        {
+            return;
+        }
+
         if !state.is_null() {
             (*state).text = text.to_string();
         }

@@ -1,15 +1,69 @@
-﻿//! 温度与功耗：CPU 走 WMI 热区，GPU 走 `nvidia-smi --loop`。
+//! 温度与功耗：CPU 走 WMI 热区，GPU 走 `nvidia-smi --loop`。
 //!
 //! 两个采集都在后台线程，UI 只读缓存值；超过 15 秒没更新就当无效（显示 `--`）。
 
 use std::io::{BufRead, BufReader};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JobObjectExtendedLimitInformation,
+};
+
 const STALE_AFTER: Duration = Duration::from_secs(15);
+
+/// 子进程闸门（Job Object，`KILL_ON_JOB_CLOSE`）。
+///
+/// nvidia-smi 是常驻子进程；以前退出时 `WM_DESTROY` 直接 `process::exit`，
+/// 后台线程根本走不到 `child.kill()`，于是每次退出都留一个 nvidia-smi
+/// 在后台每秒唤醒查 GPU（实测攒了 27 个）。
+///
+/// 挂进 Job 之后，本进程的句柄表无论怎么没的（正常退出 / 强杀 / 崩溃），
+/// 系统都会关闭 Job 句柄并连带杀掉里面所有子进程。
+struct ChildJob(*mut std::ffi::c_void);
+
+impl ChildJob {
+    fn new() -> Option<Self> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                CloseHandle(job);
+                return None;
+            }
+
+            Some(Self(job))
+        }
+    }
+
+    fn adopt(&self, child: &std::process::Child) -> bool {
+        unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as *mut std::ffi::c_void) != 0 }
+    }
+}
+
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TemperatureSnapshot {
@@ -145,6 +199,9 @@ fn query_cpu(connection: &wmi::WMIConnection) -> Option<f64> {
 
 fn spawn_gpu_reader(slot: Arc<Mutex<Reading>>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
+        // 先建 Job：子进程一 spawn 就挂进去，退出时系统连带清理
+        let job = ChildJob::new();
+
         // nvidia-smi 自己每秒输出一行，比反复起进程便宜
         let mut child = Command::new("nvidia-smi.exe")
             .args([
@@ -175,7 +232,13 @@ fn spawn_gpu_reader(slot: Arc<Mutex<Reading>>, stop: Arc<AtomicBool>) {
             return;
         };
 
+        if let Some(job) = job.as_ref() {
+            job.adopt(&child);
+        }
+
         let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
             return;
         };
 
@@ -211,6 +274,9 @@ fn spawn_gpu_reader(slot: Arc<Mutex<Reading>>, stop: Arc<AtomicBool>) {
         }
 
         let _ = child.kill();
+        let _ = child.wait();
+        // job 在这里 drop → 关句柄，子进程（如果还活着）被系统一并杀掉
+        drop(job);
     });
 }
 

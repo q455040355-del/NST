@@ -67,11 +67,26 @@ static mut HIDDEN_BY_USER: bool = false;
 
 /// 指示条动画是否在跑（ticker 线程看它决定推不推帧）
 static ANIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 叫醒 ticker 线程用（它空闲时会睡到下一个采样点）
+static TICK_WAKE: std::sync::OnceLock<(std::sync::Mutex<()>, std::sync::Condvar)> =
+    std::sync::OnceLock::new();
 /// 是否已经向系统登记了 WM_MOUSELEAVE
 static mut TRACKING_LEAVE: bool = false;
 
+fn tick_wake() -> &'static (std::sync::Mutex<()>, std::sync::Condvar) {
+    TICK_WAKE.get_or_init(|| (std::sync::Mutex::new(()), std::sync::Condvar::new()))
+}
+
 pub(crate) fn request_anim(active: bool) {
-    ANIM_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+    let was = ANIM_ACTIVE.swap(active, std::sync::atomic::Ordering::Relaxed);
+    if active && !was {
+        // ticker 空闲时睡到下一个采样点（最长 500ms）：这里直接叫醒它，
+        // 否则动画要白等半秒才起步
+        let (lock, wake) = tick_wake();
+        if let Ok(_guard) = lock.lock() {
+            wake.notify_all();
+        }
+    }
 }
 
 // 拖动面板（左键按住移动）：记起点和窗口原位，超过 3px 才算拖动
@@ -220,6 +235,12 @@ fn scale_for_dpi(value: i32) -> i32 {
 
 /// 顶层置顶窗口不用改 z 序，这里只负责跟随任务栏位置（任务栏可能移动/改尺寸）。
 fn keep_on_top(hwnd: HWND) {
+    // 每 500ms 的 tick 都会进来：完整的 FindWindow + 两次 GetWindowRect 不必这么勤，
+    // 2 秒对一次就够跟上任务栏移动/DPI 变化
+    if !place_due() {
+        return;
+    }
+
     unsafe {
         // 没手动拖过（PanelX = -1）才跟着托盘自动对齐；拖过之后只做 TOPMOST
         let saved_x = panel_mut(hwnd).map(|panel| panel.settings.panel_x).unwrap_or(-1);
@@ -293,6 +314,25 @@ fn keep_on_top(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+}
+
+/// 是否到了重新定位面板的时间（2 秒一次）
+fn place_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    let start = START.get_or_init(std::time::Instant::now);
+    let now = start.elapsed().as_millis() as u64;
+    let last = LAST.load(Ordering::Relaxed);
+    if last != u64::MAX && now.saturating_sub(last) < 2000 {
+        return false;
+    }
+
+    LAST.store(now, Ordering::Relaxed);
+    true
 }
 
 /// 面板在任务栏里的纵向位置。
@@ -414,15 +454,32 @@ fn start_ticker(hwnd: HWND) {
     std::thread::spawn(move || {
         // 采样还是 500ms 一次；指示条动画在跑的时候按 ~60fps 推帧。
         // （本进程 SetTimer/WM_TIMER 实测完全收不到，只能靠线程投递。）
+        //
+        // 空闲时直接等到下一个采样点（以前固定每 50ms 醒一次，
+        // 一天白醒 170 万次，笔记本上纯属浪费电）。有动画要启动时
+        // request_anim 会 notify 立刻把它叫醒。
+        let (lock, wake) = tick_wake();
         let mut last_tick = std::time::Instant::now();
         loop {
             let animating = ANIM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(if animating { 16 } else { 50 }));
+            let timeout = if animating {
+                std::time::Duration::from_millis(16)
+            } else {
+                std::time::Duration::from_millis(500)
+                    .saturating_sub(last_tick.elapsed())
+                    .max(std::time::Duration::from_millis(20))
+            };
+
+            if let Ok(guard) = lock.lock() {
+                let _ = wake.wait_timeout(guard, timeout);
+            }
+
             unsafe {
                 let target = handle as HWND;
                 if IsWindow(target) == 0 {
                     break;
                 }
+                let animating = ANIM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
                 if animating && PostMessageW(target, WM_APP_ANIM, 0, 0) == 0 {
                     break;
                 }
@@ -857,7 +914,7 @@ fn copy_wide(target: &mut [u16], text: &str) {
 
 fn add_tray(hwnd: HWND) {
     unsafe {
-        let icon = tray::create_icon();
+        let icon = tray::create_tray_icon();
         TRAY_ICON = icon;
 
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();

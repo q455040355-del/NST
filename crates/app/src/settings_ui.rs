@@ -12,9 +12,10 @@ use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection, CreateFontW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    InvalidateRect, LineTo, MoveToEx, ReleaseDC, RoundRect, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
+    InvalidateRect, IntersectClipRect, LineTo, MoveToEx, ReleaseDC, RestoreDC, RoundRect, SaveDC,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetViewportOrgEx, UpdateWindow,
+    BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -75,6 +76,13 @@ const AI_TOGGLE_TOP: f32 = 428.0; // 总开关行
 const AI_SOURCES_TOP: f32 = 470.0; // 四个来源行起点
 const AI_ROW_H: f32 = 42.0;
 const AI_SOURCE_LABELS: [&str; 4] = ["OpenCode", "dsh", "WorkBuddy", "WorkBuddy AI"];
+
+/// 可滚动内容区：分隔线往下到页脚分割线往上
+const CONTENT_TOP: f32 = 65.0;
+/// 内容总高度（最后一个来源行 + 一点留白）；窗口比这个矮就出现滚动
+const CONTENT_BOTTOM: f32 = 646.0;
+/// 页脚（分割线 + 完成按钮）高度
+const FOOTER_H: f32 = 64.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
@@ -318,6 +326,8 @@ struct State {
     scale: f32,
     hover: Option<Hit>,
     slider_drag: bool,
+    /// 内容区滚动位置（像素，0 = 顶部）
+    scroll: i32,
     popup: HWND,
 }
 
@@ -422,6 +432,20 @@ fn ai_source_rects(scale: f32, right: i32) -> [RECT; 4] {
 
 fn contains(rect: &RECT, point: POINT) -> bool {
     point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+/// 内容区在窗口里的可见范围（页头分隔线和页脚分割线之间）
+fn content_viewport(state: &State, client: RECT) -> (i32, i32) {
+    let top = s(CONTENT_TOP, state.scale);
+    let bottom = (client.bottom - s(FOOTER_H, state.scale)).max(top);
+    (top, bottom)
+}
+
+/// 最多能往下滚多少像素
+fn max_scroll(state: &State, client: RECT) -> i32 {
+    let (top, bottom) = content_viewport(state, client);
+    let content = s(CONTENT_BOTTOM - CONTENT_TOP, state.scale);
+    (content - (bottom - top)).max(0)
 }
 
 fn state_of(hwnd: HWND) -> *mut State {
@@ -549,6 +573,27 @@ unsafe fn paint(hwnd: HWND) {
 
     // 顶部分割线
     p.fill(0, p.s(64.0), client.right, p.s(65.0), BORDER);
+
+    // ---------------------------------------------------------------- 可滚动内容
+    //
+    // 窗口比内容矮时（小屏 / 高缩放）只滚中间这一段：页头（标题、×）和
+    // 页脚（完成按钮）固定不动。用 GDI 的视口原点做平移，画图函数里的
+    // 坐标还是「未滚动」的绝对值，裁剪区负责把超出部分切掉。
+    let (view_top, view_bottom) = content_viewport(state, client);
+    let max = max_scroll(state, client);
+    if state.scroll > max {
+        state.scroll = max;
+    }
+    if state.scroll < 0 {
+        state.scroll = 0;
+    }
+    let scroll = state.scroll;
+
+    let saved = SaveDC(dc);
+    if saved != 0 {
+        IntersectClipRect(dc, 0, view_top, client.right, view_bottom);
+        SetViewportOrgEx(dc, 0, -scroll, std::ptr::null_mut());
+    }
 
     // 行
     for row in 0..ROW_COUNT {
@@ -823,6 +868,44 @@ unsafe fn paint(hwnd: HWND) {
                 p.s(1.6),
             );
         }
+    }
+
+    // 内容区结束：恢复裁剪和原点，页脚固定在底部
+    if saved != 0 {
+        RestoreDC(dc, saved);
+    }
+
+    // 滚动条（只有在内容放不下时才出现）
+    if max > 0 {
+        let track_w = p.s(4.0);
+        let x = client.right - p.s(9.0);
+        let track_top = view_top + p.s(4.0);
+        let track_bottom = view_bottom - p.s(4.0);
+        let track_h = (track_bottom - track_top).max(1);
+        p.round(
+            x,
+            track_top,
+            x + track_w,
+            track_bottom,
+            track_w,
+            mix_white(BORDER, 0.35),
+            mix_white(BORDER, 0.35),
+        );
+
+        let span = s(CONTENT_BOTTOM - CONTENT_TOP, state.scale).max(1);
+        let thumb_h = ((track_h as f32) * (track_h as f32) / (span as f32)).round() as i32;
+        let thumb_h = thumb_h.clamp(p.s(24.0), track_h);
+        let travel = (track_h - thumb_h).max(0);
+        let thumb_top = track_top + (travel as f32 * scroll as f32 / max as f32).round() as i32;
+        p.round(
+            x,
+            thumb_top,
+            x + track_w,
+            thumb_top + thumb_h,
+            track_w,
+            TEXT3,
+            TEXT3,
+        );
     }
 
     // 底部分割线
@@ -1115,7 +1198,10 @@ unsafe fn open_popup(settings: HWND, row: usize) {
     };
     GetClientRect(settings, &mut client);
     let l = layout(state, client);
-    let anchor = l.selects[row - 1];
+    let mut anchor = l.selects[row - 1];
+    // 下拉挂在控件下方：控件坐标是「未滚动」的，这里换成窗口坐标
+    anchor.top -= state.scroll;
+    anchor.bottom -= state.scroll;
 
     let items: Vec<String> = match row {
         1 => FONT_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
@@ -1252,7 +1338,7 @@ pub fn open(parent: HWND, settings: &Settings) {
 
         let scale = crate::screen_scale();
         let width_px = s(440.0, scale);
-        let height_px = s(710.0, scale);
+        let mut height_px = s(710.0, scale);
 
         let mut screen = RECT {
             left: 0,
@@ -1261,8 +1347,16 @@ pub fn open(parent: HWND, settings: &Settings) {
             bottom: 0,
         };
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut screen as *mut _ as *mut _, 0);
+
+        // 小屏 / 高缩放（比如 1366×768 @125%）下 710px 会顶出工作区，
+        // 压到工作区里，内容靠滚轮看
+        let available = ((screen.bottom - screen.top) - s(48.0, scale)).max(s(360.0, scale));
+        if height_px > available {
+            height_px = available;
+        }
+
         let left = screen.left + ((screen.right - screen.left) - width_px) / 2;
-        let top = screen.top + ((screen.bottom - screen.top) - height_px) / 3;
+        let top = (screen.top + ((screen.bottom - screen.top) - height_px) / 3).max(screen.top);
 
         let interfaces: Vec<String> = netspeed_core::net::adapters()
             .into_iter()
@@ -1312,6 +1406,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             scale,
             hover: None,
             slider_drag: false,
+            scroll: 0,
             popup: std::ptr::null_mut(),
         }));
 
@@ -1379,6 +1474,17 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.done, point) {
         return Some(Hit::Done);
     }
+
+    // 滚出可见区的控件既不该响应悬停也不该响应点击
+    let (top, bottom) = content_viewport(state, client);
+    if point.y < top || point.y >= bottom {
+        return None;
+    }
+    let point = POINT {
+        x: point.x,
+        y: point.y + state.scroll,
+    };
+
     if contains(&l.slider, point) {
         return Some(Hit::Slider);
     }
@@ -1537,6 +1643,36 @@ unsafe extern "system" fn dialog_proc(
             let state = state_of(hwnd);
             if !state.is_null() {
                 (*state).slider_drag = false;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let mut client = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut client);
+
+            let max = max_scroll(state, client);
+            if max == 0 {
+                return 0;
+            }
+
+            // 一格滚轮 120，一次滚 3 行（约 66px）
+            let delta = ((wparam >> 16) as i16) as i32;
+            let step = s(66.0, state.scale).max(1);
+            let next = (state.scroll - delta / 120 * step).clamp(0, max);
+            if next != state.scroll {
+                state.scroll = next;
+                state.hover = None;
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0
