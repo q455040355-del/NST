@@ -17,6 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 
 const DT_NOPREFIX: u32 = 0x0800;
+const DT_CALCRECT: u32 = 0x0400;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -29,6 +30,7 @@ const WM_APP_HISTORY_READY: u32 = WM_APP + 30;
 const WM_APP_HISTORY_ANIM: u32 = WM_APP + 31;
 
 const RANGE_LABELS: [&str; 5] = ["今天", "昨天", "7 天", "30 天", "全部"];
+const SOURCE_LABELS: [&str; 5] = ["全部", "OpenCode", "DSH", "WorkBuddy", "WorkBuddy AI"];
 
 const BG: u32 = 0x00FC_F9F8; // 0x00BBGGRR，浅灰蓝
 const CARD_BG: u32 = 0x00FF_FFFF;
@@ -134,6 +136,9 @@ struct State {
     loader: Option<Receiver<Vec<UsageRecord>>>,
     canvas: HWND,
     pill_rects: Vec<RECT>,
+    /// 0 = 全部来源，1..=4 = all_sources() 里对应的一路
+    source: usize,
+    source_rects: Vec<RECT>,
     scroll: usize,
 }
 
@@ -212,6 +217,8 @@ pub fn open(parent: HWND) {
             loader: None,
             canvas: std::ptr::null_mut(),
             pill_rects: Vec::new(),
+            source: 0,
+            source_rects: Vec::new(),
             scroll: 0,
         }));
 
@@ -428,10 +435,17 @@ fn recalc(state: &mut State) {
     let today = history::today(now);
     let (mut from, to) = range_days(state.range, today);
 
+    let filter = if state.source == 0 {
+        None
+    } else {
+        all_sources().get(state.source - 1).copied()
+    };
+
     if state.range == 4 {
         from = state
             .records
             .iter()
+            .filter(|record| filter.map_or(true, |wanted| record.source == wanted))
             .map(|record| record.day)
             .min()
             .unwrap_or(today);
@@ -440,10 +454,20 @@ fn recalc(state: &mut State) {
     state.from_day = from;
     state.to_day = to;
 
-    state.days = history::summarize(&state.records, from, to);
+    state.days = history::summarize_filtered(&state.records, from, to, filter);
     // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
     // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
-    let rows = history::daily_by_source(&state.records, from, to, &all_sources());
+    let mut rows = history::daily_by_source(&state.records, from, to, &all_sources());
+    // 只看单一来源时把其他来源的列清零：这样图例、堆叠柱都只剩选中的那一路
+    if state.source != 0 {
+        for row in rows.iter_mut() {
+            for (slot, value) in row.iter_mut().enumerate() {
+                if slot + 1 != state.source {
+                    *value = 0;
+                }
+            }
+        }
+    }
     state.stack = state
         .days
         .iter()
@@ -513,6 +537,19 @@ unsafe extern "system" fn canvas_proc(
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
                 let state = &mut *state;
+
+                for (index, rect) in state.source_rects.iter().enumerate() {
+                    if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                        if state.source != index {
+                            state.source = index;
+                            recalc(state);
+                            start_animator(hwnd);
+                        }
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+
                 for (index, rect) in state.pill_rects.iter().enumerate() {
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                         if state.range != index {
@@ -662,6 +699,29 @@ impl Painter {
         );
         SelectObject(self.dc, old);
     }
+
+    /// 量一段文字在当前字号下的像素宽度（用来把胶囊宽度贴合文字）。
+    fn measure(&self, text: &str, font: HFONT) -> i32 {
+        unsafe {
+            let old = SelectObject(self.dc, font as HGDIOBJ);
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let text = wide(text);
+            DrawTextW(
+                self.dc,
+                text.as_ptr(),
+                (text.len() - 1) as i32,
+                &mut rect,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(self.dc, old);
+            rect.right - rect.left
+        }
+    }
 }
 
 fn make_font(scale: f32, points: f32, weight: i32, face: &str) -> HFONT {
@@ -720,8 +780,18 @@ fn paint(hwnd: HWND, hdc: HDC) {
 
         let mut subtitle = if state.loading {
             "读取中…".to_string()
-        } else {
+        } else if state.source == 0 {
             format!("{} 条记录", state.records.len())
+        } else {
+            let wanted = all_sources()[state.source - 1];
+            let count = state
+                .records
+                .iter()
+                .filter(|record| {
+                    record.source == wanted && record.day >= state.from_day && record.day <= state.to_day
+                })
+                .count();
+            format!("{count} 条记录 · 仅 {}", history::source_name(wanted))
         };
 
         if !state.loading {
@@ -766,6 +836,57 @@ fn paint(hwnd: HWND, hdc: HDC) {
 
             state.pill_rects.push(pill);
             x += pill_width + p.s(8.0);
+        }
+
+        // 来源筛选：和区间同一行，右对齐
+        state.source_rects.clear();
+        {
+            let gap_pill = p.s(5.0);
+            let source_height = pill_height;
+            let mut widths = [0_i32; 5];
+            let mut total = 0;
+            for (index, label) in SOURCE_LABELS.iter().enumerate() {
+                widths[index] = p.measure(label, sub_font) + p.s(16.0);
+                total += widths[index];
+            }
+            total += gap_pill * (SOURCE_LABELS.len() as i32 - 1);
+
+            let label_width = p.measure("来源", head_font) + p.s(8.0);
+            let mut sx = (p.width - pad - total - label_width).max(x + p.s(24.0)) + label_width;
+            p.text("来源", head_font, TEXT_HEAD, sx - label_width, p.s(78.0), sx, p.s(78.0) + source_height, DT_RIGHT);
+
+            for (index, label) in SOURCE_LABELS.iter().enumerate() {
+                let pill = RECT {
+                    left: sx,
+                    top: p.s(78.0),
+                    right: sx + widths[index],
+                    bottom: p.s(78.0) + source_height,
+                };
+
+                let active = index == state.source;
+                p.round_rect(
+                    pill.left,
+                    pill.top,
+                    pill.right,
+                    pill.bottom,
+                    p.s(12.0),
+                    if active { 0x00F7_EBE3 } else { CARD_BG },
+                    if active { 0x00D8_C4B8 } else { 0x00E8_DFD9 },
+                );
+                p.text(
+                    label,
+                    sub_font,
+                    if active { TEXT_MAIN } else { TEXT_MUTED },
+                    pill.left,
+                    pill.top,
+                    pill.right,
+                    pill.bottom + 1,
+                    DT_CENTER,
+                );
+
+                state.source_rects.push(pill);
+                sx += widths[index] + gap_pill;
+            }
         }
 
         // 卡片

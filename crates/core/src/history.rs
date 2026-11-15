@@ -401,12 +401,28 @@ fn home_dir() -> PathBuf {
 
 /// 按天汇总（包含没有数据的空缺天，方便直接画柱状图）。
 pub fn summarize(records: &[UsageRecord], from_day: i64, to_day: i64) -> Vec<DailyRow> {
+    summarize_filtered(records, from_day, to_day, None)
+}
+
+/// 同上，但可以只看某一个来源（`None` = 全部来源）。
+pub fn summarize_filtered(
+    records: &[UsageRecord],
+    from_day: i64,
+    to_day: i64,
+    source: Option<&str>,
+) -> Vec<DailyRow> {
     let mut map: HashMap<i64, DailyRow> = HashMap::new();
     let mut models: HashMap<i64, HashMap<String, i64>> = HashMap::new();
 
     for record in records {
         if record.day < from_day || record.day > to_day {
             continue;
+        }
+
+        if let Some(wanted) = source {
+            if record.source != wanted {
+                continue;
+            }
         }
 
         let row = map.entry(record.day).or_insert_with(|| DailyRow {
