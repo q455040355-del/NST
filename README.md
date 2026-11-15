@@ -39,6 +39,10 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **底色**：在面板左右两侧的空隙各取 4 个点，按亮度取中位数作为背景色，和任务栏融为一体；采不到才回退到标准色。
 - **DPI**：启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`；
   窗口里取 DPI 一律走 `GetDpiForWindow`（分层窗口未显示时 `GetDC(hwnd)+LOGPIXELSX` 会返回 96，会把面板算成未缩放尺寸）。
+  面板收到 `WM_DPICHANGED` 会按新 DPI 重建字体/尺寸/背缓冲（拖到缩放不同的屏或改缩放都立即生效）；
+  `WM_DISPLAYCHANGE` 会重新贴回任务栏。
+- **多显示器**：面板贴着**它所在那块屏**的任务栏（主屏 `Shell_TrayWnd`、副屏 `Shell_SecondaryTrayWnd`，
+  各自带 `TrayNotifyWnd` 托盘区），不再一律按主屏算坐标；设置窗/历史窗/取字窗开在**鼠标所在屏**的工作区中间。
 - **刷新**：后台线程每 500ms 向面板投递 `WM_APP_TICK`；历史窗口的弹簧动效用另一个线程每 16ms 投递 `WM_APP_HISTORY_ANIM`。
   ⚠️ 本进程里 `SetTimer` / `WM_TIMER`（含 `TIMERPROC` 回调形式）实测完全不触发，`SetTimer` 还返回成功 ID——只能用线程投递。
 
@@ -125,7 +129,9 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 
 - **区间胶囊**：今天 / 昨天 / 7 天 / 30 天 / 全部；关掉再打开会记住上次选的区间和来源
   （存在同目录的 `history-prefs.txt`，不动 `settings.ini`，免得和面板那份配置互相覆盖）；
-- **来源筛选**：全部 / OpenCode / DSH / WorkBuddy / WorkBuddy AI，和区间可组合，卡片、柱子、表格、副标题一起过滤；
+- **来源筛选（多选）**：`全部` 一键全开，右边四个来源点一下开关一个，可任意组合；
+  没选中的来源文字变灰、圆点变淡，图例和柱子跟着消失。全关会退回全选（不留空视图）。
+  卡片、柱子、表格、副标题都按选中的来源一起过滤；
 - **四张卡片**：输出 / 输入 / 请求（小字带**缓存命中率**）/ 平均速度，带日均、输入输出倍数等小字；
 - **堆叠柱状图**：按来源分层 + 图例 + Y 轴，切区间时柱高按 `DampedSpring(0.30s / 0.86)` 过渡；
 - **每日明细表**：日期 / 请求 / 输出 / 输入 / 平均速度 / 峰值 / 主要模型，滚轮翻页；
@@ -158,5 +164,3 @@ CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --work
 ## 待办
 
 1. AI 来源补齐：Claude Code / Codex。
-2. 多显示器：目前只处理主任务栏 `Shell_TrayWnd`，`Shell_SecondaryTrayWnd` 未处理。
-3. 历史窗口来源支持多选（现在是单选，选项本身已会记住）。

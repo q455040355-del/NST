@@ -823,15 +823,15 @@ fn home_dir() -> PathBuf {
 
 /// 按天汇总（包含没有数据的空缺天，方便直接画柱状图）。
 pub fn summarize(records: &[UsageRecord], from_day: i64, to_day: i64) -> Vec<DailyRow> {
-    summarize_filtered(records, from_day, to_day, None)
+    summarize_filtered(records, from_day, to_day, &all_sources())
 }
 
-/// 同上，但可以只看某一个来源（`None` = 全部来源）。
+/// 同上，但只统计 `sources` 里的来源（传 `all_sources()` 就是全部）。
 pub fn summarize_filtered(
     records: &[UsageRecord],
     from_day: i64,
     to_day: i64,
-    source: Option<&str>,
+    sources: &[&'static str],
 ) -> Vec<DailyRow> {
     let mut map: HashMap<i64, DailyRow> = HashMap::new();
     let mut models: HashMap<i64, HashMap<String, i64>> = HashMap::new();
@@ -841,10 +841,8 @@ pub fn summarize_filtered(
             continue;
         }
 
-        if let Some(wanted) = source {
-            if record.source != wanted {
-                continue;
-            }
+        if !sources.contains(&record.source) {
+            continue;
         }
 
         let row = map.entry(record.day).or_insert_with(|| DailyRow {
@@ -925,7 +923,7 @@ impl HourRow {
 pub fn summarize_hours(
     records: &[UsageRecord],
     day: i64,
-    source: Option<&str>,
+    sources: &[&'static str],
 ) -> Vec<HourRow> {
     let mut rows: Vec<HourRow> = (0..24)
         .map(|hour| HourRow {
@@ -939,10 +937,8 @@ pub fn summarize_hours(
         if record.day != day {
             continue;
         }
-        if let Some(wanted) = source {
-            if record.source != wanted {
-                continue;
-            }
+        if !sources.contains(&record.source) {
+            continue;
         }
 
         let index = (record.hour as usize).min(23);
@@ -1089,6 +1085,31 @@ mod tests {
             cache_read: 0,
             duration_ms: 1000,
         }
+    }
+
+    #[test]
+    fn summarize_respects_source_subset() {
+        let records = vec![
+            record(5, SOURCE_OPENCODE, "a", 100),
+            record(5, SOURCE_WORKBUDDY_AI, "b", 50),
+            record(6, SOURCE_DSH, "c", 7),
+        ];
+
+        let only_ai = [SOURCE_WORKBUDDY_AI];
+        assert_eq!(summarize_filtered(&records, 5, 6, &only_ai)[0].output, 50);
+        assert_eq!(summarize_filtered(&records, 5, 6, &only_ai)[1].output, 0);
+
+        let two = [SOURCE_OPENCODE, SOURCE_DSH];
+        let rows = summarize_filtered(&records, 5, 6, &two);
+        assert_eq!(rows[0].output, 100);
+        assert_eq!(rows[1].output, 7);
+
+        let all = all_sources();
+        assert_eq!(summarize_filtered(&records, 5, 6, &all)[0].output, 150);
+
+        // 小时视图同一套语义
+        let hours = summarize_hours(&records, 5, &only_ai);
+        assert_eq!(hours[12].output, 50);
     }
 
     #[test]

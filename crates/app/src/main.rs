@@ -23,7 +23,8 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -49,6 +50,9 @@ const WM_APP_OCR_READY: u32 = WM_APP + 5;
 const WM_APP_ANIM: u32 = WM_APP + 6;
 /// 另一个实例启动时叫醒已有面板（单实例互斥体挡住重复启动，但得给点反馈）
 const WM_APP_REVEAL: u32 = WM_APP + 7;
+/// 冒烟测试用：模拟「换到另一块屏」的 DPI 变化。
+/// （WM_DPICHANGED 是系统消息，跨进程 PostMessage 会被系统挡掉，测不了）
+const WM_APP_DPI_TEST: u32 = WM_APP + 8;
 
 /// windows-sys 0.59 没导出 WM_MOUSELEAVE，自己补一个
 /// （不能省：漏了会变成变量绑定模式，把后面的消息分支全吃掉）
@@ -267,6 +271,119 @@ fn scale_for_dpi(value: i32) -> i32 {
     panel::scale(dpi, value)
 }
 
+/// 面板所在显示器上的任务栏。
+///
+/// 主屏是 `Shell_TrayWnd`，副屏是各自的 `Shell_SecondaryTrayWnd`——以前一律拿主任务栏，
+/// 面板拖到副屏后位置会按主屏的托盘算，跑偏。
+fn taskbar_for(hwnd: HWND) -> HWND {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let primary = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+        if !primary.is_null() && MonitorFromWindow(primary, MONITOR_DEFAULTTONEAREST) == monitor {
+            return primary;
+        }
+
+        let mut query = TaskbarQuery {
+            monitor,
+            found: std::ptr::null_mut(),
+        };
+        EnumWindows(Some(find_taskbar), &mut query as *mut TaskbarQuery as isize);
+        if query.found.is_null() {
+            primary
+        } else {
+            query.found
+        }
+    }
+}
+
+struct TaskbarQuery {
+    monitor: HMONITOR,
+    found: HWND,
+}
+
+unsafe extern "system" fn find_taskbar(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let query = &mut *(lparam as *mut TaskbarQuery);
+    let mut class = [0u16; 64];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    let name = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+    if name != "Shell_TrayWnd" && name != "Shell_SecondaryTrayWnd" {
+        return 1;
+    }
+    if MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != query.monitor {
+        return 1;
+    }
+    query.found = hwnd;
+    0
+}
+
+/// 鼠标所在显示器的可用区域：多屏时窗口开在用户正在用的那块屏上
+pub(crate) fn work_area() -> RECT {
+    unsafe {
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            return info.rcWork;
+        }
+
+        let mut work = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+        work
+    }
+}
+
+
+/// 按新 DPI 重排面板：字体、尺寸、缓冲区全部重建，位置尽量不动。
+/// `dpi == 0` 表示「回到这块屏真正的 DPI」（测试通道用）。
+fn apply_dpi(hwnd: HWND, dpi: u32, suggested: *const RECT) {
+    unsafe {
+        let dpi = if dpi == 0 {
+            crate::dpi_for_window(hwnd)
+        } else {
+            dpi
+        };
+
+        if let Some(panel) = panel_mut(hwnd) {
+            panel.set_dpi(dpi.max(96));
+            let width = panel.desired_width();
+            let height = panel.height();
+
+            // 建议矩形给了就用它定位（跨屏拖过来时正好落在边界内），
+            // 没给就保持原来的左上角——尺寸一定要按新 DPI 重设，不然字和框对不上
+            let (left, top) = if suggested.is_null() {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                GetWindowRect(hwnd, &mut rect);
+                (rect.left, rect.top)
+            } else {
+                ((*suggested).left, (*suggested).top)
+            };
+
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                left,
+                top,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+        }
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
 
 /// 顶层置顶窗口不用改 z 序，这里只负责跟随任务栏位置（任务栏可能移动/改尺寸）。
 fn keep_on_top(hwnd: HWND) {
@@ -281,7 +398,7 @@ fn keep_on_top(hwnd: HWND) {
         let saved_x = panel_mut(hwnd).map(|panel| panel.settings.panel_x).unwrap_or(-1);
 
         if saved_x < 0 {
-            let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+            let taskbar = taskbar_for(hwnd);
             if taskbar.is_null() {
                 return;
             }
@@ -571,6 +688,22 @@ unsafe extern "system" fn wnd_proc(
             PostMessageW(hwnd, WM_APP_TICK, 0, 0);
             0
         }
+        // 面板被拖到另一块显示器 / 那块屏的缩放被改了
+        WM_DPICHANGED => {
+            apply_dpi(hwnd, ((wparam >> 16) & 0xFFFF) as u32, lparam as *const RECT);
+            0
+        }
+        // 测试通道：和 WM_DPICHANGED 走同一段逻辑
+        WM_APP_DPI_TEST => {
+            apply_dpi(hwnd, (wparam & 0xFFFF) as u32, std::ptr::null());
+            0
+        }
+        // 分辨率 / 显示器布局变了：重新贴回任务栏
+        WM_DISPLAYCHANGE => {
+            keep_on_top(hwnd);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_APP_TICK => {
             // Explorer 重启后我们的窗口会跟着销毁，这时直接退出进程，
             // 否则会留下「没有窗口但占着互斥体」的僵尸进程，导致再也打不开。
@@ -739,7 +872,7 @@ unsafe extern "system" fn wnd_proc(
                     bottom: 0,
                 };
                 GetWindowRect(hwnd, &mut rect);
-                let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+                let taskbar = taskbar_for(hwnd);
                 let mut bar = RECT {
                     left: 0,
                     top: 0,
@@ -963,7 +1096,7 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_PANEL_SNAP => {
                 panel.reset_anchor();
-                let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+                let taskbar = taskbar_for(hwnd);
                 position_panel(hwnd, taskbar, panel.desired_width(), panel.height());
                 keep_on_top(hwnd);
             }

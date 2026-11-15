@@ -1441,13 +1441,7 @@ pub fn open(parent: HWND, settings: &Settings) {
         let width_px = s(440.0, scale);
         let mut height_px = s(710.0, scale);
 
-        let mut screen = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut screen as *mut _ as *mut _, 0);
+        let screen = crate::work_area();
 
         // 小屏 / 高缩放（比如 1366×768 @125%）下 710px 会顶出工作区，
         // 压到工作区里，内容靠滚轮看
@@ -1456,7 +1450,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             height_px = available;
         }
 
-        let left = screen.left + ((screen.right - screen.left) - width_px) / 2;
+        let left = screen.left + ((screen.right - screen.left) - width_px).max(0) / 2;
         let top = (screen.top + ((screen.bottom - screen.top) - height_px) / 3).max(screen.top);
 
         let interfaces: Vec<String> = netspeed_core::net::adapters()

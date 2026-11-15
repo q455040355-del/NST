@@ -137,6 +137,21 @@ if ($panel.ToInt64() -eq 0) {
 Check "面板窗口存在" ($panel.ToInt64() -ne 0)
 if ($panel.ToInt64() -eq 0) { exit 1 }
 
+# DPI 重建：模拟「拖到另一块缩放不同的屏」（WM_APP_DPI_TEST 是给冒烟脚本留的通道）
+$widthOf = {
+    param($text)
+    return [int]($text.Split(' ')[1].Split('x')[0])
+}
+$beforeRect = [Smoke]::RectOf($panel)
+[void][Smoke]::PostMessageW($panel, 0x8008, [IntPtr]96, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 900
+$rect96 = [Smoke]::RectOf($panel)
+[void][Smoke]::PostMessageW($panel, 0x8008, [IntPtr]0, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 900
+$rectBack = [Smoke]::RectOf($panel)
+Check "DPI 96 时面板变窄" ((& $widthOf $rect96) -lt (& $widthOf $rectBack)) "$beforeRect -> $rect96 -> $rectBack"
+Check "恢复系统 DPI 后尺寸还原" ((& $widthOf $rectBack) -eq (& $widthOf $beforeRect)) $rectBack
+
 Write-Host ("主题: " + $(if ($Dark) { "深色（强制）" } else { "跟随系统" }))
 
 # ---------------------------------------------------------------- 打开设置

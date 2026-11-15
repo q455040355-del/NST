@@ -158,8 +158,8 @@ struct State {
     loader: Option<Receiver<Vec<UsageRecord>>>,
     canvas: HWND,
     pill_rects: Vec<RECT>,
-    /// 0 = 全部来源，1..=4 = all_sources() 里对应的一路
-    source: usize,
+    /// 哪几个来源参与统计（all_sources() 的顺序）；全 false 会当成全选
+    sources: [bool; 4],
     source_rects: Vec<RECT>,
     /// 右上角的关闭按钮
     close_rect: RECT,
@@ -224,13 +224,7 @@ pub fn open(_parent: HWND) {
         let width = (900.0 * scale) as i32;
         let mut height = (760.0 * scale) as i32;
 
-        let mut work = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+        let work = crate::work_area();
 
         // 小屏 / 高缩放（1366×768 @125% 之类）下 760px 会顶出去，
         // 压到工作区里；图表高度会跟着缩（见 layout），表格至少留一行的高度
@@ -240,7 +234,7 @@ pub fn open(_parent: HWND) {
         let left = work.left + ((work.right - work.left) - width).max(0) / 2;
         let top = (work.top + ((work.bottom - work.top) - height) / 3).max(work.top);
 
-        let (saved_range, saved_source) = prefs();
+        let (saved_range, saved_sources) = prefs();
         let state = Box::into_raw(Box::new(State {
             records: Vec::new(),
             // 上次看的是哪个区间 / 来源：存在同目录的小文件里（不写 settings.ini，
@@ -268,7 +262,12 @@ pub fn open(_parent: HWND) {
             loader: None,
             canvas: std::ptr::null_mut(),
             pill_rects: Vec::new(),
-            source: saved_source,
+            sources: [
+                saved_sources & 0b0001 != 0,
+                saved_sources & 0b0010 != 0,
+                saved_sources & 0b0100 != 0,
+                saved_sources & 0b1000 != 0,
+            ],
             source_rects: Vec::new(),
             close_rect: RECT {
                 left: 0,
@@ -354,10 +353,11 @@ fn prefs_path() -> Option<PathBuf> {
         .map(|dir| PathBuf::from(dir).join("NetSpeedTaskbar").join("history-prefs.txt"))
 }
 
-/// 上次的 (区间, 来源)。读不到就用「今天 / 全部」。
-fn prefs() -> (usize, usize) {
+/// 上次的 (区间, 来源位掩码)。读不到就用「今天 / 全部」。
+/// 老版本存的是 `source=0..4`（0 = 全部），这里兼容读。
+fn prefs() -> (usize, u8) {
     let mut range = 0;
-    let mut source = 0;
+    let mut sources: u8 = 0b1111;
     if let Some(path) = prefs_path() {
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
@@ -369,23 +369,38 @@ fn prefs() -> (usize, usize) {
                 };
                 match key.trim() {
                     "range" => range = value.min(RANGE_LABELS.len() - 1),
-                    "source" => source = value.min(SOURCE_LABELS.len() - 1),
+                    "sources" => sources = (value as u8) & 0b1111,
+                    // 单选的旧格式：0 = 全部，n = 只开第 n-1 路
+                    "source" => {
+                        sources = if value == 0 {
+                            0b1111
+                        } else {
+                            1 << ((value - 1).min(3))
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
-    (range, source)
+    if sources == 0 {
+        sources = 0b1111;
+    }
+    (range, sources)
 }
 
-fn save_prefs(range: usize, source: usize) {
+fn save_prefs(range: usize, sources: [bool; 4]) {
     let Some(path) = prefs_path() else {
         return;
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, format!("range={range}\nsource={source}\n"));
+    let mask = sources
+        .iter()
+        .enumerate()
+        .fold(0u8, |mask, (index, on)| if *on { mask | 1 << index } else { mask });
+    let _ = std::fs::write(path, format!("range={range}\nsources={mask}\n"));
 }
 
 fn start_loading(hwnd: HWND) {
@@ -580,22 +595,53 @@ fn range_days(range: usize, today: i64) -> (i64, i64) {
     }
 }
 
+/// 来源名 → all_sources() 里的下标
+fn source_slot(source: &str) -> Option<usize> {
+    all_sources().iter().position(|name| *name == source)
+}
+
+/// 勾选的来源列表（按 all_sources() 顺序）。一个都没勾时退回全选。
+fn enabled_sources(state: &State) -> Vec<&'static str> {
+    let all = all_sources();
+    let list: Vec<&'static str> = all
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| state.sources[*index])
+        .map(|(_, name)| *name)
+        .collect();
+    if list.is_empty() {
+        all.to_vec()
+    } else {
+        list
+    }
+}
+
+/// 把没勾选的来源列清零（列顺序固定是 all_sources()，这样图例和配色不用动）
+fn zero_disabled_columns(rows: &mut [Vec<i64>], sources: [bool; 4]) {
+    if sources.iter().all(|on| *on) {
+        return;
+    }
+    for row in rows {
+        for (slot, value) in row.iter_mut().enumerate() {
+            if !sources.get(slot).copied().unwrap_or(true) {
+                *value = 0;
+            }
+        }
+    }
+}
+
 fn recalc(state: &mut State) {
     let now = now_ms();
     let today = history::today(now);
     let (mut from, to) = range_days(state.range, today);
 
-    let filter = if state.source == 0 {
-        None
-    } else {
-        all_sources().get(state.source - 1).copied()
-    };
+    let sources = enabled_sources(state);
 
     if state.range == 4 {
         from = state
             .records
             .iter()
-            .filter(|record| filter.map_or(true, |wanted| record.source == wanted))
+            .filter(|record| sources.contains(&record.source))
             .map(|record| record.day)
             .min()
             .unwrap_or(today);
@@ -610,7 +656,7 @@ fn recalc(state: &mut State) {
 
     if hourly {
         let day = from;
-        let hours = history::summarize_hours(&state.records, day, filter);
+        let hours = history::summarize_hours(&state.records, day, &sources);
         state.days = hours
             .iter()
             .map(|row| DailyRow {
@@ -626,32 +672,16 @@ fn recalc(state: &mut State) {
             })
             .collect();
 
+        // 列始终按 all_sources() 排，没勾的来源清零（图例/颜色不用跟着变）
         let mut rows = history::hourly_by_source(&state.records, day, &all_sources());
-        if state.source != 0 {
-            for row in rows.iter_mut() {
-                for (slot, value) in row.iter_mut().enumerate() {
-                    if slot + 1 != state.source {
-                        *value = 0;
-                    }
-                }
-            }
-        }
+        zero_disabled_columns(&mut rows, state.sources);
         state.stack = rows;
     } else {
-        state.days = history::summarize_filtered(&state.records, from, to, filter);
+        state.days = history::summarize_filtered(&state.records, from, to, &sources);
         // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
         // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
         let mut rows = history::daily_by_source(&state.records, from, to, &all_sources());
-        // 只看单一来源时把其他来源的列清零：这样图例、堆叠柱都只剩选中的那一路
-        if state.source != 0 {
-            for row in rows.iter_mut() {
-                for (slot, value) in row.iter_mut().enumerate() {
-                    if slot + 1 != state.source {
-                        *value = 0;
-                    }
-                }
-            }
-        }
+        zero_disabled_columns(&mut rows, state.sources);
         state.stack = state
             .days
             .iter()
@@ -827,9 +857,21 @@ unsafe extern "system" fn canvas_proc(
 
                 for (index, rect) in state.source_rects.iter().enumerate() {
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                        if state.source != index {
-                            state.source = index;
-                            save_prefs(state.range, state.source);
+                        // 0 = 「全部」：一次全开；1..=4 = 单路开关（不允许全关）
+                        if index == 0 {
+                            if !state.sources.iter().all(|on| *on) {
+                                state.sources = [true; 4];
+                                save_prefs(state.range, state.sources);
+                                recalc(state);
+                                start_animator(hwnd);
+                            }
+                        } else {
+                            let slot = index - 1;
+                            state.sources[slot] = !state.sources[slot];
+                            if !state.sources.iter().any(|on| *on) {
+                                state.sources = [true; 4];
+                            }
+                            save_prefs(state.range, state.sources);
                             recalc(state);
                             start_animator(hwnd);
                         }
@@ -842,7 +884,7 @@ unsafe extern "system" fn canvas_proc(
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                         if state.range != index {
                             state.range = index;
-                            save_prefs(state.range, state.source);
+                            save_prefs(state.range, state.sources);
                             recalc(state);
                             start_animator(hwnd);
                         }
@@ -1395,6 +1437,7 @@ unsafe fn draw_chip(
     label: &str,
     active: bool,
     accent: Option<u32>,
+    on: bool,
 ) {
     if active {
         p.round(
@@ -1406,15 +1449,27 @@ unsafe fn draw_chip(
             p.ui.dark,
             p.ui.dark,
         );
-    } else if accent.is_some() {
-        // 来源按钮：透明底，只在悬停时才明显（这里保持轻量）
     }
 
-    let color = if active { 0x00FF_FFFF } else { p.ui.text2 };
+    // 三档：实心胶囊（选中的档位/全部）> 勾选 > 未勾选
+    let color = if active {
+        0x00FF_FFFF
+    } else if on {
+        p.ui.text
+    } else {
+        p.ui.text3
+    };
     if let Some(dot_color) = accent {
         let cx = rect.left + p.s(12.0);
         let cy = (rect.top + rect.bottom) / 2;
-        p.dot(cx, cy, p.s(3.0), if active { 0x00FF_FFFF } else { dot_color });
+        let dot = if active {
+            0x00FF_FFFF
+        } else if on {
+            dot_color
+        } else {
+            mix_white(dot_color, 0.45)
+        };
+        p.dot(cx, cy, p.s(3.0), dot);
     }
     p.text(
         label,
@@ -1467,16 +1522,15 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
     let subtitle = if state.loading {
         "正在读取…".to_string()
     } else {
-        let count = if state.source == 0 {
+        let count = if state.sources.iter().all(|on| *on) {
             thousands(state.records.len() as i64)
         } else {
-            let wanted = all_sources()[state.source - 1];
             thousands(
                 state
                     .records
                     .iter()
                     .filter(|record| {
-                        record.source == wanted
+                        state.sources[source_slot(record.source).unwrap_or(0)]
                             && record.day >= state.from_day
                             && record.day <= state.to_day
                     })
@@ -1542,7 +1596,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             right: x + widths[index],
             bottom: l.row_top + l.chips_h,
         };
-        draw_chip(p, rect, label, index == state.range, None);
+        draw_chip(p, rect, label, index == state.range, None, true);
         state.pill_rects.push(rect);
         x += widths[index] + gap;
     }
@@ -1587,7 +1641,14 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         } else {
             Some(series_color(all_sources()[index - 1]))
         };
-        draw_chip(p, rect, label, index == state.source, accent);
+        // 0 = 「全部」：全开时高亮；1..=4 = 单路开关，选中的用实心字 + 饱和圆点
+        let all_on = state.sources.iter().all(|on| *on);
+        let (active, on) = if index == 0 {
+            (all_on, all_on)
+        } else {
+            (false, state.sources[index - 1])
+        };
+        draw_chip(p, rect, label, active, accent, on);
         state.source_rects.push(rect);
         sx += widths[index] + gap;
     }

@@ -487,6 +487,26 @@ impl Panel {
         }
     }
 
+    /// 面板被拖到另一块显示器（或那块屏的缩放比例被改了）：
+    /// 字号、尺寸、缓冲区都要按新 DPI 重来，否则字会糊/面板大小不对。
+    ///
+    /// 尺寸由调用方按 `desired_width()` / `height()` 重新 SetWindowPos；
+    /// 这里只把 DPI / 字体 / 配色换掉，并把缓冲区标记为待重建。
+    pub fn set_dpi(&mut self, dpi: u32) {
+        if self.dpi == dpi {
+            return;
+        }
+        self.dpi = dpi;
+        self.fonts = Fonts::create(dpi, self.settings.font_scale);
+        self.colors = Colors::for_theme(crate::theme::taskbar_is_light(), 0x00F3F3F3);
+        // 尺寸马上会变：底色缓存和内容指纹都得作废，缓冲区下次绘制按新尺寸重建
+        self.bg_rect = (0, 0, 0, 0);
+        self.bg_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        self.last_frame.clear();
+        self.width = 0;
+        self.height = 0;
+    }
+
     fn ensure_buffer(&mut self) {
         let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         unsafe {
