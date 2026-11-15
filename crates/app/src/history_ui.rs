@@ -43,6 +43,10 @@ const ACCENT_GREEN: u32 = 0x008C_A92F;
 const ACCENT_PURPLE: u32 = 0x00FF_617B;
 const ACCENT_ORANGE: u32 = 0x0032_8AE0;
 
+/// 图表的阻尼弹簧：response = 一个来回的周期，damping 越小回弹越明显。
+const SPRING_RESPONSE: f64 = 0.34;
+const SPRING_DAMPING: f64 = 0.76;
+
 /// 动画投递线程的代（每次重启动画就 +1，旧线程看到代变了就退出）
 static ANIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -131,8 +135,12 @@ struct State {
     from_heights: Vec<f32>,
     to_heights: Vec<f32>,
     now_heights: Vec<f32>,
+    /// Y 轴最大值也用同一根弹簧，柱子和刻度一起动
+    max_from: f32,
+    max_to: f32,
+    max_now: f32,
     animating: bool,
-    last_tick: i64,
+    last_tick: std::time::Instant,
     loader: Option<Receiver<Vec<UsageRecord>>>,
     canvas: HWND,
     pill_rects: Vec<RECT>,
@@ -208,12 +216,15 @@ pub fn open(parent: HWND) {
             stack: Vec::new(),
             from_day: 0,
             to_day: 0,
-            spring: Spring::new(0.30, 0.86),
+            spring: Spring::new(SPRING_RESPONSE, SPRING_DAMPING),
             from_heights: Vec::new(),
             to_heights: Vec::new(),
             now_heights: Vec::new(),
+            max_from: 1.0,
+            max_to: 1.0,
+            max_now: 1.0,
             animating: false,
-            last_tick: 0,
+            last_tick: std::time::Instant::now(),
             loader: None,
             canvas: std::ptr::null_mut(),
             pill_rects: Vec::new(),
@@ -490,9 +501,22 @@ fn recalc(state: &mut State) {
     };
     state.to_heights = target;
     state.now_heights = state.from_heights.clone();
-    state.spring = Spring::new(0.30, 0.86);
+
+    // Y 轴最大值跟着一起弹，柱子和刻度不会各跳各的
+    let target_max = state
+        .days
+        .iter()
+        .map(|day| day.output)
+        .max()
+        .unwrap_or(0)
+        .max(1) as f32;
+    state.max_from = if state.max_now > 0.0 { state.max_now } else { target_max };
+    state.max_to = target_max;
+    state.max_now = state.max_from;
+
+    state.spring = Spring::new(SPRING_RESPONSE, SPRING_DAMPING);
     state.animating = true;
-    state.last_tick = now;
+    state.last_tick = std::time::Instant::now();
 }
 
 unsafe extern "system" fn canvas_proc(
@@ -507,12 +531,13 @@ unsafe extern "system" fn canvas_proc(
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
                 let state = &mut *state;
-                let now = now_ms();
-                let dt = ((now - state.last_tick) as f64 / 1000.0).clamp(0.0, 0.05);
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(state.last_tick).as_secs_f64().clamp(0.0, 0.05);
                 state.last_tick = now;
 
                 state.spring.step(1.0, dt);
                 let t = state.spring.value as f32;
+                state.max_now = state.max_from + (state.max_to - state.max_from) * t;
                 for index in 0..state.now_heights.len() {
                     let from = *state.from_heights.get(index).unwrap_or(&0.0);
                     let to = *state.to_heights.get(index).unwrap_or(&0.0);
@@ -521,6 +546,7 @@ unsafe extern "system" fn canvas_proc(
 
                 if state.spring.settled(1.0) {
                     state.now_heights = state.to_heights.clone();
+                    state.max_now = state.max_to;
                     state.animating = false;
                     // 让投递线程自然退出
                     ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -952,13 +978,8 @@ fn paint(hwnd: HWND, hdc: HDC) {
         let plot_height = (plot_bottom - plot_top).max(10);
         let plot_width = (plot_right - plot_left).max(10);
 
-        let max_output = state
-            .days
-            .iter()
-            .map(|day| day.output)
-            .max()
-            .unwrap_or(0)
-            .max(1) as f32;
+        // Y 轴最大值来自弹簧（切换区间/来源时和柱子一起动）
+        let max_output = state.max_now.max(1.0);
 
         // 网格 + Y 轴
         for step in 0..=2 {
