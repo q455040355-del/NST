@@ -67,14 +67,22 @@ pub fn taskbar_is_light() -> bool {
 
 pub struct Fonts {
     pub label: HFONT,
+    /// CPU/GPU 这类标签在小面板里要缩一档
+    pub label_small: HFONT,
     pub value: HFONT,
+    pub value_mid: HFONT,
+    pub value_small: HFONT,
 }
 
 impl Fonts {
     pub fn create(dpi: u32) -> Self {
         Self {
             label: create_font(dpi, 9.5, FW_BOLD, "Microsoft YaHei UI"),
-            value: create_font(dpi, 11.0, FW_NORMAL, "Consolas"),
+            label_small: create_font(dpi, 8.5, FW_BOLD, "Microsoft YaHei UI"),
+            // 数字也走同一个字体（以前是 Consolas，和中文混排时字重/基线对不上）
+            value: create_font(dpi, 11.0, FW_NORMAL, "Microsoft YaHei UI"),
+            value_mid: create_font(dpi, 10.0, FW_NORMAL, "Microsoft YaHei UI"),
+            value_small: create_font(dpi, 9.0, FW_NORMAL, "Microsoft YaHei UI"),
         }
     }
 }
@@ -82,8 +90,15 @@ impl Fonts {
 impl Drop for Fonts {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.label as *mut _);
-            DeleteObject(self.value as *mut _);
+            for handle in [
+                self.label,
+                self.label_small,
+                self.value,
+                self.value_mid,
+                self.value_small,
+            ] {
+                DeleteObject(handle as *mut _);
+            }
         }
     }
 }

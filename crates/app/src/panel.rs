@@ -9,9 +9,9 @@ use netspeed_core::{format_bytes_gb, format_speed, format_temperature, MemorySna
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, GetDC, GetPixel, InvalidateRect, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DT_LEFT, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
+    DeleteObject, EndPaint, FillRect, GetDC, GetPixel, GetTextExtentPoint32W, InvalidateRect,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DT_LEFT,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE,
@@ -500,16 +500,46 @@ impl Panel {
         let color = if is_down { self.colors.down } else { self.colors.up };
         unsafe {
             SetBkMode(dc, TRANSPARENT as i32);
-            let font = SelectObject(dc, self.fonts.label as HGDIOBJ);
-            SetTextColor(dc, color);
-            draw_text(dc, &wide(label), pad, top, pad + scale(self.dpi, 20), top + row_height, DT_LEFT);
 
-            SelectObject(dc, self.fonts.value as HGDIOBJ);
+            // 标签列不再写死 20px：雅黑比 Consolas 宽，写死会把 CPU/GPU 切掉
+            let gap = scale(self.dpi, 4);
+            let available = self.width - pad * 2;
+            let mut label_font = self.fonts.label;
+            let mut value_font = self.fonts.value;
+            for (candidate_label, candidate_value) in [
+                (self.fonts.label, self.fonts.value),
+                (self.fonts.label, self.fonts.value_mid),
+                (self.fonts.label_small, self.fonts.value_mid),
+                (self.fonts.label_small, self.fonts.value_small),
+            ] {
+                let label_w = text_width(dc, label, candidate_label);
+                let value_w = text_width(dc, value, candidate_value);
+                label_font = candidate_label;
+                value_font = candidate_value;
+                if label_w + value_w + gap <= available {
+                    break;
+                }
+            }
+
+            let label_w = text_width(dc, label, label_font);
+            let font = SelectObject(dc, label_font as HGDIOBJ);
+            SetTextColor(dc, color);
+            draw_text(
+                dc,
+                &wide(label),
+                pad,
+                top,
+                pad + label_w + 2,
+                top + row_height,
+                DT_LEFT,
+            );
+
+            SelectObject(dc, value_font as HGDIOBJ);
             SetTextColor(dc, self.colors.value);
             draw_text(
                 dc,
                 &wide(value),
-                pad,
+                pad + label_w + gap,
                 top,
                 self.width - pad,
                 top + row_height,
@@ -576,6 +606,18 @@ fn draw_text(dc: HDC, text: &[u16], left: i32, top: i32, right: i32, bottom: i32
     let flags = align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
     unsafe {
         DrawTextW(dc, text.as_ptr(), (text.len() - 1) as i32, &mut rect, flags);
+    }
+}
+
+/// 量一段文字在当前字体下的像素宽（挑字号用）
+fn text_width(dc: HDC, text: &str, font: HFONT) -> i32 {
+    unsafe {
+        let old = SelectObject(dc, font as HGDIOBJ);
+        let mut size: SIZE = std::mem::zeroed();
+        let units = wide(text);
+        GetTextExtentPoint32W(dc, units.as_ptr(), (units.len() - 1) as i32, &mut size);
+        SelectObject(dc, old);
+        size.cx
     }
 }
 

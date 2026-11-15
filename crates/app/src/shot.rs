@@ -1,4 +1,4 @@
-﻿//! 轻量截图 + 标注（自研，纯 Win32/GDI）。
+//! 轻量截图 + 标注（自研，纯 Win32/GDI）。
 //!
 //! 交互参考 Snow Shot，但代码全部自己写，不引入其 GPL-3.0 实现：
 //!   Ctrl+Shift+A / 右键菜单「截图…」
@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
     GetStockObject, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline, ReleaseDC, SelectObject,
-    SetBkMode, SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchBlt, TextOutW, BITMAPINFO,
+    ScreenToClient, SetBkColor, SetBkMode, SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchBlt, TextOutW, BITMAPINFO,
     BITMAPINFOHEADER,
     CLEARTYPE_QUALITY, COLORONCOLOR, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
     HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
@@ -648,6 +648,7 @@ pub unsafe fn begin(panel: HWND) {
     }
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+    crate::ui::round_corners(hwnd);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
@@ -663,6 +664,8 @@ enum Tool {
     Pen,
     Text,
     Mosaic,
+    /// 拖框选一块区域做 OCR
+    Ocr,
 }
 
 #[derive(Clone)]
@@ -688,6 +691,8 @@ enum Action {
 struct TextEdit {
     hwnd: HWND,
     at: (i32, i32),
+    /// 拖出来的框宽（图片坐标），输入时画框用
+    width: i32,
 }
 
 struct Editor {
@@ -727,6 +732,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Pen) => "画笔",
         Action::Tool(Tool::Text) => "文字",
         Action::Tool(Tool::Mosaic) => "马赛克",
+        Action::Tool(Tool::Ocr) => "取字",
         Action::Undo => "撤销",
         Action::Copy => "复制",
         Action::Save => "保存",
@@ -886,6 +892,100 @@ fn draw_mosaic(dc: HDC, base: &Bitmap, a: (i32, i32), b: (i32, i32), scale: f32,
         DeleteDC(src_dc);
     }
 }
+/// 拖拽时的选框：虚线边框 + 右上角的尺寸标签，让「框到哪儿」一眼看得见
+fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
+    let left = a.0.min(b.0);
+    let top = a.1.min(b.1);
+    let right = a.0.max(b.0);
+    let bottom = a.1.max(b.1);
+    if right - left < 1 || bottom - top < 1 {
+        return;
+    }
+
+    unsafe {
+        // 白色虚线：先在下面描一条深色，深浅背景都能看清
+        for color in [0x0000_0000u32, 0x00FF_FFFFu32] {
+            let pen = CreatePen(2, 1, color); // PS_DOT
+            let old = SelectObject(dc, pen as HGDIOBJ);
+            let inset = if color == 0 { 1 } else { 0 };
+            MoveToEx(dc, left + inset, top + inset, std::ptr::null_mut());
+            LineTo(dc, right - inset, top + inset);
+            LineTo(dc, right - inset, bottom - inset);
+            LineTo(dc, left + inset, bottom - inset);
+            LineTo(dc, left + inset, top + inset);
+            SelectObject(dc, old);
+            DeleteObject(pen as *mut _);
+        }
+
+        // 尺寸标签
+        let label = format!("{} × {}", right - left, bottom - top);
+        let font = cached_font(9.0, 600);
+        let old_font = SelectObject(dc, font as HGDIOBJ);
+        let mut measure = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let units = wide(&label);
+        // 先选字体再量，否则量的是上一个字体，标签会被切掉
+        DrawTextW(
+            dc,
+            units.as_ptr(),
+            (units.len() - 1) as i32,
+            &mut measure,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        let pad = (6.0 * scale).round().max(4.0) as i32;
+        let label_h = (measure.bottom - measure.top).max(12) + pad / 2;
+        let label_w = (measure.right - measure.left) + pad * 2 + (2.0 * scale) as i32;
+        let chip_left = left;
+        let chip_top = if top - label_h - 3 >= 0 {
+            top - label_h - 3
+        } else {
+            top + 3
+        };
+        let brush = CreateSolidBrush(0x0022_1F1E); // 深灰
+        let old_brush = SelectObject(dc, brush as HGDIOBJ);
+        let mut chip = RECT {
+            left: chip_left,
+            top: chip_top,
+            right: chip_left + label_w,
+            bottom: chip_top + label_h,
+        };
+        FillRect(dc, &chip, brush);
+        SelectObject(dc, old_brush);
+        DeleteObject(brush as *mut _);
+
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, 0x00FF_FFFF);
+        let mut text_rect = RECT {
+            left: chip_left + pad,
+            top: chip_top,
+            right: chip_left + label_w - pad,
+            bottom: chip_top + label_h,
+        };
+        DrawTextW(
+            dc,
+            units.as_ptr(),
+            (units.len() - 1) as i32,
+            &mut text_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_font);
+    }
+}
+
+fn hint_for(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Text => "拖出文字位置后直接输入 · Enter 提交 · Esc 取消",
+        Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
+        Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
+        _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
+    }
+}
+
 fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
     let width = (2.0 * editor.scale).round().max(2.0) as i32;
     for shape in editor.shapes.iter().skip(from) {
@@ -997,13 +1097,34 @@ unsafe fn editor_paint(hwnd: HWND) {
             Tool::Arrow => draw_arrow(dc, from, to, width),
             Tool::Rect => draw_rect(dc, from, to, width),
             Tool::Mosaic => {
-                draw_mosaic(dc, &editor.base, from, to, editor.scale, (8.0 * editor.scale) as i32)
+                // 实时看到打码效果，外面再套一层选框
+                draw_mosaic(dc, &editor.base, from, to, editor.scale, (8.0 * editor.scale) as i32);
+                draw_drag_frame(dc, from, to, editor.scale);
             }
+            Tool::Text | Tool::Ocr => draw_drag_frame(dc, from, to, editor.scale),
             _ => {}
         }
     }
     if editor.tool == Tool::Pen && editor.pen_points.len() > 1 {
         draw_pen(dc, &editor.pen_points, width);
+    }
+
+    // 正在输入文字：把位置框出来，免得白底白字看不见输入框在哪
+    if let Some(text) = &editor.text {
+        let height = (24.0 * editor.scale).round() as i32;
+        let left = text.at.0;
+        let top = text.at.1;
+        let right = left + text.width.max(40);
+        let bottom = top + height;
+        let pen = CreatePen(2, 1, crate::ui::ACCENT); // PS_DOT
+        let old = SelectObject(dc, pen as HGDIOBJ);
+        MoveToEx(dc, left, top, std::ptr::null_mut());
+        LineTo(dc, right, top);
+        LineTo(dc, right, bottom);
+        LineTo(dc, left, bottom);
+        LineTo(dc, left, top);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
     }
 
     SetViewportOrgEx(dc, old_origin.x, old_origin.y, std::ptr::null_mut());
@@ -1086,7 +1207,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     SelectObject(dc, old_font);
 
     // 提示
-    let hint = "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消";
+    let hint = hint_for(editor.tool);
     let hint_font = cached_font(8.0, 400);
     let old_hint = SelectObject(dc, hint_font as HGDIOBJ);
     SetTextColor(dc, EDITOR_MUTED);
@@ -1489,7 +1610,7 @@ unsafe fn commit_text(parent: HWND) {
     InvalidateRect(parent, std::ptr::null(), 0);
 }
 
-unsafe fn start_text(parent: HWND, at: (i32, i32)) {
+unsafe fn start_text(parent: HWND, at: (i32, i32), box_width: i32) {
     let editor = editor_state(parent);
     if editor.is_null() {
         return;
@@ -1501,17 +1622,19 @@ unsafe fn start_text(parent: HWND, at: (i32, i32)) {
 
     let instance = GetModuleHandleW(std::ptr::null());
     let height = s(26.0);
-    let left = editor_ref.image_left + at.0;
-    let top = editor_ref.image_top + at.1;
+    let left = editor_ref.image_left + (at.0 as f32 * editor_ref.scale) as i32;
+    let top = editor_ref.image_top + (at.1 as f32 * editor_ref.scale) as i32;
+    // 输入框至少 160，跟着拖出来的框宽（超长会横向滚动）
+    let width = ((box_width as f32 * editor_ref.scale) as i32).max(s(160.0));
 
     let edit = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
+        0,
         wide("EDIT").as_ptr(),
         std::ptr::null(),
         WS_CHILD | WS_VISIBLE | 0x0080, // ES_AUTOHSCROLL
         left,
         top,
-        s(180.0),
+        width,
         height,
         parent,
         std::ptr::null_mut(),
@@ -1528,7 +1651,11 @@ unsafe fn start_text(parent: HWND, at: (i32, i32)) {
     TEXT_OLD_PROC = SetWindowLongPtrW(edit, GWLP_WNDPROC, text_edit_proc as isize);
 
     let editor = &mut *editor;
-    editor.text = Some(TextEdit { hwnd: edit, at });
+    editor.text = Some(TextEdit {
+        hwnd: edit,
+        at,
+        width: box_width,
+    });
     SetFocus(edit);
     InvalidateRect(parent, std::ptr::null(), 0);
 }
@@ -1568,12 +1695,11 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             }
         }
         Action::Ocr => {
+            // 进入框选模式：拖一块出来，只识别那块（整图就拖满）
             commit_text(hwnd);
-            let editor = &*editor;
-            let bitmap = composite(editor);
-            // 结果窗挂到任务栏面板窗口上（WM_APP_OCR_READY 在那边处理）
-            let target = if PANEL.is_null() { hwnd } else { PANEL };
-            crate::ocr::recognize_async(target, bitmap);
+            let editor = &mut *editor;
+            editor.tool = Tool::Ocr;
+            SetWindowTextW(hwnd, wide("截图编辑 · 拖框选择要识别的区域").as_ptr());
         }
         Action::Pin => {
             commit_text(hwnd);
@@ -1598,6 +1724,36 @@ unsafe fn hit_button(editor: &Editor, point: POINT) -> Option<Action> {
 
 unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_NCHITTEST => {
+            // 无边框窗口：工具栏空白处按住能拖窗口，按钮还是要能点
+            let mut point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            ScreenToClient(hwnd, &mut point);
+            let editor = editor_state(hwnd);
+            if !editor.is_null() && point.y < s(44.0) {
+                for (rect, _) in &(*editor).buttons {
+                    if point.x >= rect.left
+                        && point.x <= rect.right
+                        && point.y >= rect.top
+                        && point.y <= rect.bottom
+                    {
+                        return HTCLIENT as LRESULT;
+                    }
+                }
+                return HTCAPTION as LRESULT;
+            }
+            HTCLIENT as LRESULT
+        }
+        WM_CTLCOLOREDIT => {
+            // 文字输入框：浅蓝底 + 深色字，图片上是白的也能看出输入框在哪
+            let dc = wparam as HDC;
+            SetBkColor(dc, 0x00FF_F2_E8);
+            SetTextColor(dc, 0x001A_1614);
+            let brush = CreateSolidBrush(0x00FF_F2_E8);
+            brush as LRESULT
+        }
         WM_LBUTTONDOWN => {
             let mut point = POINT {
                 x: (lparam as i32) & 0xFFFF,
@@ -1624,7 +1780,12 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
             let _ = &mut point;
             match editor.tool {
-                Tool::Text => start_text(hwnd, (ix, iy)),
+                Tool::Text | Tool::Ocr => {
+                    // 文字 / 取字都先拖一个框，框住要处理的区域
+                    editor.drag_from = Some((ix, iy));
+                    editor.drag_to = Some((ix, iy));
+                    SetCapture(hwnd);
+                }
                 Tool::Pen => {
                     editor.pen_points = vec![(ix, iy)];
                     SetCapture(hwnd);
@@ -1677,13 +1838,37 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     editor.pen_points.clear();
                 }
             } else if let (Some(from), Some(to)) = (editor.drag_from, editor.drag_to) {
-                if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 {
-                    match editor.tool {
-                        Tool::Arrow => editor.shapes.push(Shape::Arrow { a: from, b: to }),
-                        Tool::Rect => editor.shapes.push(Shape::Rect { a: from, b: to }),
-                        Tool::Mosaic => editor.shapes.push(Shape::Mosaic { a: from, b: to }),
-                        _ => {}
+                let left = from.0.min(to.0);
+                let top = from.1.min(to.1);
+                let right = from.0.max(to.0);
+                let bottom = from.1.max(to.1);
+                let wide_enough = right - left >= 8 && bottom - top >= 8;
+
+                match editor.tool {
+                    Tool::Arrow if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
+                        editor.shapes.push(Shape::Arrow { a: from, b: to })
                     }
+                    Tool::Rect if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
+                        editor.shapes.push(Shape::Rect { a: from, b: to })
+                    }
+                    Tool::Mosaic if wide_enough => {
+                        editor.shapes.push(Shape::Mosaic { a: from, b: to })
+                    }
+                    Tool::Text if wide_enough => {
+                        // 框的左下角起笔，输入框宽度跟框一样宽
+                        let width = right - left;
+                        editor.tool = Tool::Arrow;
+                        start_text(hwnd, (left, top), width);
+                    }
+                    Tool::Ocr if wide_enough => {
+                        // 只对框里这块做 OCR
+                        let region = editor.base.crop(left, top, right - left, bottom - top);
+                        editor.tool = Tool::Arrow;
+                        let panel = PANEL;
+                        crate::ocr::recognize_async(panel, region);
+                        SetWindowTextW(hwnd, wide("截图编辑 · 正在识别…").as_ptr());
+                    }
+                    _ => {}
                 }
             }
 
@@ -1695,10 +1880,13 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_KEYDOWN => {
             match wparam as u32 {
                 0x1B => {
-                    // Esc：取消文字输入 → 否则关闭窗口
+                    // Esc：取消文字输入 → 退出取字框选 → 否则关闭窗口
                     let editor = editor_state(hwnd);
                     if !editor.is_null() && (*editor).text.is_some() {
                         cancel_text(hwnd);
+                    } else if !editor.is_null() && (*editor).tool == Tool::Ocr {
+                        (*editor).tool = Tool::Arrow;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else {
                         DestroyWindow(hwnd);
                     }
@@ -1769,7 +1957,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     let instance = GetModuleHandleW(std::ptr::null());
     let class = wide(EDITOR_CLASS);
     let wc = WNDCLASSW {
-        style: 0,
+        style: CS_DROPSHADOW,
         lpfnWndProc: Some(editor_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
@@ -1805,17 +1993,9 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     let client_w = image_w.max(s(600.0));
     let client_h = toolbar + image_h + hint;
 
-    let mut rect = RECT {
-        left: work.left + ((work.right - work.left) - client_w) / 2,
-        top: work.top + ((work.bottom - work.top) - client_h) / 2,
-        right: 0,
-        bottom: 0,
-    };
-    rect.right = rect.left + client_w;
-    rect.bottom = rect.top + client_h;
-    AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
-    let window_w = rect.right - rect.left;
-    let window_h = rect.bottom - rect.top;
+    // 无边框：窗口就是客户区，位置居中
+    let window_w = client_w;
+    let window_h = client_h;
     let window_x = work.left + ((work.right - work.left) - window_w) / 2;
     let window_y = work.top + ((work.bottom - work.top) - window_h) / 3;
 
@@ -1839,7 +2019,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
         0,
         class.as_ptr(),
         wide("截图编辑").as_ptr(),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_POPUP | WS_VISIBLE,
         window_x,
         window_y,
         window_w,
@@ -1857,6 +2037,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     }
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+    crate::ui::round_corners(hwnd);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);

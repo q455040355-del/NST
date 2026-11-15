@@ -1,4 +1,4 @@
-﻿//! 用量历史窗口：区间胶囊 + 四张卡片 + 按来源堆叠柱状图 + 每日明细表。
+//! 用量历史窗口：区间胶囊 + 四张卡片 + 按来源堆叠柱状图 + 每日明细表。
 //!
 //! 整窗自绘（一个 canvas 子窗口），数据在后台线程加载，弹簧动效和 AgentSpeed 同款参数。
 
@@ -20,7 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 const DT_NOPREFIX: u32 = 0x0800;
 const DT_CALCRECT: u32 = 0x0400;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
@@ -160,6 +160,8 @@ struct State {
     /// 0 = 全部来源，1..=4 = all_sources() 里对应的一路
     source: usize,
     source_rects: Vec<RECT>,
+    /// 右上角的关闭按钮
+    close_rect: RECT,
     scroll: usize,
     /// 图表卡片区域（动画期间只重画这块）
     chart_rect: RECT,
@@ -190,14 +192,14 @@ pub fn open(_parent: HWND) {
         let window_title = wide("用量历史");
 
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_DROPSHADOW | CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
             hIcon: crate::tray::create_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: (15 + 1) as usize as *mut _, // COLOR_BTNFACE
+            hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: class_name.as_ptr(),
         };
@@ -259,6 +261,12 @@ pub fn open(_parent: HWND) {
             pill_rects: Vec::new(),
             source: 0,
             source_rects: Vec::new(),
+            close_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
             scroll: 0,
             chart_rect: RECT {
                 left: 0,
@@ -281,7 +289,7 @@ pub fn open(_parent: HWND) {
             0,
             class_name.as_ptr(),
             window_title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            WS_POPUP | WS_CLIPCHILDREN,
             left,
             top,
             width,
@@ -299,6 +307,7 @@ pub fn open(_parent: HWND) {
         }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+        crate::ui::round_corners(hwnd);
 
         let canvas = CreateWindowExW(
             0,
@@ -719,6 +728,33 @@ unsafe extern "system" fn canvas_proc(
 
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 UpdateWindow(hwnd);
+            }
+            0
+        }
+        WM_LBUTTONDOWN => {
+            // 无边框窗口：右上角 × 关闭，标题栏空白处按住可以拖窗口
+            let x = (lparam as i32) & 0xFFFF;
+            let y = ((lparam as i32) >> 16) & 0xFFFF;
+            let parent = GetParent(hwnd);
+            let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
+            if !state.is_null() {
+                let state = &mut *state;
+                let c = state.close_rect;
+                if x >= c.left && x <= c.right && y >= c.top && y <= c.bottom {
+                    DestroyWindow(parent);
+                    return 0;
+                }
+
+                let on_chip = state
+                    .pill_rects
+                    .iter()
+                    .chain(state.source_rects.iter())
+                    .any(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom);
+                if y < crate::ui::s(70.0, crate::screen_scale()) && !on_chip {
+                    ReleaseCapture();
+                    SendMessageW(parent, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
+                    return 0;
+                }
             }
             0
         }
@@ -1306,6 +1342,23 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         p.s(48.0),
         DT_LEFT,
     );
+
+    // 右上角关闭 ×
+    let close_size = p.s(28.0);
+    state.close_rect = RECT {
+        left: p.width - l.pad - close_size,
+        top: p.s(12.0),
+        right: p.width - l.pad,
+        bottom: p.s(12.0) + close_size,
+    };
+    {
+        let c = state.close_rect;
+        let cx = (c.left + c.right) / 2;
+        let cy = (c.top + c.bottom) / 2;
+        let arm = p.s(5.0);
+        p.solid_line(cx - arm, cy - arm, cx + arm, cy + arm, TEXT3);
+        p.solid_line(cx - arm, cy + arm, cx + arm, cy - arm, TEXT3);
+    }
 
     let subtitle = if state.loading {
         "正在读取…".to_string()

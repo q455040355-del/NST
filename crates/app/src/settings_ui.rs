@@ -468,19 +468,9 @@ unsafe fn paint(hwnd: HWND) {
         state.fonts.title,
         TEXT,
         pad + p.s(4.0),
-        p.s(14.0),
+        p.s(16.0),
         content_right,
-        p.s(40.0),
-        DT_LEFT,
-    );
-    p.text(
-        "改动即时生效，自动写入 settings.ini",
-        state.fonts.small,
-        TEXT2,
-        pad + p.s(4.0),
-        p.s(38.0),
-        content_right,
-        p.s(58.0),
+        p.s(46.0),
         DT_LEFT,
     );
 
@@ -636,17 +626,6 @@ unsafe fn paint(hwnd: HWND) {
     // 底部分割线
     let foot_top = client.bottom - p.s(64.0);
     p.fill(0, foot_top, client.right, foot_top + 1, BORDER);
-
-    p.text(
-        "拖动滑块调宽度 · 点开下拉切换来源",
-        state.fonts.small,
-        TEXT2,
-        pad + p.s(4.0),
-        l.done.top,
-        l.done.left - p.s(8.0),
-        l.done.bottom,
-        DT_LEFT,
-    );
 
     let done_hover = state.hover == Some(Hit::Done);
     let done_fill = if done_hover {

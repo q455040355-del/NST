@@ -1,44 +1,298 @@
-﻿//! 取字结果窗：多行可编辑文本框 + 复制 / 关闭（识别完自动复制一次）。
+//! 取字结果窗（自绘卡片 + 无边框多行编辑框）。
+//!
+//! 文本区还是原生 EDIT（要输入法、要选择、要 Ctrl+C），但去掉了系统边框，
+//! 背景和卡片同色，外围的标题 / 按钮 / 状态全是自己画的。
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ,
+    BeginPaint, BitBlt, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, ScreenToClient,
+    SetBkColor, SetTextColor, HBRUSH, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const COLOR_BTNFACE: u32 = 15;
-
 use crate::theme::wide;
+use crate::ui::{
+    self, font, mix_white, Painter, ACCENT, ACCENT_PRESSED, BORDER, CHIP, DT_CENTER, DT_LEFT,
+    SURFACE, TEXT, TEXT2, TEXT3,
+};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.OcrResult";
 const ID_EDIT: usize = 2001;
-const ID_COPY: usize = 2002;
-const ID_CLOSE: usize = 2003;
-const ID_STATUS: usize = 2004;
+
+const EM_SETMARGINS: u32 = 0x00D3;
+const EC_LEFTMARGIN: usize = 0x0001;
+const EC_RIGHTMARGIN: usize = 0x0002;
+const EM_SETSEL: u32 = 0x00B1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Close,
+    Copy,
+}
+
+struct State {
+    edit: HWND,
+    status: String,
+    fonts: Fonts,
+    scale: f32,
+    hover: Option<Hit>,
+    /// EDIT 的底色画刷（WM_CTLCOLOREDIT 必须返回一个常驻句柄，不能每次新建）
+    edit_brush: HBRUSH,
+}
+
+struct Fonts {
+    title: ::windows_sys::Win32::Graphics::Gdi::HFONT,
+    body: ::windows_sys::Win32::Graphics::Gdi::HFONT,
+    small: ::windows_sys::Win32::Graphics::Gdi::HFONT,
+}
+
+impl Fonts {
+    fn create(scale: f32) -> Self {
+        Self {
+            title: font(12.5, 650, scale),
+            body: font(10.0, 400, scale),
+            small: font(9.0, 400, scale),
+        }
+    }
+}
+
+fn state_of(hwnd: HWND) -> *mut State {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State }
+}
+
+struct Layout {
+    close: RECT,
+    copy: RECT,
+    edit: RECT,
+}
+
+fn layout(state: &State, client: RECT) -> Layout {
+    let scale = state.scale;
+    let pad = ui::s(16.0, scale);
+
+    let close_size = ui::s(26.0, scale);
+    let close = RECT {
+        left: client.right - pad - close_size,
+        top: ui::s(14.0, scale),
+        right: client.right - pad,
+        bottom: ui::s(14.0, scale) + close_size,
+    };
+
+    let button_w = ui::s(84.0, scale);
+    let button_h = ui::s(32.0, scale);
+    let copy = RECT {
+        left: client.right - pad - button_w,
+        top: client.bottom - pad - button_h,
+        right: client.right - pad,
+        bottom: client.bottom - pad,
+    };
+
+    let edit = RECT {
+        left: pad,
+        top: ui::s(54.0, scale),
+        right: client.right - pad,
+        bottom: copy.top - ui::s(12.0, scale),
+    };
+
+    Layout { close, copy, edit }
+}
+
+fn contains(rect: &RECT, point: POINT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+unsafe fn paint(hwnd: HWND) {
+    let state = state_of(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    GetClientRect(hwnd, &mut client);
+    if client.right <= 0 || client.bottom <= 0 {
+        return;
+    }
+
+    let Some(dib) = ui::Dib::new(client.right, client.bottom) else {
+        return;
+    };
+    let p = Painter::new(dib.dc, state.scale);
+    let l = layout(state, client);
+    let pad = p.s(16.0);
+
+    p.fill(0, 0, client.right, client.bottom, ui::BG);
+    p.round(
+        0,
+        0,
+        client.right,
+        client.bottom,
+        p.s(16.0),
+        SURFACE,
+        BORDER,
+    );
+
+    // 标题
+    p.text(
+        "取字结果",
+        state.fonts.title,
+        TEXT,
+        pad + p.s(2.0),
+        p.s(14.0),
+        l.close.left - p.s(8.0),
+        p.s(44.0),
+        DT_LEFT,
+    );
+
+    // 关闭 ×
+    let close_hover = state.hover == Some(Hit::Close);
+    if close_hover {
+        p.round(
+            l.close.left,
+            l.close.top,
+            l.close.right,
+            l.close.bottom,
+            p.s(8.0),
+            CHIP,
+            CHIP,
+        );
+    }
+    let cx = (l.close.left + l.close.right) / 2;
+    let cy = (l.close.top + l.close.bottom) / 2;
+    let arm = p.s(5.0);
+    let ink = if close_hover { TEXT } else { TEXT2 };
+    p.line(cx - arm, cy - arm, cx + arm, cy + arm, ink, p.s(1.4));
+    p.line(cx - arm, cy + arm, cx + arm, cy - arm, ink, p.s(1.4));
+
+    // 文本区底板（EDIT 就盖在这块上，靠 WM_CTLCOLOREDIT 同色）
+    p.round(
+        l.edit.left - p.s(8.0),
+        l.edit.top - p.s(8.0),
+        l.edit.right + p.s(8.0),
+        l.edit.bottom + p.s(8.0),
+        p.s(10.0),
+        mix_white(SURFACE, 0.0),
+        BORDER,
+    );
+
+    // 底部
+    p.text(
+        &state.status,
+        state.fonts.small,
+        TEXT3,
+        pad + p.s(2.0),
+        l.copy.top,
+        l.copy.left - p.s(10.0),
+        l.copy.bottom,
+        DT_LEFT,
+    );
+
+    let hover = state.hover == Some(Hit::Copy);
+    let fill = if hover { ACCENT_PRESSED } else { ACCENT };
+    p.round(
+        l.copy.left,
+        l.copy.top,
+        l.copy.right,
+        l.copy.bottom,
+        p.s(9.0),
+        fill,
+        fill,
+    );
+    p.text(
+        "复制",
+        state.fonts.body,
+        0x00FF_FFFF,
+        l.copy.left,
+        l.copy.top,
+        l.copy.right,
+        l.copy.bottom,
+        DT_CENTER,
+    );
+
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    BitBlt(hdc, 0, 0, client.right, client.bottom, dib.dc, 0, 0, SRCCOPY);
+    EndPaint(hwnd, &mut ps);
+}
+
+unsafe fn layout_edit(hwnd: HWND) {
+    let state = state_of(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    GetClientRect(hwnd, &mut client);
+    let l = layout(state, client);
+    if !state.edit.is_null() {
+        MoveWindow(
+            state.edit,
+            l.edit.left,
+            l.edit.top,
+            l.edit.right - l.edit.left,
+            l.edit.bottom - l.edit.top,
+            1,
+        );
+        SendMessageW(
+            state.edit,
+            EM_SETMARGINS,
+            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
+            (ui::s(8.0, state.scale) as isize) | ((ui::s(8.0, state.scale) as isize) << 16),
+        );
+    }
+}
+
+unsafe fn copy_from_edit(hwnd: HWND) {
+    let state = state_of(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+    if state.edit.is_null() {
+        return;
+    }
+    let length = GetWindowTextLengthW(state.edit);
+    let mut buffer = vec![0u16; (length + 1) as usize];
+    GetWindowTextW(state.edit, buffer.as_mut_ptr(), buffer.len() as i32);
+    let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    crate::ocr::copy_text(&text);
+    state.status = format!("已复制到剪贴板 · {} 字", text.chars().count());
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+}
 
 pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class = wide(CLASS_NAME);
         let wc = WNDCLASSW {
-            style: 0,
+            style: CS_DROPSHADOW,
             lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
             hIcon: crate::tray::create_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_BTNFACE + 1) as usize as *mut _,
+            hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: class.as_ptr(),
         };
         RegisterClassW(&wc);
 
         let scale = crate::screen_scale();
-        let client_w = (560.0 * scale) as i32;
-        let client_h = (420.0 * scale) as i32;
+        let width = ui::s(560.0, scale);
+        let height = ui::s(440.0, scale);
 
         let mut work = RECT {
             left: 0,
@@ -47,28 +301,32 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
             bottom: 0,
         };
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: client_w,
-            bottom: client_h,
+        let x = work.left + ((work.right - work.left) - width) / 2;
+        let y = work.top + ((work.bottom - work.top) - height) / 3;
+
+        let status = match error {
+            Some(message) => message.to_string(),
+            None => format!("已自动复制 · {} 字", text.chars().count()),
         };
-        AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
-        let window_w = rect.right - rect.left;
-        let window_h = rect.bottom - rect.top;
-        let x = work.left + ((work.right - work.left) - window_w) / 2;
-        let y = work.top + ((work.bottom - work.top) - window_h) / 3;
+
+        let state = Box::into_raw(Box::new(State {
+            edit: std::ptr::null_mut(),
+            status,
+            fonts: Fonts::create(scale),
+            scale,
+            hover: None,
+            edit_brush: CreateSolidBrush(SURFACE),
+        }));
 
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             class.as_ptr(),
             wide("取字结果").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE,
             x,
             y,
-            window_w,
-            window_h,
-            // 不挂任务栏面板当 owner（否则会变成置顶窗口，挡住别的软件）
+            width,
+            height,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
@@ -76,11 +334,14 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
         );
 
         if hwnd.is_null() {
+            let _ = Box::from_raw(state);
             return;
         }
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
 
+        // 文本区：原生 EDIT，但去掉边框（外观交给父窗口画）
         let edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             wide("EDIT").as_ptr(),
             wide(text).as_ptr(),
             WS_CHILD
@@ -100,166 +361,171 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
             std::ptr::null(),
         );
 
-        let font = GetStockObject(DEFAULT_GUI_FONT) as HGDIOBJ;
-        SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
-
-        let button_w = (78.0 * scale) as i32;
-        let button_h = (28.0 * scale) as i32;
-        let margin = (12.0 * scale) as i32;
-
-        CreateWindowExW(
-            0,
-            wide("BUTTON").as_ptr(),
-            wide("复制").as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | 0x0000_0001,
-            client_w - margin - button_w * 2 - margin,
-            client_h - margin - button_h,
-            button_w,
-            button_h,
-            hwnd,
-            ID_COPY as usize as *mut _,
-            instance,
-            std::ptr::null(),
-        );
-
-        CreateWindowExW(
-            0,
-            wide("BUTTON").as_ptr(),
-            wide("关闭").as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | 0x0000_0001,
-            client_w - margin - button_w,
-            client_h - margin - button_h,
-            button_w,
-            button_h,
-            hwnd,
-            ID_CLOSE as usize as *mut _,
-            instance,
-            std::ptr::null(),
-        );
-
-        let status_text = match error {
-            Some(message) => message.to_string(),
-            None => format!(
-                "已复制到剪贴板 · {} 字（可直接 Ctrl+V 粘贴）",
-                text.chars().count()
-            ),
-        };
-
-        CreateWindowExW(
-            0,
-            wide("STATIC").as_ptr(),
-            wide(&status_text).as_ptr(),
-            WS_CHILD | WS_VISIBLE,
-            margin,
-            client_h - margin - button_h,
-            client_w - margin * 3 - button_w * 2,
-            button_h,
-            hwnd,
-            ID_STATUS as usize as *mut _,
-            instance,
-            std::ptr::null(),
-        );
+        let body = (*state).fonts.body;
+        SendMessageW(edit, WM_SETFONT, body as WPARAM, 1);
+        (*state).edit = edit;
 
         if error.is_none() {
             crate::ocr::copy_text(text);
         }
 
-        // 子控件建好后才有尺寸：WM_SIZE 在创建子控件之前就到过了，这里补一次布局
-        layout(hwnd);
-
+        ui::round_corners(hwnd);
+        layout_edit(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         SetFocus(edit);
+        // 全选，方便直接 Ctrl+C
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
 
-unsafe fn layout(hwnd: HWND) {
-    let mut client = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    GetClientRect(hwnd, &mut client);
-
-    let scale = crate::screen_scale();
-    let margin = (12.0 * scale) as i32;
-    let button_h = (28.0 * scale) as i32;
-    let button_w = (78.0 * scale) as i32;
-
-    let edit = GetDlgItem(hwnd, ID_EDIT as i32);
-    if !edit.is_null() {
-        MoveWindow(
-            edit,
-            margin,
-            margin,
-            client.right - margin * 2,
-            client.bottom - margin * 2 - button_h - (8.0 * scale) as i32,
-            1,
-        );
-    }
-
-    let copy = GetDlgItem(hwnd, ID_COPY as i32);
-    let close = GetDlgItem(hwnd, ID_CLOSE as i32);
-    let status = GetDlgItem(hwnd, ID_STATUS as i32);
-    let bottom = client.bottom - margin - button_h;
-
-    if !copy.is_null() {
-        MoveWindow(
-            copy,
-            client.right - margin - button_w * 2 - margin,
-            bottom,
-            button_w,
-            button_h,
-            1,
-        );
-    }
-    if !close.is_null() {
-        MoveWindow(close, client.right - margin - button_w, bottom, button_w, button_h, 1);
-    }
-    if !status.is_null() {
-        MoveWindow(
-            status,
-            margin,
-            bottom,
-            client.right - margin * 3 - button_w * 2,
-            button_h,
-            1,
-        );
-    }
-}
-
-unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
-        WM_SIZE => {
-            layout(hwnd);
+        WM_PAINT => {
+            paint(hwnd);
             0
         }
-        WM_COMMAND => {
-            let id = wparam & 0xFFFF;
-            if id == ID_COPY {
-                let edit = GetDlgItem(hwnd, ID_EDIT as i32);
-                if !edit.is_null() {
-                    let length = GetWindowTextLengthW(edit);
-                    let mut buffer = vec![0u16; (length + 1) as usize];
-                    GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
-                    let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-                    crate::ocr::copy_text(&text);
-                    let status = GetDlgItem(hwnd, ID_STATUS as i32);
-                    if !status.is_null() {
-                        SetWindowTextW(status, wide("已复制到剪贴板").as_ptr());
-                    }
-                }
-                0
-            } else if id == ID_CLOSE {
-                DestroyWindow(hwnd);
-                0
-            } else {
-                DefWindowProcW(hwnd, msg, wparam, lparam)
+        WM_ERASEBKGND => 1,
+        WM_SIZE => {
+            layout_edit(hwnd);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        WM_CTLCOLOREDIT => {
+            let dc = wparam as ::windows_sys::Win32::Graphics::Gdi::HDC;
+            SetBkColor(dc, SURFACE);
+            SetTextColor(dc, TEXT);
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
             }
+            (*state).edit_brush as LRESULT
+        }
+        WM_NCHITTEST => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let mut point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            ScreenToClient(hwnd, &mut point);
+            let mut client = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut client);
+            let l = layout(&*state, client);
+            if point.y < ui::s(54.0, (*state).scale) && !contains(&l.close, point) {
+                return HTCAPTION as LRESULT;
+            }
+            HTCLIENT as LRESULT
+        }
+        WM_MOUSEMOVE => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            let mut client = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut client);
+            let l = layout(state, client);
+            let hover = if contains(&l.close, point) {
+                Some(Hit::Close)
+            } else if contains(&l.copy, point) {
+                Some(Hit::Copy)
+            } else {
+                None
+            };
+            if state.hover != hover {
+                state.hover = hover;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            let mut client = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut client);
+            let l = layout(&*state, client);
+            if contains(&l.close, point) {
+                DestroyWindow(hwnd);
+            } else if contains(&l.copy, point) {
+                copy_from_edit(hwnd);
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            let state = state_of(hwnd);
+            if !state.is_null() {
+                let mut point = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut point);
+                ScreenToClient(hwnd, &mut point);
+                let mut client = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                GetClientRect(hwnd, &mut client);
+                let l = layout(&*state, client);
+                if contains(&l.close, point) || contains(&l.copy, point) {
+                    ui::set_hand_cursor();
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_KEYDOWN => {
+            if wparam as u32 == 0x1B {
+                DestroyWindow(hwnd);
+            }
+            0
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            let state = state_of(hwnd);
+            if !state.is_null() {
+                let state = Box::from_raw(state);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                if !state.edit_brush.is_null() {
+                    DeleteObject(state.edit_brush as *mut _);
+                }
+                drop(state);
+            }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
