@@ -321,7 +321,14 @@ pub(crate) fn work_area() -> RECT {
     unsafe {
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
-        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        work_area_at(cursor)
+    }
+}
+
+/// 某个点所在显示器的可用区域
+pub(crate) fn work_area_at(point: POINT) -> RECT {
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
 
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -337,6 +344,39 @@ pub(crate) fn work_area() -> RECT {
         };
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
         work
+    }
+}
+
+/// 某块显示器当前的 DPI（per-monitor 生效值；失败就按 96 算）
+pub(crate) fn dpi_for_monitor(monitor: HMONITOR) -> u32 {
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    unsafe {
+        let mut x = 96_u32;
+        let mut y = 96_u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) == 0 {
+            x.max(96)
+        } else {
+            96
+        }
+    }
+}
+
+/// 鼠标所在显示器的缩放（1.0 = 100%）
+pub(crate) fn cursor_scale() -> f32 {
+    unsafe {
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        dpi_for_monitor(monitor) as f32 / 96.0
+    }
+}
+
+/// 屏幕坐标附近那块屏的缩放（气泡/菜单贴着面板或鼠标出现时用）
+pub(crate) fn scale_at(point: POINT) -> f32 {
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        dpi_for_monitor(monitor) as f32 / 96.0
     }
 }
 
@@ -578,7 +618,11 @@ fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
 /// （本进程 SetTimer/WM_TIMER 实测完全收不到，改用线程投递最稳。）
 /// 前台是不是一个占满整块显示器的窗口（游戏、视频全屏）。
 /// 任务栏/桌面/有 owner 的弹窗都不算。
-fn fullscreen_foreground() -> bool {
+/// 前台是不是一块屏上的真全屏窗口（游戏/视频）。
+///
+/// 只在它和 `panel` 在**同一块屏**时才算数：主屏打游戏不该把副屏任务栏上的
+/// 面板一起藏掉。
+fn fullscreen_foreground(panel: HWND) -> bool {
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
@@ -613,6 +657,11 @@ fn fullscreen_foreground() -> bool {
 
         let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
         if monitor.is_null() {
+            return false;
+        }
+
+        // 全屏窗口和面板不在同一块屏：不藏
+        if monitor != MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST) {
             return false;
         }
 
@@ -714,7 +763,7 @@ unsafe extern "system" fn wnd_proc(
             keep_on_top(hwnd);
 
             // 全屏程序（游戏/视频）在前台时把自己藏起来，否则一个 TOPMOST 面板会糊在画面上
-            let fullscreen = fullscreen_foreground();
+            let fullscreen = fullscreen_foreground(hwnd);
             let visible = IsWindowVisible(hwnd) != 0;
             // 截图/编辑过程中不要把自己弹出来盖住遮罩
             if !shot::active() && !fullscreen && !visible && !HIDDEN_BY_USER {

@@ -1437,7 +1437,8 @@ pub fn open(parent: HWND, settings: &Settings) {
         };
         RegisterClassW(&wc);
 
-        let scale = crate::screen_scale();
+        // 窗口开在鼠标那块屏上：缩放按那块屏算（多屏缩放不同也对）
+        let scale = crate::cursor_scale();
         let width_px = s(440.0, scale);
         let mut height_px = s(710.0, scale);
 
@@ -1865,6 +1866,49 @@ unsafe extern "system" fn dialog_proc(
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
             InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        // 设置窗可以拖到另一块屏：缩放跟着那块屏走（字体/尺寸/布局全部重算）
+        WM_DPICHANGED => {
+            let dpi = ((wparam >> 16) & 0xFFFF) as u32;
+            let scale = (dpi.max(96) as f32) / 96.0;
+            let state = state_of(hwnd);
+            if !state.is_null() {
+                (*state).scale = scale;
+                (*state).fonts = Fonts::create(scale);
+                (*state).scroll = 0;
+
+                let width = s(440.0, scale);
+                let mut height = s(710.0, scale);
+                let suggested = lparam as *const RECT;
+                let (left, top) = if suggested.is_null() {
+                    let mut rect = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    GetWindowRect(hwnd, &mut rect);
+                    (rect.left, rect.top)
+                } else {
+                    ((*suggested).left, (*suggested).top)
+                };
+
+                let work = crate::work_area_at(POINT { x: left, y: top });
+                let available = ((work.bottom - work.top) - s(48.0, scale)).max(s(360.0, scale));
+                height = height.min(available);
+
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    left,
+                    top,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
             0
         }
         WM_KEYDOWN => {

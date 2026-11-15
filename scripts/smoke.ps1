@@ -253,9 +253,10 @@ if (-not $hadRun) {
 }
 
 # ---------------------------------------------------------------- 收尾
-[void][Smoke]::PostMessageW($settings, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-Start-Sleep -Milliseconds 300
-Check "设置窗可关闭" (-not [Smoke]::IsWindow($settings))
+# Esc 也能关（和点「完成」等价），这里顺便把它测掉
+[void][Smoke]::PostMessageW($settings, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+Check "Esc 关闭设置窗" (-not [Smoke]::IsWindow($settings))
 
 Write-Host ""
 if ($failures.Count -eq 0) {

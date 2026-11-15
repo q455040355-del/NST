@@ -185,7 +185,9 @@ pub fn open(_parent: HWND) {
         }
 
         let instance = GetModuleHandleW(std::ptr::null());
-        let scale = crate::screen_scale();
+        // 鼠标那块屏的缩放（窗口就开在那块屏上）
+        let scale = crate::cursor_scale();
+        UI_SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
         // wide() 的 Vec 必须活到 RegisterClassW 之后
         let class_name = wide(CLASS_NAME);
@@ -345,6 +347,19 @@ pub fn open(_parent: HWND) {
 
         // 后台加载
         start_loading(hwnd);
+    }
+}
+
+/// 这个窗口所在屏的缩放。窗口打开时定下来，绘制和字体都用它，
+/// 免得窗口在副屏、字体却按主屏 DPI 算。
+static UI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn ui_scale() -> f32 {
+    let bits = UI_SCALE.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        crate::screen_scale()
+    } else {
+        f32::from_bits(bits)
     }
 }
 
@@ -764,6 +779,13 @@ unsafe extern "system" fn canvas_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // Esc 关闭：焦点通常在 canvas 上（它铺满整个窗口），父窗口收不到
+        WM_KEYDOWN => {
+            if wparam as u32 == 0x1B {
+                DestroyWindow(GetParent(hwnd));
+            }
+            0
+        }
         // 系统切明暗主题：整套配色要重画
         WM_SETTINGCHANGE => {
             InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -839,7 +861,7 @@ unsafe extern "system" fn canvas_proc(
                     .iter()
                     .chain(state.source_rects.iter())
                     .any(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom);
-                if y < crate::ui::s(70.0, crate::screen_scale()) && !on_chip {
+                if y < crate::ui::s(70.0, ui_scale()) && !on_chip {
                     ReleaseCapture();
                     SendMessageW(parent, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
                     return 0;
@@ -1000,6 +1022,7 @@ unsafe fn hatch_brush(color: u32) -> HBRUSH {
             return *handle;
         }
 
+        // 鼠标那块屏的缩放（打开时定下来）
         let scale = crate::screen_scale();
         let size = (6.0 * scale).round().max(6.0) as i32;
 
@@ -1304,7 +1327,7 @@ impl Painter {
 }
 
 fn make_font(points: f32, weight: i32) -> HFONT {
-    let height = -((points * crate::screen_scale() * 96.0 / 72.0).round() as i32);
+    let height = -((points * ui_scale() * 96.0 / 72.0).round() as i32);
     unsafe {
         CreateFontW(
             height,
@@ -2234,7 +2257,7 @@ fn paint(hwnd: HWND, hdc: HDC, ps: &PAINTSTRUCT) {
             dc,
             width: client.right,
             height: client.bottom,
-            scale: crate::screen_scale(),
+            scale: ui_scale(),
         };
 
         let chart = state.chart_rect;

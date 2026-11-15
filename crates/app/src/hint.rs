@@ -152,16 +152,15 @@ pub unsafe fn show(anchor: RECT, text: &str) {
         return;
     }
 
-    let scale = crate::screen_scale();
+    // 面板在哪块屏，气泡就用那块屏的缩放和工作区（多屏缩放不同也不会跑偏）
+    let center = POINT {
+        x: (anchor.left + anchor.right) / 2,
+        y: (anchor.top + anchor.bottom) / 2,
+    };
+    let scale = crate::scale_at(center);
     let (width, height) = measure(text, scale);
 
-    let mut work = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+    let work = crate::work_area_at(center);
 
     // 横向贴着面板居中，纵向放在面板上方（面板本身在任务栏里，放下面会出屏）
     let left = ((anchor.left + anchor.right) / 2 - width / 2)

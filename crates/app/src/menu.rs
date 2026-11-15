@@ -497,19 +497,14 @@ pub unsafe fn open(owner: HWND, rows: Vec<Entry>) {
     };
     RegisterClassW(&wc);
 
-    let scale = crate::screen_scale();
-    let (width, height, hit) = measure(&rows, scale);
-
     let mut point = POINT { x: 0, y: 0 };
     GetCursorPos(&mut point);
 
-    let mut work = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+    // 菜单开在鼠标那块屏：缩放和工作区都按那块屏算
+    let scale = crate::scale_at(point);
+    let (width, height, hit) = measure(&rows, scale);
+
+    let work = crate::work_area_at(point);
 
     let left = point.x.min(work.right - width).max(work.left);
     let top = if point.y + height > work.bottom {
