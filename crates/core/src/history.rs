@@ -1,4 +1,4 @@
-﻿//! 用量历史：多来源加载 + 按天/来源/模型聚合。
+//! 用量历史：多来源加载 + 按天/来源/模型聚合。
 //!
 //! 数据源和 AI 采集一致：OpenCode（SQLite）、DSH（zstd）、WorkBuddy（jsonl）。
 //! 这里的解析比实时采集宽松：整文件读、按时间戳过滤，结果按「天」聚合。
@@ -28,6 +28,8 @@ pub struct UsageRecord {
     pub model: String,
     pub output: i64,
     pub input: i64,
+    /// 其中来自缓存命中的输入 token（prompt cache）
+    pub cache_read: i64,
     pub duration_ms: i64,
 }
 
@@ -36,6 +38,8 @@ pub struct DailyRow {
     pub day: i64,
     pub output: i64,
     pub input: i64,
+    /// 缓存命中的输入 token，用来算命中率
+    pub cache_read: i64,
     pub requests: i64,
     pub measured_output: i64,
     pub measured_ms: i64,
@@ -150,7 +154,8 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
                IFNULL(json_extract(data,'$.time.streamed'),0), \
                IFNULL(json_extract(data,'$.model.id'),''), \
                IFNULL(json_extract(data,'$.tokens.output'),0) + IFNULL(json_extract(data,'$.tokens.reasoning'),0), \
-               IFNULL(json_extract(data,'$.tokens.input'),0) + IFNULL(json_extract(data,'$.tokens.cache.read'),0) + IFNULL(json_extract(data,'$.tokens.cache.write'),0) \
+               IFNULL(json_extract(data,'$.tokens.input'),0) + IFNULL(json_extract(data,'$.tokens.cache.read'),0) + IFNULL(json_extract(data,'$.tokens.cache.write'),0), \
+               IFNULL(json_extract(data,'$.tokens.cache.read'),0) \
                FROM session_message WHERE type = 'assistant' AND time_created >= ?1";
 
     let Ok(mut statement) = connection.prepare(sql) else {
@@ -164,12 +169,13 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     }) else {
         return;
     };
 
-    for (created, streamed, model, output, input) in rows.flatten() {
+    for (created, streamed, model, output, input, cache_read) in rows.flatten() {
         if output <= 0 && input <= 0 {
             continue;
         }
@@ -181,6 +187,7 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
             model,
             output,
             input,
+            cache_read,
             duration_ms: if streamed > created { streamed - created } else { 0 },
         });
     }
@@ -290,8 +297,9 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
 
         let usage = &value["data"]["usage"];
         let output = usage["outputTokens"].as_i64().unwrap_or(0);
+        let cache_read = usage["cacheReadTokens"].as_i64().unwrap_or(0);
         let input = usage["inputTokens"].as_i64().unwrap_or(0)
-            + usage["cacheReadTokens"].as_i64().unwrap_or(0)
+            + cache_read
             + usage["cacheWriteTokens"].as_i64().unwrap_or(0);
         if output <= 0 && input <= 0 {
             continue;
@@ -310,6 +318,7 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             model,
             output,
             input,
+            cache_read,
             duration_ms: if pending_start > 0 && time > pending_start {
                 time - pending_start
             } else {
@@ -348,6 +357,11 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
         let raw = &provider["rawUsage"];
         let output = raw["completion_tokens"].as_i64().unwrap_or(0);
         let input = raw["prompt_tokens"].as_i64().unwrap_or(0);
+        // OpenAI 风格在 prompt_tokens_details.cached_tokens，Anthropic 风格单独一个字段
+        let cache_read = raw["prompt_tokens_details"]["cached_tokens"]
+            .as_i64()
+            .or_else(|| raw["cache_read_input_tokens"].as_i64())
+            .unwrap_or(0);
         if output <= 0 && input <= 0 {
             continue;
         }
@@ -366,6 +380,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             model: model.clone(),
             output: 0,
             input: 0,
+            cache_read: 0,
             duration_ms: 0,
         });
 
@@ -375,6 +390,10 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
 
         if input > entry.input {
             entry.input = input;
+        }
+
+        if cache_read > entry.cache_read {
+            entry.cache_read = cache_read;
         }
 
         if model.len() > 0 {
@@ -438,6 +457,7 @@ pub fn summarize_filtered(
 
         row.output += record.output;
         row.input += record.input;
+        row.cache_read += record.cache_read;
         row.requests += 1;
 
         if record.duration_ms > 0 {
@@ -485,6 +505,8 @@ pub struct HourRow {
     pub hour: u8,
     pub output: i64,
     pub input: i64,
+    /// 缓存命中的输入 token
+    pub cache_read: i64,
     pub requests: i64,
     pub measured_output: i64,
     pub measured_ms: i64,
@@ -530,6 +552,7 @@ pub fn summarize_hours(
         let row = &mut rows[index];
         row.output += record.output;
         row.input += record.input;
+        row.cache_read += record.cache_read;
         row.requests += 1;
 
         if record.duration_ms > 0 {
@@ -666,6 +689,7 @@ mod tests {
             model: model.to_string(),
             output,
             input: output * 10,
+            cache_read: 0,
             duration_ms: 1000,
         }
     }

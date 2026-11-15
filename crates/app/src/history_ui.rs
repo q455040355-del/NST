@@ -564,6 +564,7 @@ fn recalc(state: &mut State) {
                 day: row.hour as i64,
                 output: row.output,
                 input: row.input,
+                cache_read: row.cache_read,
                 requests: row.requests,
                 measured_output: row.measured_output,
                 measured_ms: row.measured_ms,
@@ -1490,6 +1491,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
 
     let total_output: i64 = state.days.iter().map(|day| day.output).sum();
     let total_input: i64 = state.days.iter().map(|day| day.input).sum();
+    let total_cache: i64 = state.days.iter().map(|day| day.cache_read).sum();
     let total_requests: i64 = state.days.iter().map(|day| day.requests).sum();
     let measured_output: i64 = state.days.iter().map(|day| day.measured_output).sum();
     let measured_ms: i64 = state.days.iter().map(|day| day.measured_ms).sum();
@@ -1499,6 +1501,13 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         0.0
     };
     let days_count = state.days.len().max(1) as i64;
+
+    // 缓存命中率 = 命中的输入 token / 全部输入 token（输入里已经含缓存部分）
+    let hit_rate = if total_input > 0 {
+        total_cache as f64 * 100.0 / total_input as f64
+    } else {
+        0.0
+    };
 
     let per = if state.hourly { "时均" } else { "日均" };
     let cards: [(&str, String, String, u32); 4] = [
@@ -1521,7 +1530,15 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         (
             "请求数",
             thousands(total_requests),
-            format!("{per} {}", thousands(total_requests / days_count)),
+            if total_requests > 0 {
+                format!(
+                    "{per} {} · 命中 {:.0}%",
+                    thousands(total_requests / days_count),
+                    hit_rate
+                )
+            } else {
+                format!("{per} {}", thousands(total_requests / days_count))
+            },
             series_color("dsh"),
         ),
         (

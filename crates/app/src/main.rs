@@ -259,7 +259,7 @@ fn keep_on_top(hwnd: HWND) {
             } else {
                 bar.right - width - scale_for_dpi(220)
             };
-            let top = bar.top + ((bar.bottom - bar.top) - height) / 2;
+            let top = panel_top(bar.top, bar.bottom - bar.top, height);
 
             if rect.left != left || rect.top != top {
                 SetWindowPos(
@@ -287,6 +287,18 @@ fn keep_on_top(hwnd: HWND) {
     }
 }
 
+/// 面板在任务栏里的纵向位置。
+///
+/// 面板高度通常就等于任务栏高度，这时必须贴着 bar.top，不能居中——
+/// 差 1~2px 就会「浮」在任务栏上下，看起来就不像嵌进去了。
+fn panel_top(bar_top: i32, bar_height: i32, height: i32) -> i32 {
+    if height >= bar_height - 1 {
+        bar_top
+    } else {
+        bar_top + (bar_height - height) / 2
+    }
+}
+
 fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
     unsafe {
         let mut bar = RECT { left: 0, top: 0, right: 0, bottom: 0 };
@@ -308,7 +320,7 @@ fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
             bar.right - width - scale_for_dpi(220)
         };
 
-        let default_top = bar.top + ((bar.bottom - bar.top) - height) / 2;
+        let default_top = panel_top(bar.top, bar.bottom - bar.top, height);
 
         // 用户拖过就按拖到的位置摆（PanelX / PanelY，-1 = 自动）
         let (saved_x, saved_y) = panel_mut(hwnd)
