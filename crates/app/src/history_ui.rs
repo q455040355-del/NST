@@ -140,6 +140,12 @@ struct State {
     from_heights: Vec<f32>,
     to_heights: Vec<f32>,
     now_heights: Vec<f32>,
+    /// 逐日、逐来源的堆叠值：换区间/来源时按「同一天」对齐做过渡（同 AgentSpeed 的 Blend）
+    from_stack: Vec<Vec<f32>>,
+    to_stack: Vec<Vec<f32>>,
+    now_stack: Vec<Vec<f32>>,
+    /// 上一帧每个日期、每个来源的值
+    previous: std::collections::HashMap<i64, Vec<f32>>,
     /// Y 轴最大值也用同一根弹簧，柱子和刻度一起动
     max_from: f32,
     max_to: f32,
@@ -230,6 +236,10 @@ pub fn open(_parent: HWND) {
             from_heights: Vec::new(),
             to_heights: Vec::new(),
             now_heights: Vec::new(),
+            from_stack: Vec::new(),
+            to_stack: Vec::new(),
+            now_stack: Vec::new(),
+            previous: std::collections::HashMap::new(),
             max_from: 1.0,
             max_to: 1.0,
             max_now: 1.0,
@@ -514,11 +524,34 @@ fn recalc(state: &mut State) {
         .map(|day| day.output as f32)
         .collect();
 
-    state.from_heights = if state.now_heights.len() == target.len() {
-        state.now_heights.clone()
-    } else {
-        vec![0.0; target.len()]
-    };
+    // 过渡起点：按「同一天」从上一帧取值（AgentSpeed 的 HistoryBars.Blend 就是这么做的）。
+    // 换区间时同一根柱子保持高度、只是重新排布，而不是全体从 0 长出来。
+    let source_count = all_sources().len();
+    state.from_stack = state
+        .days
+        .iter()
+        .map(|day| {
+            state
+                .previous
+                .get(&day.day)
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; source_count])
+        })
+        .collect();
+    state.to_stack = state
+        .stack
+        .iter()
+        .map(|row| row.iter().map(|value| *value as f32).collect())
+        .collect();
+    state.now_stack = state.from_stack.clone();
+    state.previous = state
+        .days
+        .iter()
+        .zip(state.to_stack.iter())
+        .map(|(day, row)| (day.day, row.clone()))
+        .collect();
+
+    state.from_heights = state.now_stack.iter().map(|row| row.iter().sum()).collect();
     state.to_heights = target;
     state.now_heights = state.from_heights.clone();
 
@@ -565,6 +598,7 @@ unsafe extern "system" fn canvas_proc(
                 // 和 AgentSpeed 的 HistoryChart 一样：0.45s 到点、或者判定已到位，就收尾吸附
                 if state.animation_elapsed >= SPRING_MAX_DURATION || state.spring.settled(1.0) {
                     state.now_heights = state.to_heights.clone();
+                    state.now_stack = state.to_stack.clone();
                     state.max_now = state.max_to;
                     state.animating = false;
                     // 让投递线程自然退出
@@ -578,11 +612,19 @@ unsafe extern "system" fn canvas_proc(
                 let t = state.spring.value as f32;
                 let axis_t = t.clamp(0.0, 1.1);
                 state.max_now = state.max_from + (state.max_to - state.max_from) * axis_t;
-                for index in 0..state.now_heights.len() {
-                    let from = *state.from_heights.get(index).unwrap_or(&0.0);
-                    let to = *state.to_heights.get(index).unwrap_or(&0.0);
-                    state.now_heights[index] = from + (to - from) * t;
+                // 逐日逐来源插值：换区间时同一根柱子按日期对齐，不会整体从 0 冒出来
+                let mut rows = Vec::with_capacity(state.to_stack.len());
+                for (index, to_row) in state.to_stack.iter().enumerate() {
+                    let from_row = state.from_stack.get(index);
+                    let mut row = Vec::with_capacity(to_row.len());
+                    for (slot, to) in to_row.iter().enumerate() {
+                        let from = from_row.and_then(|r| r.get(slot)).copied().unwrap_or(0.0);
+                        row.push((from + (to - from) * t).max(0.0));
+                    }
+                    rows.push(row);
                 }
+                state.now_heights = rows.iter().map(|row| row.iter().sum()).collect();
+                state.now_stack = rows;
 
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 UpdateWindow(hwnd);
@@ -1376,38 +1418,39 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     let bar_width = (slot * 0.58).clamp(4.0, 40.0);
     let radius = (bar_width * 0.28).clamp(2.0, 8.0) as i32;
 
-    for (index, day) in state.days.iter().enumerate() {
-        let total = *state.now_heights.get(index).unwrap_or(&0.0);
-        if total <= 0.0 {
+    for index in 0..state.days.len() {
+        let Some(row) = state.now_stack.get(index) else {
+            continue;
+        };
+        let total: f32 = row.iter().sum();
+        if total <= 0.5 {
             continue;
         }
 
-        let height = (plot_height as f32 * total / max_output).max(1.0);
-        let x = plot_left as f32 + slot * index as f32 + (slot - bar_width) / 2.0;
+        // 像素对齐，1px 的边不会糊
+        let slot_left = plot_left as f32 + slot * index as f32;
+        let left = (slot_left + (slot - bar_width) / 2.0).round() as i32;
+        let right = (slot_left + (slot + bar_width) / 2.0).round() as i32;
         let mut bottom = plot_bottom as f32;
 
-        let day_stack = state.stack.get(index);
-        let day_total: i64 = day_stack.map(|row| row.iter().sum()).unwrap_or(0).max(1);
-
         for (slot_index, source) in sources.iter().enumerate() {
-            let value = day_stack
-                .and_then(|row| row.get(slot_index).copied())
-                .unwrap_or(0) as f32;
+            let value = row.get(slot_index).copied().unwrap_or(0.0);
             if value <= 0.0 {
                 continue;
             }
 
-            let share = value / day_total as f32;
-            let segment = (height * share).max(1.0);
+            // 段高直接按数值换算，和整根柱子的高度一致（逐来源过渡）
+            let segment = plot_height as f32 * value / max_output;
             bottom -= segment;
-            let color = series_color(source);
-            let top = bottom as i32;
-            let left = x as i32;
-            let right = (x + bar_width) as i32;
-            let bottom_px = (bottom + segment) as i32;
+            if segment < 1.0 {
+                continue;
+            }
 
-            // 圆角柱：只有整根柱子的最上面一段带圆角，堆叠处保持平直
-            let is_top = (top as f32) <= bottom + 0.5;
+            let color = series_color(source);
+            let top = bottom.round() as i32;
+            let bottom_px = (bottom + segment).round() as i32;
+            // 只有整根柱子最上面一段带圆角，堆叠处保持平直
+            let is_top = bottom_px >= plot_bottom - 1;
             if is_top {
                 p.round(left, top, right, bottom_px, radius, color, color);
                 if bottom_px - radius > top {
