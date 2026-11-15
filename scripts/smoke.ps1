@@ -28,6 +28,7 @@ public static class Smoke {
   [DllImport("user32.dll")] static extern bool EnumWindows(Proc p, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -251,6 +252,33 @@ Check "再点一次清掉 AutoStart" ($autoIni -eq "AutoStart=False") $autoIni
 if (-not $hadRun) {
     Check "注册表自启项已删除" ($null -eq $runValue) "$runValue"
 }
+
+# ---------------------------------------------------------------- 键盘导航
+# 重开一个干净的设置窗（焦点会回到第一项「字号」），Tab 到「面板宽度」，
+# 右方向键 +4px，再按左方向键还原
+$widthNow = {
+    param($text)
+    return [int](($text | Select-String '^PanelWidth=').Line -replace 'PanelWidth=', '')
+}
+[void][Smoke]::PostMessageW($settings, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+$settings = [IntPtr]::Zero
+for ($attempt = 0; $attempt -lt 6 -and $settings.ToInt64() -eq 0; $attempt++) {
+    [void][Smoke]::PostMessageW($panel, 0x8041, [IntPtr]1301, [IntPtr]::Zero)
+    $settings = Wait-Class "NetSpeedTaskbarRs.Settings" 1000
+}
+Start-Sleep -Milliseconds 300
+$widthBefore = & $widthNow (Get-Content $ini)
+[void][Smoke]::SendMessageW($settings, 0x0100, [IntPtr]0x09, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 250
+[void][Smoke]::SendMessageW($settings, 0x0100, [IntPtr]0x27, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+$widthAfter = & $widthNow (Get-Content $ini)
+Check "Tab + → 能调面板宽度" ($widthAfter -eq ($widthBefore + 4)) "$widthBefore -> $widthAfter"
+[void][Smoke]::SendMessageW($settings, 0x0100, [IntPtr]0x25, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+$widthBack = & $widthNow (Get-Content $ini)
+Check "← 能调回去" ($widthBack -eq $widthBefore) "$widthBack"
 
 # ---------------------------------------------------------------- 收尾
 # Esc 也能关（和点「完成」等价），这里顺便把它测掉

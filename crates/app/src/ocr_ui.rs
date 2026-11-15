@@ -13,10 +13,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
-use crate::ui::{
-    self, font, mix_white, Painter, ACCENT, ACCENT_PRESSED, BORDER, CHIP, DT_CENTER, DT_LEFT,
-    SURFACE, TEXT, TEXT2, TEXT3,
-};
+use crate::ui::{self, font, Painter, DT_CENTER, DT_LEFT};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.OcrResult";
 const ID_EDIT: usize = 2001;
@@ -40,6 +37,8 @@ struct State {
     hover: Option<Hit>,
     /// EDIT 的底色画刷（WM_CTLCOLOREDIT 必须返回一个常驻句柄，不能每次新建）
     edit_brush: HBRUSH,
+    /// 这个画刷对应的颜色：主题切了就重建
+    edit_color: u32,
 }
 
 struct Fonts {
@@ -127,23 +126,24 @@ unsafe fn paint(hwnd: HWND) {
     let p = Painter::new(dib.dc, state.scale);
     let l = layout(state, client);
     let pad = p.s(16.0);
+    let c = crate::theme::ui();
 
-    p.fill(0, 0, client.right, client.bottom, ui::BG);
+    p.fill(0, 0, client.right, client.bottom, c.bg);
     p.round(
         0,
         0,
         client.right,
         client.bottom,
         p.s(16.0),
-        SURFACE,
-        BORDER,
+        c.surface,
+        c.border,
     );
 
     // 标题
     p.text(
         "取字结果",
         state.fonts.title,
-        TEXT,
+        c.text,
         pad + p.s(2.0),
         p.s(14.0),
         l.close.left - p.s(8.0),
@@ -160,14 +160,14 @@ unsafe fn paint(hwnd: HWND) {
             l.close.right,
             l.close.bottom,
             p.s(8.0),
-            CHIP,
-            CHIP,
+            c.chip,
+            c.chip,
         );
     }
     let cx = (l.close.left + l.close.right) / 2;
     let cy = (l.close.top + l.close.bottom) / 2;
     let arm = p.s(5.0);
-    let ink = if close_hover { TEXT } else { TEXT2 };
+    let ink = if close_hover { c.text } else { c.text2 };
     p.line(cx - arm, cy - arm, cx + arm, cy + arm, ink, p.s(1.4));
     p.line(cx - arm, cy + arm, cx + arm, cy - arm, ink, p.s(1.4));
 
@@ -178,15 +178,15 @@ unsafe fn paint(hwnd: HWND) {
         l.edit.right + p.s(8.0),
         l.edit.bottom + p.s(8.0),
         p.s(10.0),
-        mix_white(SURFACE, 0.0),
-        BORDER,
+        c.surface,
+        c.border,
     );
 
     // 底部
     p.text(
         &state.status,
         state.fonts.small,
-        TEXT3,
+        c.text3,
         pad + p.s(2.0),
         l.copy.top,
         l.copy.left - p.s(10.0),
@@ -195,7 +195,7 @@ unsafe fn paint(hwnd: HWND) {
     );
 
     let hover = state.hover == Some(Hit::Copy);
-    let fill = if hover { ACCENT_PRESSED } else { ACCENT };
+    let fill = if hover { c.accent_pressed } else { c.accent };
     p.round(
         l.copy.left,
         l.copy.top,
@@ -315,7 +315,8 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
             fonts: Fonts::create(scale),
             scale,
             hover: None,
-            edit_brush: CreateSolidBrush(SURFACE),
+            edit_brush: std::ptr::null_mut(),
+            edit_color: 0,
         }));
 
         let hwnd = CreateWindowExW(
@@ -399,13 +400,23 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLOREDIT => {
             let dc = wparam as ::windows_sys::Win32::Graphics::Gdi::HDC;
-            SetBkColor(dc, SURFACE);
-            SetTextColor(dc, TEXT);
+            let c = crate::theme::ui();
+            SetBkColor(dc, c.surface);
+            SetTextColor(dc, c.text);
             let state = state_of(hwnd);
             if state.is_null() {
                 return 0;
             }
-            (*state).edit_brush as LRESULT
+            // 系统换成深色后底色变了：旧画刷要删掉重做
+            let state = &mut *state;
+            if state.edit_brush.is_null() || state.edit_color != c.surface {
+                if !state.edit_brush.is_null() {
+                    DeleteObject(state.edit_brush as *mut _);
+                }
+                state.edit_brush = CreateSolidBrush(c.surface);
+                state.edit_color = c.surface;
+            }
+            state.edit_brush as LRESULT
         }
         WM_NCHITTEST => {
             let state = state_of(hwnd);
@@ -514,6 +525,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);
+            0
+        }
+        // 系统切明暗主题：整窗重画（EDIT 的底色由 WM_CTLCOLOREDIT 自己更新）
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_DESTROY => {

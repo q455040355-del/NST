@@ -19,7 +19,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
@@ -219,6 +219,31 @@ impl Painter {
         DeleteObject(brush as *mut _);
     }
 
+    /// 空心圆角框（键盘焦点框）：只画边，不盖住里面的内容
+    unsafe fn ring(
+        &self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        radius: i32,
+        color: u32,
+        width: i32,
+    ) {
+        let pen = CreatePen(0, width.max(1), color);
+        let old_pen = SelectObject(self.dc, pen as HGDIOBJ);
+        let old_brush = SelectObject(
+            self.dc,
+            windows_sys::Win32::Graphics::Gdi::GetStockObject(
+                windows_sys::Win32::Graphics::Gdi::NULL_BRUSH,
+            ),
+        );
+        RoundRect(self.dc, left, top, right, bottom, radius, radius);
+        SelectObject(self.dc, old_brush);
+        SelectObject(self.dc, old_pen);
+        DeleteObject(pen as *mut _);
+    }
+
     unsafe fn line(&self, x1: i32, y1: i32, x2: i32, y2: i32, color: u32, width: i32) {
         let pen = CreatePen(0, width.max(1), color);
         let old = SelectObject(self.dc, pen as HGDIOBJ);
@@ -296,6 +321,10 @@ struct State {
     fonts: Fonts,
     scale: f32,
     hover: Option<Hit>,
+    /// 键盘焦点（Tab 走一圈）；鼠标一动就清掉，避免两个「当前项」打架
+    focus: Option<Hit>,
+    /// 最近一次操作是键盘：只有键盘操作才画焦点框
+    keyboard: bool,
     slider_drag: bool,
     /// 正在拖滚动条滑块
     scroll_drag: bool,
@@ -921,9 +950,29 @@ unsafe fn paint(hwnd: HWND) {
         }
     }
 
+    // 键盘焦点框：内容区的控件画在滚动坐标系里（还在裁剪区内）
+    if state.keyboard {
+        if let Some(hit) = state.focus {
+            if !matches!(hit, Hit::Done | Hit::AutoStart) {
+                if let Some(rect) = focus_rect(state, client, hit) {
+                    draw_focus(&p, rect);
+                }
+            }
+        }
+    }
+
     // 内容区结束：恢复裁剪和原点，页脚固定在底部
     if saved != 0 {
         RestoreDC(dc, saved);
+    }
+
+    // 页脚控件的焦点框画在正常坐标系里
+    if state.keyboard {
+        if let Some(hit @ (Hit::Done | Hit::AutoStart)) = state.focus {
+            if let Some(rect) = focus_rect(state, client, hit) {
+                draw_focus(&p, rect);
+            }
+        }
     }
 
     // 滚动条（只有在内容放不下时才出现）
@@ -1502,6 +1551,9 @@ pub fn open(parent: HWND, settings: &Settings) {
             fonts: Fonts::create(scale),
             scale,
             hover: None,
+            // 打开时焦点在第一项（字号），按 Tab 就能一路走过去
+            focus: Some(Hit::Select(1)),
+            keyboard: false,
             slider_drag: false,
             scroll_drag: false,
             scroll: 0,
@@ -1611,6 +1663,130 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
         }
     }
     None
+}
+
+/// 键盘能走到的控件（顺序 = Tab 顺序）。AI 关着时那几行不参与。
+fn nav_items(state: &State) -> Vec<Hit> {
+    let mut items = vec![
+        Hit::Select(1),
+        Hit::Slider,
+        Hit::Select(2),
+        Hit::Select(3),
+        Hit::Select(4),
+    ];
+    if state.ai_enabled {
+        items.push(Hit::AiToggle);
+        for index in 0..4 {
+            items.push(Hit::AiSource(index));
+        }
+    }
+    items.push(Hit::AutoStart);
+    items.push(Hit::Done);
+    items
+}
+
+/// 某个控件的矩形（焦点框用）
+fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
+    let l = layout(state, client);
+    Some(match hit {
+        Hit::Slider => l.slider,
+        Hit::Select(row) => *l.selects.get(row.checked_sub(1)?)?,
+        Hit::AiToggle => l.ai_toggle,
+        Hit::AiSource(index) => *l.ai_sources.get(index)?,
+        Hit::AutoStart => l.auto_start,
+        Hit::Done => l.done,
+        _ => return None,
+    })
+}
+
+/// 下拉选中某一项：鼠标点选和键盘改值共用
+fn choose(state: &mut State, row: usize, index: usize) {
+    match row {
+        1 => {
+            if let Some((_, percent)) = FONT_OPTIONS.get(index) {
+                state.font = index;
+                crate::apply_font_scale(state.parent, *percent);
+            }
+        }
+        2 => {
+            if let Some((_, value)) = GAUGE_OPTIONS.get(index) {
+                state.gauge = index;
+                crate::apply_gauge(state.parent, value);
+            }
+        }
+        3 => {
+            state.interface = index;
+            let alias = if index == 0 {
+                "auto".to_string()
+            } else {
+                state
+                    .interfaces
+                    .get(index - 1)
+                    .cloned()
+                    .unwrap_or_else(|| "auto".to_string())
+            };
+            crate::apply_network_interface(state.parent, &alias);
+        }
+        _ => {
+            if let Some((_, ms)) = REFRESH_OPTIONS.get(index) {
+                state.refresh = index;
+                crate::apply_refresh_ms(state.parent, *ms);
+            }
+        }
+    }
+}
+
+/// 键盘左右/上下改值：在当前项附近循环
+fn shift_choice(state: &mut State, row: usize, delta: i32) {
+    let (current, len) = match row {
+        1 => (state.font, FONT_OPTIONS.len()),
+        2 => (state.gauge, GAUGE_OPTIONS.len()),
+        3 => (state.interface, state.interfaces.len() + 1),
+        _ => (state.refresh, REFRESH_OPTIONS.len()),
+    };
+    let len = len.max(1) as i32;
+    let next = (current as i32 + delta).rem_euclid(len) as usize;
+    choose(state, row, next);
+}
+
+fn toggle_ai(state: &mut State) {
+    let enabled = !state.ai_enabled;
+    // 打开总开关时如果四个来源全关着，默认全开，否则什么也采不到
+    if enabled && !state.ai_sources.iter().any(|flag| *flag) {
+        state.ai_sources = [true; 4];
+        crate::apply_ai_sources(state.parent, state.ai_sources);
+    }
+    state.ai_enabled = enabled;
+    crate::apply_ai_enabled(state.parent, enabled);
+}
+
+fn toggle_source(state: &mut State, index: usize) {
+    if !state.ai_enabled {
+        return;
+    }
+    state.ai_sources[index] = !state.ai_sources[index];
+    crate::apply_ai_sources(state.parent, state.ai_sources);
+}
+
+fn toggle_auto_start(state: &mut State) {
+    state.auto_start = !state.auto_start;
+    crate::apply_auto_start(state.parent, state.auto_start);
+}
+
+/// 键盘焦点框：比控件大 3px 的空心圆角框，不挡住里面的内容
+fn draw_focus(p: &Painter, rect: RECT) {
+    let pad = p.s(3.0);
+    unsafe {
+        p.ring(
+            rect.left - pad,
+            rect.top - pad,
+            rect.right + pad,
+            rect.bottom + pad,
+            p.s(10.0),
+            crate::theme::ui().accent,
+            p.s(2.0),
+        );
+    }
 }
 
 unsafe fn apply_width(hwnd: HWND, state: *mut State, x: i32, client: RECT) {
@@ -1730,7 +1906,14 @@ unsafe extern "system" fn dialog_proc(
             };
             GetClientRect(hwnd, &mut client);
 
-            match hit_test(state, client, point) {
+            // 鼠标点谁，焦点就落在谁身上（焦点框只在键盘操作时显示）
+            let hit = hit_test(state, client, point);
+            if let Some(hit) = hit {
+                state.focus = Some(hit);
+                state.keyboard = false;
+            }
+
+            match hit {
                 Some(Hit::Close) | Some(Hit::Done) => {
                     DestroyWindow(hwnd);
                 }
@@ -1753,26 +1936,15 @@ unsafe extern "system" fn dialog_proc(
                     open_popup(hwnd, row);
                 }
                 Some(Hit::AiToggle) => {
-                    let enabled = !state.ai_enabled;
-                    // 打开总开关时如果四个来源全关着，默认全开，否则什么也采不到
-                    if enabled && !state.ai_sources.iter().any(|flag| *flag) {
-                        state.ai_sources = [true; 4];
-                        crate::apply_ai_sources(state.parent, state.ai_sources);
-                    }
-                    state.ai_enabled = enabled;
-                    crate::apply_ai_enabled(state.parent, enabled);
+                    toggle_ai(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::AiSource(index)) => {
-                    if state.ai_enabled {
-                        state.ai_sources[index] = !state.ai_sources[index];
-                        crate::apply_ai_sources(state.parent, state.ai_sources);
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                    }
+                    toggle_source(state, index);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::AutoStart) => {
-                    state.auto_start = !state.auto_start;
-                    crate::apply_auto_start(state.parent, state.auto_start);
+                    toggle_auto_start(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 None => {}
@@ -1828,39 +2000,7 @@ unsafe extern "system" fn dialog_proc(
             let row = wparam;
             let index = lparam as usize;
 
-            match row {
-                1 => {
-                    if let Some((_, percent)) = FONT_OPTIONS.get(index) {
-                        state.font = index;
-                        crate::apply_font_scale(state.parent, *percent);
-                    }
-                }
-                2 => {
-                    if let Some((_, value)) = GAUGE_OPTIONS.get(index) {
-                        state.gauge = index;
-                        crate::apply_gauge(state.parent, value);
-                    }
-                }
-                3 => {
-                    state.interface = index;
-                    let alias = if index == 0 {
-                        "auto".to_string()
-                    } else {
-                        state
-                            .interfaces
-                            .get(index - 1)
-                            .cloned()
-                            .unwrap_or_else(|| "auto".to_string())
-                    };
-                    crate::apply_network_interface(state.parent, &alias);
-                }
-                _ => {
-                    if let Some((_, ms)) = REFRESH_OPTIONS.get(index) {
-                        state.refresh = index;
-                        crate::apply_refresh_ms(state.parent, *ms);
-                    }
-                }
-            }
+            choose(state, row, index);
 
             state.popup = std::ptr::null_mut();
             SetForegroundWindow(hwnd);
@@ -1912,14 +2052,82 @@ unsafe extern "system" fn dialog_proc(
             0
         }
         WM_KEYDOWN => {
+            crate::debug_log(&format!("key {wparam}"));
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
             if wparam as u32 == 0x1B {
-                let state = state_of(hwnd);
-                if !state.is_null() && !(*state).popup.is_null() {
-                    DestroyWindow((*state).popup);
+                if !state.popup.is_null() {
+                    DestroyWindow(state.popup);
                 } else {
                     DestroyWindow(hwnd);
                 }
+                return 0;
             }
+
+            // Tab / Shift+Tab：在控件之间走一圈
+            if wparam as u32 == 0x09 {
+                let shift = unsafe { GetKeyState(0x10) } < 0;
+                let items = nav_items(state);
+                if items.is_empty() {
+                    return 0;
+                }
+                let current = state
+                    .focus
+                    .and_then(|hit| items.iter().position(|item| *item == hit));
+                let next = match (current, shift) {
+                    (Some(index), true) => (index + items.len() - 1) % items.len(),
+                    (Some(index), false) => (index + 1) % items.len(),
+                    (None, _) => 0,
+                };
+                state.focus = Some(items[next]);
+                state.keyboard = true;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+
+            let Some(hit) = state.focus else {
+                return 0;
+            };
+            state.keyboard = true;
+
+            match wparam as u32 {
+                // ↑↓←→：下拉改值、滑杆调宽度
+                0x26 | 0x25 | 0x28 | 0x27 => {
+                    let delta = if (wparam as u32) == 0x26 || (wparam as u32) == 0x25 {
+                        -1
+                    } else {
+                        1
+                    };
+                    match hit {
+                        Hit::Select(row) => shift_choice(state, row, delta),
+                        Hit::Slider => {
+                            let width = (state.width + delta * 4).clamp(72, 360);
+                            if width != state.width {
+                                state.width = width;
+                                crate::apply_panel_width(state.parent, width);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // 空格 / 回车：开关、按钮
+                0x20 | 0x0D => match hit {
+                    Hit::AiToggle => toggle_ai(state),
+                    Hit::AiSource(index) => toggle_source(state, index),
+                    Hit::AutoStart => toggle_auto_start(state),
+                    Hit::Done => {
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                    _ => {}
+                },
+                _ => return 0,
+            }
+
+            InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_SETCURSOR => {

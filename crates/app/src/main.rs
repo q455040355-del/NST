@@ -468,26 +468,57 @@ fn keep_on_top(hwnd: HWND) {
                 std::ptr::null(),
             );
             let gap = scale_for_dpi(8);
-            let left = if !tray.is_null() {
-                let mut tray_rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                GetWindowRect(tray, &mut tray_rect);
-                tray_rect.left - width - gap
-            } else {
-                bar.right - width - scale_for_dpi(220)
+
+            let mut tray_rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
             };
-            let top = panel_top(bar.top, bar.bottom - bar.top, height);
+            if !tray.is_null() {
+                GetWindowRect(tray, &mut tray_rect);
+            }
+
+            // 竖排任务栏（Win10 侧边）：面板是横条，塞不进 48px 宽的竖栏，
+            // 就贴在栏的外侧、纵向对齐托盘——总比被夹回栏里盖住图标强
+            let vertical = (bar.bottom - bar.top) > (bar.right - bar.left) * 2;
+            let (left, top) = if vertical {
+                let work = work_area_at(POINT {
+                    x: bar.left,
+                    y: bar.top,
+                });
+                let on_left = bar.left <= work.left + 2;
+                let left = if on_left {
+                    bar.right + gap
+                } else {
+                    bar.left - width - gap
+                };
+                let center = if !tray.is_null() {
+                    (tray_rect.top + tray_rect.bottom) / 2
+                } else {
+                    (bar.top + bar.bottom) / 2
+                };
+                let top = (center - height / 2).clamp(work.top, (work.bottom - height).max(work.top));
+                (left.clamp(work.left, (work.right - width).max(work.left)), top)
+            } else {
+                let left = if !tray.is_null() {
+                    tray_rect.left - width - gap
+                } else {
+                    bar.right - width - scale_for_dpi(220)
+                };
+                let top = panel_top(bar.top, bar.bottom - bar.top, height);
+                (
+                    left.max(bar.left),
+                    top.max(bar.top),
+                )
+            };
 
             if rect.left != left || rect.top != top {
                 SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
-                    left.max(bar.left),
-                    top.max(bar.top),
+                    left,
+                    top,
                     width,
                     height,
                     SWP_NOACTIVATE,
@@ -934,10 +965,21 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(panel) = panel_mut(hwnd) {
                     let width = rect.right - rect.left;
                     let height = rect.bottom - rect.top;
+                    // 竖排任务栏装不下横条面板：拖到侧边栏时按整块工作区夹，
+                    // 而不是夹进那条 48px 宽的竖栏
+                    let vertical = (bar.bottom - bar.top) > (bar.right - bar.left) * 2;
+                    let area = if vertical {
+                        work_area_at(POINT {
+                            x: bar.left,
+                            y: bar.top,
+                        })
+                    } else {
+                        bar
+                    };
                     panel.settings.panel_x =
-                        rect.left.clamp(bar.left, (bar.right - width).max(bar.left));
+                        rect.left.clamp(area.left, (area.right - width).max(area.left));
                     panel.settings.panel_y =
-                        rect.top.clamp(bar.top, (bar.bottom - height).max(bar.top));
+                        rect.top.clamp(area.top, (area.bottom - height).max(area.top));
                     panel.settings.save();
                 }
             } else if let Some(panel) = panel_mut(hwnd) {

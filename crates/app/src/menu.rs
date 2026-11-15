@@ -12,9 +12,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
-use crate::ui::{
-    self, font, mix_white, Painter, ACCENT, BORDER, CHIP, DT_LEFT, DT_RIGHT, SURFACE, TEXT, TEXT3,
-};
+use crate::ui::{self, font, mix_white, Painter, DT_LEFT, DT_RIGHT};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Menu";
 
@@ -216,15 +214,16 @@ unsafe fn paint(hwnd: HWND) {
     };
     let p = Painter::new(dib.dc, state.scale);
 
-    p.fill(0, 0, client.right, client.bottom, SURFACE);
+    let c = crate::theme::ui();
+    p.fill(0, 0, client.right, client.bottom, c.surface);
     p.round(
         0,
         0,
         client.right,
         client.bottom,
         p.s(10.0),
-        SURFACE,
-        BORDER,
+        c.surface,
+        c.border,
     );
 
     let label_font = font(10.0, 400, state.scale);
@@ -246,7 +245,7 @@ unsafe fn paint(hwnd: HWND) {
                     mid,
                     client.right - p.s(10.0),
                     mid + 1,
-                    mix_white(BORDER, 0.25),
+                    mix_white(c.border, 0.25),
                 );
                 y += p.s(SEP_H);
             }
@@ -254,7 +253,7 @@ unsafe fn paint(hwnd: HWND) {
                 p.text(
                     text,
                     header_font,
-                    TEXT3,
+                    c.text3,
                     mark_x,
                     y,
                     client.right - p.s(12.0),
@@ -281,31 +280,31 @@ unsafe fn paint(hwnd: HWND) {
                         client.right - p.s(4.0),
                         bottom,
                         p.s(7.0),
-                        CHIP,
-                        CHIP,
+                        c.chip,
+                        c.chip,
                     );
                 }
 
                 match mark {
                     Mark::Check if *on => {
                         let ax = mark_x + p.s(2.0);
-                        p.line(ax, mid_y, ax + p.s(4.0), mid_y + p.s(4.0), ACCENT, p.s(1.8));
+                        p.line(ax, mid_y, ax + p.s(4.0), mid_y + p.s(4.0), c.accent, p.s(1.8));
                         p.line(
                             ax + p.s(4.0),
                             mid_y + p.s(4.0),
                             ax + p.s(11.0),
                             mid_y - p.s(5.0),
-                            ACCENT,
+                            c.accent,
                             p.s(1.8),
                         );
                     }
                     Mark::Radio => {
                         let cx = mark_x + mark_w / 2;
                         if *on {
-                            p.circle(cx, mid_y, p.s(5.0), SURFACE, ACCENT);
-                            p.circle(cx, mid_y, p.s(2.5), ACCENT, ACCENT);
+                            p.circle(cx, mid_y, p.s(5.0), c.surface, c.accent);
+                            p.circle(cx, mid_y, p.s(2.5), c.accent, c.accent);
                         } else {
-                            p.circle(cx, mid_y, p.s(5.0), SURFACE, mix_white(TEXT3, 0.25));
+                            p.circle(cx, mid_y, p.s(5.0), c.surface, mix_white(c.text3, 0.25));
                         }
                     }
                     _ => {}
@@ -314,7 +313,7 @@ unsafe fn paint(hwnd: HWND) {
                 p.text(
                     label,
                     label_font,
-                    TEXT,
+                    c.text,
                     label_left,
                     top,
                     client.right - p.s(12.0),
@@ -326,7 +325,7 @@ unsafe fn paint(hwnd: HWND) {
                     p.text(
                         shortcut,
                         shortcut_font,
-                        TEXT3,
+                        c.text3,
                         client.right - p.s(120.0),
                         top,
                         client.right - p.s(12.0),
@@ -353,6 +352,11 @@ unsafe extern "system" fn menu_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 系统切明暗主题：菜单也要换色
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_PAINT => {
             paint(hwnd);
             0

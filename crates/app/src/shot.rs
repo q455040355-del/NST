@@ -714,11 +714,6 @@ struct Editor {
 }
 
 const ANNOT: u32 = 0x003A_3AE0; // 0x00BBGGRR，红
-const EDITOR_BG: u32 = 0x00F3_F1EF;
-const EDITOR_TEXT: u32 = 0x002A_2420;
-const EDITOR_MUTED: u32 = 0x00A0_9690;
-const EDITOR_CARD: u32 = 0x00FF_FFFF;
-const EDITOR_LINE: u32 = 0x00E4_DED9;
 
 fn editor_state(hwnd: HWND) -> *mut Editor {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Editor }
@@ -1058,7 +1053,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     let _ = dib;
 
     let toolbar = s(44.0);
-    let bg = CreateSolidBrush(EDITOR_BG);
+    let bg = CreateSolidBrush(crate::theme::ui().bg);
     let all = RECT {
         left: 0,
         top: 0,
@@ -1115,7 +1110,7 @@ unsafe fn editor_paint(hwnd: HWND) {
         let top = text.at.1;
         let right = left + text.width.max(40);
         let bottom = top + height;
-        let pen = CreatePen(2, 1, crate::ui::ACCENT); // PS_DOT
+        let pen = CreatePen(2, 1, crate::theme::ui().accent); // PS_DOT
         let old = SelectObject(dc, pen as HGDIOBJ);
         MoveToEx(dc, left, top, std::ptr::null_mut());
         LineTo(dc, right, top);
@@ -1155,7 +1150,14 @@ unsafe fn editor_paint(hwnd: HWND) {
         };
         let active = matches!(action, Action::Tool(tool) if tool == editor.tool);
         draw_pill(dc, rect, active);
-        SetTextColor(dc, if active { EDITOR_TEXT } else { EDITOR_MUTED });
+        SetTextColor(
+            dc,
+            if active {
+                crate::theme::ui().text
+            } else {
+                crate::theme::ui().text3
+            },
+        );
         let mut text_rect = rect;
         text_rect.bottom += 1;
         DrawTextW(
@@ -1189,7 +1191,7 @@ unsafe fn editor_paint(hwnd: HWND) {
             bottom: s(9.0) + height,
         };
         draw_pill(dc, rect, false);
-        SetTextColor(dc, EDITOR_TEXT);
+        SetTextColor(dc, crate::theme::ui().text);
         let mut text_rect = rect;
         text_rect.bottom += 1;
         DrawTextW(
@@ -1209,7 +1211,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     let hint = hint_for(editor.tool);
     let hint_font = cached_font(8.0, 400);
     let old_hint = SelectObject(dc, hint_font as HGDIOBJ);
-    SetTextColor(dc, EDITOR_MUTED);
+    SetTextColor(dc, crate::theme::ui().text3);
     let mut hint_rect = RECT {
         left: s(12.0),
         top: client.bottom - s(22.0),
@@ -1263,8 +1265,9 @@ const DT_CALCRECT: u32 = 0x0400;
 
 fn draw_pill(dc: HDC, rect: RECT, active: bool) {
     unsafe {
-        let brush = CreateSolidBrush(if active { 0x00F6_ECDF } else { EDITOR_CARD });
-        let pen = CreatePen(0, 1, if active { 0x00D8_C4B8 } else { EDITOR_LINE });
+        let c = crate::theme::ui();
+        let brush = CreateSolidBrush(if active { c.chip } else { c.surface });
+        let pen = CreatePen(0, 1, if active { c.accent } else { c.border });
         let old_brush = SelectObject(dc, brush as HGDIOBJ);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         windows_sys::Win32::Graphics::Gdi::RoundRect(
@@ -1921,6 +1924,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             0
         }
         WM_ERASEBKGND => 1,
+        // 系统切明暗主题：工具栏/胶囊要跟着换色
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_PAINT => {
             editor_paint(hwnd);
             0

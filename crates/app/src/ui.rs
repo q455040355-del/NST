@@ -24,17 +24,7 @@ pub const DT_LEFT: u32 = 0x0000;
 pub const DT_RIGHT: u32 = 0x0002;
 pub const DT_VCENTER: u32 = 0x0004;
 
-// 浅色主题（和历史窗口同一套）
-pub const BG: u32 = 0x00F8_F6F5; // #F5F6F8
-pub const SURFACE: u32 = 0x00FF_FFFF;
-pub const BORDER: u32 = 0x00EF_EAE8; // #E8EAEF
-pub const TEXT: u32 = 0x001A_1614; // #14161A
-pub const TEXT2: u32 = 0x0080_726B; // #6B7280
-pub const TEXT3: u32 = 0x00AF_A39A; // #9AA3AF
-pub const CHIP: u32 = 0x00F3_F1EF; // #EFF1F3
-pub const ACCENT: u32 = 0x00E4_6F_2F; // #2F6FE4（COLORREF 里是 BGR）
-pub const ACCENT_PRESSED: u32 = 0x00C2_5A_1F;
-
+// 窗口配色统一走 theme::ui()（跟随系统明暗）；这里只留非颜色的常量
 pub const IDC_HAND: *const u16 = 32649 as *const u16;
 
 pub fn s(value: f32, scale: f32) -> i32 {

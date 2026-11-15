@@ -11,7 +11,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
-use crate::ui::{self, font, Painter, BORDER, DT_LEFT, SURFACE, TEXT};
+use crate::ui::{self, font, Painter, DT_LEFT};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Hint";
 
@@ -54,20 +54,21 @@ unsafe fn paint(hwnd: HWND) {
     };
     let p = Painter::new(dib.dc, state.scale);
 
-    p.fill(0, 0, client.right, client.bottom, SURFACE);
+    let c = crate::theme::ui();
+    p.fill(0, 0, client.right, client.bottom, c.surface);
     p.round(
         0,
         0,
         client.right,
         client.bottom,
         p.s(7.0),
-        SURFACE,
-        BORDER,
+        c.surface,
+        c.border,
     );
     p.text(
         &state.text,
         font(9.5, 400, state.scale),
-        TEXT,
+        c.text,
         p.s(PAD_X),
         0,
         client.right - p.s(PAD_X),
@@ -88,6 +89,11 @@ unsafe extern "system" fn hint_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 系统切明暗主题：气泡也要换色
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_PAINT => {
             paint(hwnd);
             0
