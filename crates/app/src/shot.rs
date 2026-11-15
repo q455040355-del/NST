@@ -719,7 +719,6 @@ const EDITOR_TEXT: u32 = 0x002A_2420;
 const EDITOR_MUTED: u32 = 0x00A0_9690;
 const EDITOR_CARD: u32 = 0x00FF_FFFF;
 const EDITOR_LINE: u32 = 0x00E4_DED9;
-const EDITOR_ACCENT: u32 = 0x00D8_8440;
 
 fn editor_state(hwnd: HWND) -> *mut Editor {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Editor }
@@ -948,7 +947,7 @@ fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
         };
         let brush = CreateSolidBrush(0x0022_1F1E); // 深灰
         let old_brush = SelectObject(dc, brush as HGDIOBJ);
-        let mut chip = RECT {
+        let chip = RECT {
             left: chip_left,
             top: chip_top,
             right: chip_left + label_w,
@@ -1060,7 +1059,7 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     let toolbar = s(44.0);
     let bg = CreateSolidBrush(EDITOR_BG);
-    let mut all = RECT {
+    let all = RECT {
         left: 0,
         top: 0,
         right: client.right,
@@ -1228,7 +1227,6 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     let _ = toolbar;
     let _ = all;
-    all.left = 0;
 
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
@@ -1411,7 +1409,7 @@ fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> bool {
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 
         if GetSaveFileNameW(&mut dialog) == 0 {
-            let code = CommDlgExtendedError();
+            let _code = CommDlgExtendedError();
             return false;
         }
 
@@ -1648,7 +1646,7 @@ unsafe fn start_text(parent: HWND, at: (i32, i32), box_width: i32) {
 
     let font = cached_font(12.0, 700);
     SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
-    TEXT_OLD_PROC = SetWindowLongPtrW(edit, GWLP_WNDPROC, text_edit_proc as isize);
+    TEXT_OLD_PROC = SetWindowLongPtrW(edit, GWLP_WNDPROC, text_edit_proc as *const () as isize);
 
     let editor = &mut *editor;
     editor.text = Some(TextEdit {

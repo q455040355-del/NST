@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 钉了 nightly-2026-09-08（OCR 依赖要 portable_simd），
+      # 这里不用指定版本，rustup 会自己按文件装
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      # 全目标编译：连测试、示例一起查，避免只查 bin 漏掉
+      - name: Check all targets
+        run: cargo check --workspace --all-targets
+
+      # UI 冒烟需要真实桌面会话（要开窗口、截图），CI 跑不了；
+      # 本地用 scripts\smoke.ps1

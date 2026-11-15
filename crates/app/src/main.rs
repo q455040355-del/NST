@@ -120,6 +120,7 @@ const ID_OCR: usize = 1303;
 const ID_QUIT: usize = 1099;
 
 fn main() {
+    install_panic_hook();
     unsafe {
         // 必须在任何窗口/坐标计算之前：否则进程是 DPI 不感知的，
         // 系统会把坐标和尺寸按 150% 缩放虚拟化（面板位置/大小全错）
@@ -223,9 +224,37 @@ fn main() {
 pub fn debug_log(message: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("netspeed-rs.log");
+
+    // 日志只在诊断时用，长时间跑也别长到几十 MB：超过 1 MB 就从空的重新开始
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_000_000 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{message}");
     }
+}
+
+/// 崩溃现场：GUI 程序挂掉时托盘图标直接消失，不落盘就完全查不到原因
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "?".to_string());
+        let message = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "?".to_string()
+        };
+        debug_log(&format!("PANIC {location}: {message}"));
+        default(info);
+    }));
 }
 
 fn scale_for_dpi(value: i32) -> i32 {

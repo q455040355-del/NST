@@ -81,6 +81,8 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   WorkBuddy / WorkBuddy AI（`.jsonl` 扫 `rawUsage`）。
   文件按「路径 + mtime + 长度」缓存；jsonl 是**流式逐行**读（峰值只跟最长一行有关，不再整文件进内存），
   且只解析**新增的字节**（记录上次偏移，文件被重写时用头部指纹识别后重来）。坏字节只丢一行，不会废掉整个文件。
+  > 面板的「今日」只统计**勾选**的来源（没全开时悬浮说明会标 `n / 4 来源`），历史窗口统计**全部**来源，
+  > 两个数字对不上时先看这里；都勾上就一致了。
 - **全屏避让**：前台窗口铺满整块显示器（且不是任务栏/桌面/弹窗）时自动隐藏面板，退出全屏自动回来；手动「隐藏面板」后不再自动显示，左键点托盘恢复。
 
 ## 截图 + 标注
@@ -121,7 +123,8 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 
 `netspeed.exe --history`（或右键菜单「Token 用量历史…」）：
 
-- **区间胶囊**：今天 / 昨天 / 7 天 / 30 天 / 全部；
+- **区间胶囊**：今天 / 昨天 / 7 天 / 30 天 / 全部；关掉再打开会记住上次选的区间和来源
+  （存在同目录的 `history-prefs.txt`，不动 `settings.ini`，免得和面板那份配置互相覆盖）；
 - **来源筛选**：全部 / OpenCode / DSH / WorkBuddy / WorkBuddy AI，和区间可组合，卡片、柱子、表格、副标题一起过滤；
 - **四张卡片**：输出 / 输入 / 请求（小字带**缓存命中率**）/ 平均速度，带日均、输入输出倍数等小字；
 - **堆叠柱状图**：按来源分层 + 图例 + Y 轴，切区间时柱高按 `DampedSpring(0.30s / 0.86)` 过渡；
@@ -144,10 +147,16 @@ powershell -File scripts\smoke.ps1 -Dark
 
 `smoke.ps1` 会自己起进程（没起的话），用 `WM_APP_MENU_PICK` 打开设置窗，
 截图落在 `%TEMP%\nst-smoke\`，并把 `AiEnabled` / `AutoStart` 改完再改回去。
+点击坐标按窗口实际宽度换算（`440` 逻辑像素），换缩放比例也能跑。
 `-Dark` 走 `NST_FORCE_DARK=1` 强制深色，用来检查两套配色。
+
+CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --workspace` 和
+`cargo check --workspace --all-targets`；界面相关的验证只能本地跑 smoke。
+
+崩溃会在 `%TEMP%\netspeed-rs.log` 留一条 `PANIC 文件:行: 消息`（日志超过 1 MB 自动重建）。
 
 ## 待办
 
 1. AI 来源补齐：Claude Code / Codex。
 2. 多显示器：目前只处理主任务栏 `Shell_TrayWnd`，`Shell_SecondaryTrayWnd` 未处理。
-3. 历史窗口记住来源选择 / 支持多选。
+3. 历史窗口来源支持多选（现在是单选，选项本身已会记住）。

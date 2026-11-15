@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
@@ -32,7 +32,6 @@ pub const TEXT: u32 = 0x001A_1614; // #14161A
 pub const TEXT2: u32 = 0x0080_726B; // #6B7280
 pub const TEXT3: u32 = 0x00AF_A39A; // #9AA3AF
 pub const CHIP: u32 = 0x00F3_F1EF; // #EFF1F3
-pub const CHIP_HOVER: u32 = 0x00FE_F7F2;
 pub const ACCENT: u32 = 0x00E4_6F_2F; // #2F6FE4（COLORREF 里是 BGR）
 pub const ACCENT_PRESSED: u32 = 0x00C2_5A_1F;
 
@@ -42,9 +41,6 @@ pub fn s(value: f32, scale: f32) -> i32 {
     (value * scale).round() as i32
 }
 
-pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
-}
 
 /// 偏白（t=0 原色，t=1 纯白）
 pub fn mix_white(color: u32, t: f32) -> u32 {
@@ -56,12 +52,6 @@ pub fn mix_white(color: u32, t: f32) -> u32 {
     ch(0) | (ch(8) << 8) | (ch(16) << 16)
 }
 
-/// 偏黑（t=0 原色，t=1 纯黑）
-pub fn mix_black(color: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let ch = |shift: u32| -> u32 { (((color >> shift) & 0xFF) as f32 * (1.0 - t)).round() as u32 };
-    ch(0) | (ch(8) << 8) | (ch(16) << 16)
-}
 
 pub fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
     unsafe {
@@ -130,14 +120,6 @@ pub fn set_hand_cursor() {
     }
 }
 
-pub fn set_arrow_cursor() {
-    unsafe {
-        SetCursor(::windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
-            std::ptr::null_mut(),
-            ::windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW,
-        ));
-    }
-}
 
 /// Win11 圆角（Win10 上调用失败，无所谓）
 pub fn round_corners(hwnd: HWND) {
@@ -170,7 +152,7 @@ impl Painter {
 
     pub unsafe fn fill(&self, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
         let brush = CreateSolidBrush(color);
-        let mut rect = RECT {
+        let rect = RECT {
             left,
             top,
             right,
@@ -280,19 +262,11 @@ impl Painter {
     }
 }
 
-/// 双击拖动标题栏之类要用：把客户区坐标翻成屏幕坐标
-pub fn client_to_screen(hwnd: HWND, point: &mut POINT) {
-    unsafe {
-        ::windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, point);
-    }
-}
 
 /// GDI 资源释放助手（Drop 时删）
 pub struct Dib {
     pub dc: HDC,
     pub bitmap: HBITMAP,
-    pub width: i32,
-    pub height: i32,
 }
 
 impl Dib {
@@ -304,12 +278,8 @@ impl Dib {
             }
             return None;
         }
-        Some(Self {
-            dc,
-            bitmap,
-            width,
-            height,
-        })
+        let _ = (width, height);
+        Some(Self { dc, bitmap })
     }
 }
 

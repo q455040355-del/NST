@@ -120,7 +120,7 @@ pub fn recognize_async(owner: HWND, bitmap: Bitmap) {
         let outcome = recognize(&bitmap);
         let payload = Box::into_raw(Box::new(outcome));
         unsafe {
-            let ok = PostMessageW(handle as HWND, crate::WM_APP_OCR_READY, payload as usize, 0);
+            let _ok = PostMessageW(handle as HWND, crate::WM_APP_OCR_READY, payload as usize, 0);
         }
     });
 }

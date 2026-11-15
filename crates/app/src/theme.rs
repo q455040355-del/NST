@@ -11,7 +11,6 @@ use windows_sys::Win32::System::Registry::{
 pub struct Colors {
     pub up: u32,
     pub down: u32,
-    pub label: u32,
     pub value: u32,
     pub background: u32,
 }
@@ -26,7 +25,6 @@ impl Colors {
             Self {
                 up: rgb(22, 122, 66),
                 down: rgb(26, 96, 168),
-                label: rgb(96, 102, 112),
                 value: rgb(32, 36, 42),
                 background,
             }
@@ -34,7 +32,6 @@ impl Colors {
             Self {
                 up: rgb(120, 224, 150),
                 down: rgb(120, 196, 255),
-                label: rgb(158, 166, 178),
                 value: rgb(238, 242, 246),
                 background,
             }

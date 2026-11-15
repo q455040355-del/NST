@@ -86,7 +86,7 @@ pub struct Panel {
 
 impl Panel {
     pub fn new(hwnd: HWND, settings: Settings) -> Self {
-        let dpi = unsafe { crate::dpi_for_window(hwnd) };
+        let dpi = crate::dpi_for_window(hwnd);
         let light = taskbar_is_light();
         let colors = Colors::for_theme(light, 0x00F3F3F3);
 
@@ -419,7 +419,27 @@ impl Panel {
     /// 指示条当前代表的指标（给悬浮说明用）
     pub fn gauge_hint(&self) -> String {
         match self.settings.gauge_source.as_str() {
-            GAUGE_AI => format!("Token {} · 今日 {}", self.ai_speed_text, self.ai_today_text),
+            GAUGE_AI => {
+                // 只统计勾选的来源：数字和历史窗口对不上时，这里说清楚为什么
+                let enabled = [
+                    self.settings.ai_opencode,
+                    self.settings.ai_dsh,
+                    self.settings.ai_workbuddy,
+                    self.settings.ai_workbuddy_ai,
+                ]
+                .iter()
+                .filter(|flag| **flag)
+                .count();
+
+                if enabled < 4 {
+                    format!(
+                        "Token {} · 今日 {}（{enabled} / 4 来源）",
+                        self.ai_speed_text, self.ai_today_text
+                    )
+                } else {
+                    format!("Token {} · 今日 {}", self.ai_speed_text, self.ai_today_text)
+                }
+            }
             GAUGE_MEMORY => format!(
                 "内存 {:.0}%（{} / {}）",
                 self.memory.used_ratio() * 100.0,
@@ -705,7 +725,7 @@ impl Panel {
 
         unsafe {
             let track = CreateSolidBrush(blend(self.colors.background, 0x0000_0000, 0.12));
-            let mut rect = RECT {
+            let rect = RECT {
                 left: pad,
                 top,
                 right: pad + track_width,
@@ -718,7 +738,7 @@ impl Panel {
             if filled > 0 {
                 let color = gauge_color(self.gauge);
                 let brush = CreateSolidBrush(color);
-                let mut rect = RECT {
+                let rect = RECT {
                     left: pad,
                     top,
                     right: pad + filled,
@@ -772,7 +792,7 @@ fn text_width(dc: HDC, text: &str, font: HFONT) -> i32 {
 fn fill(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
     unsafe {
         let brush = CreateSolidBrush(color);
-        let mut rect = RECT {
+        let rect = RECT {
             left,
             top,
             right,
@@ -860,10 +880,6 @@ fn sources_of(settings: &Settings) -> Sources {
         workbuddy: settings.ai_workbuddy,
         workbuddy_ai: settings.ai_workbuddy_ai,
     }
-}
-
-pub fn font_is_alive(font: HFONT) -> bool {
-    !font.is_null()
 }
 
 // ---------------------------------------------------------------- AI 采集线程

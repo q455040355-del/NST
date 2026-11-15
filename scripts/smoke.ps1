@@ -153,18 +153,30 @@ Start-Sleep -Milliseconds 400
 [void](Shot "settings-full" $settings)
 
 # ---------------------------------------------------------------- 压矮 + 滚动
-[void][Smoke]::Resize($settings, 900, 120, 660, 520)
+# 坐标全部按窗口实际尺寸换算：布局是 440 逻辑像素宽，150% 下就是 660。
+# 换缩放比例时这里自动跟着变，不用改脚本。
+function Window-Scale([IntPtr]$hwnd) {
+    $parts = ([Smoke]::RectOf($hwnd)).Split(' ')
+    $width = [int]($parts[1].Split('x')[0])
+    return $width / 440.0
+}
+$scale = Window-Scale $settings
+$shortW = [int][math]::Round(440 * $scale)
+$shortH = [int][math]::Round(347 * $scale)
+
+[void][Smoke]::Resize($settings, 900, 120, $shortW, $shortH)
 Start-Sleep -Milliseconds 500
 $short = Shot "settings-short" $settings
 $rect = [Smoke]::RectOf($settings)
-Check "压矮后仍是 660x520" ($rect -eq "900,120 660x520") $rect
+Check "压矮后尺寸不变" ($rect -eq "900,120 ${shortW}x${shortH}") $rect
 
 [Smoke]::Wheel($settings, -360)
 Start-Sleep -Milliseconds 350
 $wheeled = Shot "settings-wheel" $settings
 
-# 拖滚动条滑块（右侧细轨道，从上往下拖到底）
-[Smoke]::Drag($settings, 649, 150, 649, 460)
+# 拖滚动条滑块（右侧细轨道，从上往下拖）
+$barX = $shortW - [int][math]::Round(7 * $scale)
+[Smoke]::Drag($settings, $barX, [int]($shortH * 0.3), $barX, [int]($shortH * 0.85))
 Start-Sleep -Milliseconds 350
 $dragged = Shot "settings-drag" $settings
 
@@ -173,7 +185,7 @@ Check "拖动滚动条改变了内容" ((Hash-Of $dragged) -ne (Hash-Of $wheeled
 
 # ---------------------------------------------------------------- AI 总开关
 # 先重开一个干净的设置窗（滚到底之后开关已经滚出可见区），
-# 再滚一格滚轮，让 AI 总开关落到 y≈372
+# 再滚 3 格（3 × 66 逻辑像素），让 AI 总开关正好落在可见区
 [void][Smoke]::PostMessageW($settings, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 300
 $settings = [IntPtr]::Zero
@@ -181,18 +193,21 @@ for ($attempt = 0; $attempt -lt 6 -and $settings.ToInt64() -eq 0; $attempt++) {
     [void][Smoke]::PostMessageW($panel, 0x8041, [IntPtr]1301, [IntPtr]::Zero)
     $settings = Wait-Class "NetSpeedTaskbarRs.Settings" 1000
 }
-[void][Smoke]::Resize($settings, 900, 120, 660, 520)
+[void][Smoke]::Resize($settings, 900, 120, $shortW, $shortH)
 Start-Sleep -Milliseconds 400
 [Smoke]::Wheel($settings, -360)
 Start-Sleep -Milliseconds 350
 
-[Smoke]::Click($settings, 600, 372)
+# AI 总开关中心：x = 右边距 - 39，y = 449 - 3 格滚动
+$aiX = $shortW - [int][math]::Round(39 * $scale)
+$aiY = [int][math]::Round((449 - 198) * $scale)
+[Smoke]::Click($settings, $aiX, $aiY)
 Start-Sleep -Milliseconds 600
 $after = Ini-Ai
 Check "点击开关翻转 AiEnabled" ($after -ne $before) "$before -> $after"
 
 # 复原
-[Smoke]::Click($settings, 600, 372)
+[Smoke]::Click($settings, $aiX, $aiY)
 Start-Sleep -Milliseconds 600
 $restored = Ini-Ai
 Check "再点一次恢复原值" ($restored -eq $before) $restored
@@ -202,8 +217,10 @@ $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $runName = "NetSpeedTaskbar"
 $hadRun = $null -ne (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue)
 
-# 页脚左侧的开关（滚轮不影响页脚位置）
-[Smoke]::Click($settings, 264, 468)
+# 页脚左侧的开关（滚轮不影响页脚位置）：x = 175，y = 底边 - 36
+$autoX = [int][math]::Round(175 * $scale)
+$autoY = $shortH - [int][math]::Round(36 * $scale)
+[Smoke]::Click($settings, $autoX, $autoY)
 Start-Sleep -Milliseconds 600
 $autoIni = [string](Get-Content $ini | Select-String '^AutoStart=').Line
 $runValue = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName
@@ -211,7 +228,7 @@ Check "开关写入 AutoStart" ($autoIni -eq "AutoStart=True") $autoIni
 Check "注册表自启项已写入" ($null -ne $runValue) $runValue
 
 # 再点一次关掉（回到测试前的状态）
-[Smoke]::Click($settings, 264, 468)
+[Smoke]::Click($settings, $autoX, $autoY)
 Start-Sleep -Milliseconds 600
 $autoIni = [string](Get-Content $ini | Select-String '^AutoStart=').Line
 $runValue = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName

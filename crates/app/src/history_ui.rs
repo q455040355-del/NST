@@ -6,6 +6,7 @@ use netspeed_core::ai::now_ms;
 use netspeed_core::history::{
     self, all_sources, source_name, DailyRow, UsageRecord, DAY_MS,
 };
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
@@ -239,10 +240,12 @@ pub fn open(_parent: HWND) {
         let left = work.left + ((work.right - work.left) - width).max(0) / 2;
         let top = (work.top + ((work.bottom - work.top) - height) / 3).max(work.top);
 
+        let (saved_range, saved_source) = prefs();
         let state = Box::into_raw(Box::new(State {
             records: Vec::new(),
-            // 默认「今天」：打开就是按小时的当日视图
-            range: 0,
+            // 上次看的是哪个区间 / 来源：存在同目录的小文件里（不写 settings.ini，
+            // 免得和面板那份配置互相覆盖）
+            range: saved_range,
             loading: true,
             days: Vec::new(),
             stack: Vec::new(),
@@ -265,7 +268,7 @@ pub fn open(_parent: HWND) {
             loader: None,
             canvas: std::ptr::null_mut(),
             pill_rects: Vec::new(),
-            source: 0,
+            source: saved_source,
             source_rects: Vec::new(),
             close_rect: RECT {
                 left: 0,
@@ -344,6 +347,45 @@ pub fn open(_parent: HWND) {
         // 后台加载
         start_loading(hwnd);
     }
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("NetSpeedTaskbar").join("history-prefs.txt"))
+}
+
+/// 上次的 (区间, 来源)。读不到就用「今天 / 全部」。
+fn prefs() -> (usize, usize) {
+    let mut range = 0;
+    let mut source = 0;
+    if let Some(path) = prefs_path() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let Ok(value) = value.trim().parse::<usize>() else {
+                    continue;
+                };
+                match key.trim() {
+                    "range" => range = value.min(RANGE_LABELS.len() - 1),
+                    "source" => source = value.min(SOURCE_LABELS.len() - 1),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (range, source)
+}
+
+fn save_prefs(range: usize, source: usize) {
+    let Some(path) = prefs_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("range={range}\nsource={source}\n"));
 }
 
 fn start_loading(hwnd: HWND) {
@@ -787,6 +829,7 @@ unsafe extern "system" fn canvas_proc(
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                         if state.source != index {
                             state.source = index;
+                            save_prefs(state.range, state.source);
                             recalc(state);
                             start_animator(hwnd);
                         }
@@ -799,6 +842,7 @@ unsafe extern "system" fn canvas_proc(
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                         if state.range != index {
                             state.range = index;
+                            save_prefs(state.range, state.source);
                             recalc(state);
                             start_animator(hwnd);
                         }
@@ -935,7 +979,7 @@ unsafe fn hatch_brush(color: u32) -> HBRUSH {
 
         let old = SelectObject(dc, dib as HGDIOBJ);
         let tint = CreateSolidBrush(mix_white(color, 0.62));
-        let mut rect = RECT {
+        let rect = RECT {
             left: 0,
             top: 0,
             right: size,
@@ -1059,7 +1103,7 @@ impl Painter {
 
     unsafe fn fill(&self, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
         let brush = CreateSolidBrush(color);
-        let mut rect = RECT {
+        let rect = RECT {
             left,
             top,
             right,
@@ -2201,7 +2245,7 @@ fn weekday_name(weekday: i64) -> &'static str {
 fn day_to_date(day: i64) -> (i32, u32, u32, i64) {
     // 1970-01-01 是周四（weekday 4）
     let days = day;
-    let weekday = ((days % 7) + 11) % 7; // 3..9 映射到 0..6 太绕，直接算：
+    let _weekday = ((days % 7) + 11) % 7; // 3..9 映射到 0..6 太绕，直接算：
     let weekday = ((days + 3).rem_euclid(7)) + 1; // 1=周一 … 7=周日
     let _ = weekday;
 
