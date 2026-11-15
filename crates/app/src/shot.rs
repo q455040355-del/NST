@@ -1857,7 +1857,6 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     Tool::Text if wide_enough => {
                         // 框的左下角起笔，输入框宽度跟框一样宽
                         let width = right - left;
-                        editor.tool = Tool::Arrow;
                         start_text(hwnd, (left, top), width);
                     }
                     Tool::Ocr if wide_enough => {
