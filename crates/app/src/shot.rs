@@ -7,6 +7,8 @@
 //!
 //! 画面全部走 GDI 双缓冲；贴图窗口是置顶无边框窗口。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,8 +19,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetStockObject, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline, ReleaseDC, SelectObject,
     SetBkMode, SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchBlt, TextOutW, BITMAPINFO,
     BITMAPINFOHEADER,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HALFTONE,
-    HBITMAP, HDC, HFONT, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, SRCCOPY, TRANSPARENT, UpdateWindow,
+    CLEARTYPE_QUALITY, COLORONCOLOR, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    UpdateWindow,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus,
@@ -261,6 +264,55 @@ fn make_font(points: f32, weight: i32) -> HFONT {
     }
 }
 
+thread_local! {
+    /// 字体缓存。CreateFontW 要建一份字库，拖拽时每帧都建一次会明显发顿。
+    /// 缓存里的句柄常驻，调用方**不要** DeleteObject。
+    static FONTS: RefCell<HashMap<(i32, i32), HFONT>> = RefCell::new(HashMap::new());
+}
+
+fn cached_font(points: f32, weight: i32) -> HFONT {
+    let key = ((points * 10.0).round() as i32, weight);
+    FONTS.with(|cell| {
+        if let Some(handle) = cell.borrow().get(&key) {
+            return *handle;
+        }
+        let handle = make_font(points, weight);
+        cell.borrow_mut().insert(key, handle);
+        handle
+    })
+}
+
+/// 把位图拷进一个常驻的内存 DC（只做一次，之后每帧直接 blit）。
+unsafe fn source_dc(bitmap: &Bitmap) -> Option<(HDC, HBITMAP)> {
+    let (dc, dib, bits) = make_dib(bitmap.width, bitmap.height);
+    if dc.is_null() || dib.is_null() {
+        return None;
+    }
+    if !bits.is_null() {
+        std::ptr::copy_nonoverlapping(bitmap.pixels.as_ptr(), bits, bitmap.pixels.len());
+    }
+    Some((dc, dib))
+}
+
+/// 从常驻 DC 贴到目标：1:1 用 BitBlt（最快），缩放才走 HALFTONE StretchBlt。
+unsafe fn blit_cached(
+    dc: HDC,
+    source: HDC,
+    src_w: i32,
+    src_h: i32,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) {
+    if src_w == width && src_h == height {
+        BitBlt(dc, left, top, width, height, source, 0, 0, SRCCOPY);
+    } else {
+        SetStretchBltMode(dc, HALFTONE);
+        StretchBlt(dc, left, top, width, height, source, 0, 0, src_w, src_h, SRCCOPY);
+    }
+}
+
 // ---------------------------------------------------------------- 选区遮罩
 
 struct Overlay {
@@ -269,6 +321,29 @@ struct Overlay {
     origin: (i32, i32),
     start: Option<POINT>,
     current: POINT,
+    /// 常驻的整屏画布：每帧只改动选区那几行，不再整屏重新分配 + 拷 14 MB
+    canvas: Option<(HDC, HBITMAP, *mut u8)>,
+    /// 上一帧的选区（用来把那些行恢复成压暗版本）
+    last_rect: Option<RECT>,
+}
+
+/// 把整屏画布上某块矩形恢复成「压暗版」像素。
+unsafe fn restore_rows(bits: *mut u8, dimmed: &[u8], width: i32, height: i32, rect: RECT) {
+    let top = rect.top.max(0).min(height);
+    let bottom = rect.bottom.max(0).min(height);
+    let left = rect.left.max(0).min(width);
+    let right = rect.right.max(0).min(width);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let len = (right - left) as usize * 4;
+    for row in top..bottom {
+        let offset = (row * width) as usize * 4 + left as usize * 4;
+        if offset + len <= dimmed.len() {
+            std::ptr::copy_nonoverlapping(dimmed.as_ptr().add(offset), bits.add(offset), len);
+        }
+    }
 }
 
 unsafe fn dim_pixels(shot: &Bitmap) -> Vec<u8> {
@@ -316,17 +391,31 @@ unsafe fn overlay_paint(hwnd: HWND) {
     let width = state.shot.width;
     let height = state.shot.height;
 
-    let (dc, dib, bits) = make_dib(width, height);
-    if dib.is_null() {
-        return;
-    }
+    let (dc, dib, bits) = match state.canvas {
+        Some((dc, dib, bits)) => (dc, dib, bits),
+        None => {
+            let (dc, dib, bits) = make_dib(width, height);
+            if dib.is_null() {
+                return;
+            }
+            if !bits.is_null() {
+                // 只铺一次压暗版
+                std::ptr::copy_nonoverlapping(state.dimmed.as_ptr(), bits, state.dimmed.len());
+            }
+            state.canvas = Some((dc, dib, bits));
+            (dc, dib, bits)
+        }
+    };
+    let _ = dib;
 
     if !bits.is_null() {
-        // 先铺压暗后的整屏
-        std::ptr::copy_nonoverlapping(state.dimmed.as_ptr(), bits, state.dimmed.len());
+        // 先把上一帧的选区恢复成压暗版，再把这一帧的选区还原成原始像素
+        if let Some(rect) = state.last_rect {
+            restore_rows(bits, &state.dimmed, width, height, rect);
+        }
 
-        // 选区内还原原始像素
-        if let Some(rect) = selection(state) {
+        let current = selection(state);
+        if let Some(rect) = current {
             for row in rect.top..rect.bottom {
                 let offset = (row * width) as usize * 4;
                 let from = offset + rect.left as usize * 4;
@@ -338,6 +427,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
                 );
             }
         }
+        state.last_rect = current;
     }
 
     // 选区边框 + 尺寸
@@ -352,7 +442,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
         DeleteObject(pen as *mut _);
 
         let label = format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top);
-        let font = make_font(9.0, 700);
+        let font = cached_font(9.0, 700);
         let old_font = SelectObject(dc, font as HGDIOBJ);
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, 0x00FF_FFFF);
@@ -372,16 +462,12 @@ unsafe fn overlay_paint(hwnd: HWND) {
         );
 
         SelectObject(dc, old_font);
-        DeleteObject(font as *mut _);
     }
 
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
     EndPaint(hwnd, &mut ps);
-
-    DeleteObject(dib as *mut _);
-    DeleteDC(dc);
 }
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -484,7 +570,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_DESTROY => {
             let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
             if !state.is_null() {
-                drop(Box::from_raw(state));
+                let state = Box::from_raw(state);
+                if let Some((dc, dib, _)) = state.canvas {
+                    DeleteObject(dib as *mut _);
+                    DeleteDC(dc);
+                }
+                drop(state);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             finish_capture();
@@ -531,6 +622,8 @@ pub unsafe fn begin(panel: HWND) {
         origin: (vx, vy),
         start: None,
         current: POINT { x: 0, y: 0 },
+        canvas: None,
+        last_rect: None,
     }));
 
     let hwnd = CreateWindowExW(
@@ -609,6 +702,10 @@ struct Editor {
     pen_points: Vec<(i32, i32)>,
     text: Option<TextEdit>,
     buttons: Vec<(RECT, Action)>,
+    /// 原图只拷进内存 DC 一次，之后每帧直接 blit
+    source: Option<(HDC, HBITMAP)>,
+    /// 客户区双缓冲（尺寸变了才重建）
+    back: Option<(HDC, HBITMAP, i32, i32)>,
 }
 
 const ANNOT: u32 = 0x003A_3AE0; // 0x00BBGGRR，红
@@ -711,14 +808,39 @@ fn draw_mosaic(dc: HDC, base: &Bitmap, a: (i32, i32), b: (i32, i32), scale: f32,
     let right = a.0.max(b.0);
     let bottom = a.1.max(b.1);
     let block = block.max(4);
+    if right <= left || bottom <= top {
+        return;
+    }
 
-    let mut y = top;
-    while y < bottom {
-        let mut x = left;
-        while x < right {
-            // 取块内若干采样点的平均值，才像「马赛克」而不是噪点
+    let cols = (right - left + block - 1) / block;
+    let rows = (bottom - top + block - 1) / block;
+    if cols <= 0 || rows <= 0 {
+        return;
+    }
+
+    // 一个像素 = 一个马赛克块：先算成一张极小的位图，再一次性放大贴上去。
+    // 旧写法是每块 CreateSolidBrush + FillRect，拖大区域时每帧要建上千个 GDI 对象，卡就卡在这。
+    let (src_dc, src_dib, src_bits) = make_dib(cols, rows);
+    if src_dc.is_null() || src_dib.is_null() || src_bits.is_null() {
+        unsafe {
+            if !src_dc.is_null() {
+                DeleteDC(src_dc);
+            }
+            if !src_dib.is_null() {
+                DeleteObject(src_dib as *mut _);
+            }
+        }
+        return;
+    }
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = left + col * block;
+            let y = top + row * block;
+
+            // 取块内四个采样点的平均值，才像「马赛克」而不是噪点
             let mut sum = (0u32, 0u32, 0u32, 0u32);
-            for (sx, sy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            for (sx, sy) in [(0.25f32, 0.25f32), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
                 let px = ((x as f32 + block as f32 * sx) / scale) as i32;
                 let py = ((y as f32 + block as f32 * sy) / scale) as i32;
                 if px < 0 || py < 0 || px >= base.width || py >= base.height {
@@ -734,23 +856,34 @@ fn draw_mosaic(dc: HDC, base: &Bitmap, a: (i32, i32), b: (i32, i32), scale: f32,
             }
 
             let count = sum.3.max(1);
-            let color = ((sum.0 / count) << 16) | ((sum.1 / count) << 8) | (sum.2 / count);
-
+            let offset = (row * cols + col) as usize * 4;
             unsafe {
-                let brush = CreateSolidBrush(color);
-                let rect = RECT {
-                    left: x,
-                    top: y,
-                    right: (x + block).min(right),
-                    bottom: (y + block).min(bottom),
-                };
-                FillRect(dc, &rect, brush);
-                DeleteObject(brush as *mut _);
+                // DIB 是 BGRA，和 Bitmap::pixels 的顺序一致
+                *src_bits.add(offset) = (sum.0 / count) as u8;
+                *src_bits.add(offset + 1) = (sum.1 / count) as u8;
+                *src_bits.add(offset + 2) = (sum.2 / count) as u8;
+                *src_bits.add(offset + 3) = 255;
             }
-
-            x += block;
         }
-        y += block;
+    }
+
+    unsafe {
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchBlt(
+            dc,
+            left,
+            top,
+            right - left,
+            bottom - top,
+            src_dc,
+            0,
+            0,
+            cols,
+            rows,
+            SRCCOPY,
+        );
+        DeleteObject(src_dib as *mut _);
+        DeleteDC(src_dc);
     }
 }
 fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
@@ -761,14 +894,13 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
             Shape::Rect { a, b } => draw_rect(dc, *a, *b, width),
             Shape::Pen { points } => draw_pen(dc, points, width),
             Shape::Text { at, text } => {
-                let font = make_font(12.0, 700);
+                let font = cached_font(12.0, 700);
                 unsafe {
                     let old = SelectObject(dc, font as HGDIOBJ);
                     SetBkMode(dc, TRANSPARENT as i32);
                     SetTextColor(dc, ANNOT);
                     TextOutW(dc, at.0, at.1, wide(text).as_ptr(), text.encode_utf16().count() as i32);
                     SelectObject(dc, old);
-                    DeleteObject(font as *mut _);
                 }
             }
             Shape::Mosaic { a, b } => {
@@ -779,6 +911,7 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
 }
 
 unsafe fn editor_paint(hwnd: HWND) {
+    let started = std::time::Instant::now();
     let editor = editor_state(hwnd);
     if editor.is_null() {
         return;
@@ -792,10 +925,38 @@ unsafe fn editor_paint(hwnd: HWND) {
         bottom: 0,
     };
     GetClientRect(hwnd, &mut client);
-    let (dc, dib, bits) = make_dib(client.right, client.bottom);
-    if dib.is_null() {
+    if client.right <= 0 || client.bottom <= 0 {
         return;
     }
+
+    // 原图只拷一次
+    if editor.source.is_none() {
+        editor.source = source_dc(&editor.base);
+    }
+
+    // 双缓冲：尺寸没变就复用，别每帧重新建 5 MB 的 DIB
+    let (dc, dib) = match editor.back {
+        Some((dc, dib, w, h)) if w == client.right && h == client.bottom => (dc, dib),
+        _ => {
+            if let Some((old_dc, old_dib, _, _)) = editor.back.take() {
+                DeleteObject(old_dib as *mut _);
+                DeleteDC(old_dc);
+            }
+            let (dc, dib, _bits) = make_dib(client.right, client.bottom);
+            if dc.is_null() || dib.is_null() {
+                if !dc.is_null() {
+                    DeleteDC(dc);
+                }
+                if !dib.is_null() {
+                    DeleteObject(dib as *mut _);
+                }
+                return;
+            }
+            editor.back = Some((dc, dib, client.right, client.bottom));
+            (dc, dib)
+        }
+    };
+    let _ = dib;
 
     let toolbar = s(44.0);
     let bg = CreateSolidBrush(EDITOR_BG);
@@ -808,15 +969,19 @@ unsafe fn editor_paint(hwnd: HWND) {
     FillRect(dc, &all, bg);
     DeleteObject(bg as *mut _);
 
-    // 图片
-    blit_bitmap(
-        dc,
-        &editor.base,
-        editor.image_left,
-        editor.image_top,
-        (editor.base.width as f32 * editor.scale) as i32,
-        (editor.base.height as f32 * editor.scale) as i32,
-    );
+    // 图片（从常驻 DC 直接贴，不再每帧分配 + 拷整张图）
+    if let Some((source, _)) = editor.source {
+        blit_cached(
+            dc,
+            source,
+            editor.base.width,
+            editor.base.height,
+            editor.image_left,
+            editor.image_top,
+            (editor.base.width as f32 * editor.scale) as i32,
+            (editor.base.height as f32 * editor.scale) as i32,
+        );
+    }
 
     // 图形都在「图片坐标系」里，这里把视口原点挪到图片左上角
     let mut old_origin = POINT { x: 0, y: 0 };
@@ -845,7 +1010,7 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     // 工具栏
     editor.buttons.clear();
-    let font = make_font(9.0, 400);
+    let font = cached_font(9.0, 400);
     let old_font = SelectObject(dc, font as HGDIOBJ);
     SetBkMode(dc, TRANSPARENT as i32);
 
@@ -919,11 +1084,10 @@ unsafe fn editor_paint(hwnd: HWND) {
     }
 
     SelectObject(dc, old_font);
-    DeleteObject(font as *mut _);
 
     // 提示
     let hint = "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消";
-    let hint_font = make_font(8.0, 400);
+    let hint_font = cached_font(8.0, 400);
     let old_hint = SelectObject(dc, hint_font as HGDIOBJ);
     SetTextColor(dc, EDITOR_MUTED);
     let mut hint_rect = RECT {
@@ -940,7 +1104,6 @@ unsafe fn editor_paint(hwnd: HWND) {
         DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
     );
     SelectObject(dc, old_hint);
-    DeleteObject(hint_font as *mut _);
 
     let _ = toolbar;
     let _ = all;
@@ -951,8 +1114,11 @@ unsafe fn editor_paint(hwnd: HWND) {
     BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     EndPaint(hwnd, &mut ps);
 
-    DeleteObject(dib as *mut _);
-    DeleteDC(dc);
+    // 拖拽时每帧都走这里，超过一帧（16ms）就记一笔，方便以后查回归
+    let cost_us = started.elapsed().as_micros();
+    if cost_us > 16_000 {
+        crate::debug_log(&format!("editor paint={cost_us}us"));
+    }
 }
 
 fn wide_width(dc: HDC, text: &str) -> i32 {
@@ -1037,6 +1203,8 @@ impl Editor {
             pen_points: Vec::new(),
             text: None,
             buttons: Vec::new(),
+            source: None,
+            back: None,
         }
     }
 }
@@ -1355,7 +1523,7 @@ unsafe fn start_text(parent: HWND, at: (i32, i32)) {
         return;
     }
 
-    let font = make_font(12.0, 700);
+    let font = cached_font(12.0, 700);
     SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
     TEXT_OLD_PROC = SetWindowLongPtrW(edit, GWLP_WNDPROC, text_edit_proc as isize);
 
@@ -1575,7 +1743,16 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_DESTROY => {
             let editor = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Editor;
             if !editor.is_null() {
-                drop(Box::from_raw(editor));
+                let editor = Box::from_raw(editor);
+                if let Some((dc, dib)) = editor.source {
+                    DeleteObject(dib as *mut _);
+                    DeleteDC(dc);
+                }
+                if let Some((dc, dib, _, _)) = editor.back {
+                    DeleteObject(dib as *mut _);
+                    DeleteDC(dc);
+                }
+                drop(editor);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             finish_capture();
@@ -1654,6 +1831,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
         pen_points: Vec::new(),
         text: None,
         buttons: Vec::new(),
+        source: None,
+        back: None,
     }));
 
     let hwnd = CreateWindowExW(

@@ -33,6 +33,9 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   Explorer 反复重绘任务栏也盖不住它（挂在任务栏下面的 `WS_CHILD` 子窗口会被 `MSTaskListWClass` 压住，点击全丢）。
 - **呈现**：背缓冲 `CreateDIBSection`（32bpp，行序 top-down）+ 全量 alpha=255，整体 `UpdateLayeredWindow` 推给 DWM。
   普通 `CreateCompatibleBitmap` 的 alpha 恒为 0，合成后文字近乎透明，必须用 DIB 并手写 alpha。
+  ⚠️ 分层窗口的 `WM_PAINT` 里必须自己 `ValidateRect`：`UpdateLayeredWindow` 不会清更新区，
+  不清就会无穷重发 `WM_PAINT`（面板又是 TOPMOST，永远排在队首），把同线程其它窗口的
+  `WM_PAINT` 全饿死 —— 截图编辑器拖箭头/马赛克发顿就是这个原因。
 - **底色**：在面板左右两侧的空隙各取 4 个点，按亮度取中位数作为背景色，和任务栏融为一体；采不到才回退到标准色。
 - **DPI**：启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`；
   窗口里取 DPI 一律走 `GetDpiForWindow`（分层窗口未显示时 `GetDC(hwnd)+LOGPIXELSX` 会返回 96，会把面板算成未缩放尺寸）。
@@ -45,6 +48,8 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **网速网卡**：默认是「自动（全部合计）」；设置里可选单块网卡（WLAN / 以太网 / Tailscale / vEthernet…），只统计那一块。
   NDIS 过滤层/虚拟交换端口（名字带 `-0000` 的那堆）一律排除——它们和底层网卡上报同一份计数，一起加会把网速放大 5～6 倍。
   单位：≥ 100 KB/s 直接进位到 `M/s`（两位小数），避免 `136.7 K/s` 这种占地方又不好读的写法。
+- **刷新间隔**：设置里可选 0.5 / 1 / 2 秒（默认 0.5），四个视图共用；改完立刻生效并落盘。
+  计时器线程固定 500ms 投递一次，真正的采样由面板按这个间隔限流（`Panel::last_refresh`）。
 - **指示条**：跟随时按视图取源（网速对数刻度 / 内存占用 / CPU / AI），右键菜单可固定来源或关闭。
 - **菜单**：面板右键与托盘共用——显示网速/内存/温度/AI、底部指示条子菜单、Token 用量历史、设置、隐藏面板、退出。
   子窗口不能抢前台，菜单前会先把一个屏幕外的 1×1 顶层窗口设为前台，否则 `TrackPopupMenu` 立刻返回、菜单不显示。
@@ -66,6 +71,11 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **贴图**：一键把结果钉在最上层，拖动移动，右键 / 双击 / Esc 关闭。
 
 实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一画在「图片坐标系」里，靠 `SetViewportOrgEx` 平移到显示位置，导出时把原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
+
+拖拽性能（之前拖箭头/马赛克会顿）：原图只拷进常驻内存 DC 一次、背缓冲按客户区尺寸复用、字体走 `cached_font` 缓存；
+马赛克从「每块 `CreateSolidBrush` + `FillRect`」改成「先算成一张块级小位图，再一次 `StretchBlt(COLORONCOLOR)` 放大」。
+选区遮罩同理：整屏画布只建一次，每帧只刷「上一帧选区」和「这一帧选区」两种行。
+实测 600×420 选区拖拽每帧 ≈ 2.0ms（原来要建上千个 GDI 对象），加上面板 `ValidateRect` 修好后不再掉帧。
 
 > 交互参考 [Snow Shot](https://github.com/mg-chao/snow-shot)（GPL-3.0），但**没有复用其任何代码**，全部是这里的 Win32/GDI 实现。
 

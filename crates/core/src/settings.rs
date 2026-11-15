@@ -21,6 +21,8 @@ pub struct Settings {
     pub panel_y: i32,
     pub network_interface: String,
     pub gauge_source: String,
+    /// 面板刷新间隔（毫秒）：500 / 1000 / 2000
+    pub refresh_ms: i32,
     /// 当前视图：speed / memory / temperature / ai
     pub view: String,
     pub ai_opencode: bool,
@@ -41,6 +43,7 @@ impl Default for Settings {
             panel_y: -1,
             network_interface: "auto".to_string(),
             gauge_source: GAUGE_VIEW.to_string(),
+            refresh_ms: 500,
             view: "speed".to_string(),
             ai_opencode: true,
             ai_claude: false,
@@ -85,6 +88,7 @@ impl Settings {
                 "PanelY" => settings.panel_y = value.parse().unwrap_or(-1),
                 "NetworkInterface" => settings.network_interface = value.to_string(),
                 "GaugeSource" => settings.gauge_source = normalize_gauge(value),
+                "RefreshMs" => settings.refresh_ms = normalize_refresh(value.parse().unwrap_or(500)),
                 "View" => settings.view = value.to_string(),
                 "AiOpenCode" => settings.ai_opencode = parse_bool(value),
                 "AiClaude" => settings.ai_claude = parse_bool(value),
@@ -99,6 +103,7 @@ impl Settings {
         }
 
         settings.panel_width = settings.panel_width.clamp(72, 360);
+        settings.refresh_ms = normalize_refresh(settings.refresh_ms);
         settings
     }
 
@@ -116,6 +121,7 @@ impl Settings {
         out.push_str(&format!("NetworkInterface={}\n", self.network_interface));
         out.push_str("DisplayMode=embedded\n");
         out.push_str(&format!("GaugeSource={}\n", self.gauge_source));
+        out.push_str(&format!("RefreshMs={}\n", self.refresh_ms));
         out.push_str(&format!("View={}\n", self.view));
         out.push_str(&format!("AiOpenCode={}\n", self.ai_opencode));
         out.push_str(&format!("AiClaude={}\n", self.ai_claude));
@@ -183,6 +189,15 @@ fn normalize_gauge(value: &str) -> String {
         _ => GAUGE_VIEW,
     }
     .to_string()
+}
+
+/// 刷新间隔只允许 0.5 / 1 / 2 秒，其它值就近吸附（手改 ini 也不会跑飞）。
+pub fn normalize_refresh(value: i32) -> i32 {
+    match value {
+        v if v <= 750 => 500,
+        v if v <= 1500 => 1000,
+        _ => 2000,
+    }
 }
 
 #[cfg(test)]

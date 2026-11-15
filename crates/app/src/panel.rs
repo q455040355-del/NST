@@ -69,6 +69,8 @@ pub struct Panel {
     width: i32,
     height: i32,
     gauge: f32,
+    /// 上一次真正采样/重绘的时间（用来按设置的间隔限流）
+    last_refresh: std::time::Instant,
 }
 
 impl Panel {
@@ -104,6 +106,7 @@ impl Panel {
             width: 0,
             height: 0,
             gauge: 0.0,
+            last_refresh: std::time::Instant::now(),
         };
 
         panel.ensure_buffer();
@@ -121,7 +124,16 @@ impl Panel {
 
     /// 计时器里调用：更新采样值并重绘。
     pub fn tick(&mut self) {
+        // 计时器本身每 500ms 响一次，这里是「多久真正采一次样」的闸门。
+        // 留 60ms 的余量，免得 500ms 的节拍抖动把这一帧跳过。
+        let interval = self.settings.refresh_ms.max(50) as u128;
+        let elapsed = self.last_refresh.elapsed().as_millis();
+        if elapsed + 60 < interval {
+            return;
+        }
+
         let started = std::time::Instant::now();
+        self.last_refresh = started;
 
         self.refresh();
         let refresh_us = started.elapsed().as_micros();
@@ -131,6 +143,14 @@ impl Panel {
         if refresh_us > 5_000 {
             crate::debug_log(&format!("tick refresh={refresh_us}us"));
         }
+    }
+
+    /// 改刷新间隔（毫秒）：立刻生效，下一次 tick 就会采一次样。
+    pub fn set_refresh_ms(&mut self, ms: i32) {
+        self.settings.refresh_ms = netspeed_core::settings::normalize_refresh(ms);
+        self.settings.save();
+        self.last_refresh = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        self.tick();
     }
 
     pub fn cycle_view(&mut self) {

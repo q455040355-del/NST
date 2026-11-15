@@ -37,6 +37,11 @@ const ID_GAUGE_COMBO: usize = 2005;
 const ID_CLOSE: usize = 2006;
 const ID_INTERFACE_LABEL: usize = 2007;
 const ID_INTERFACE_COMBO: usize = 2008;
+const ID_REFRESH_LABEL: usize = 2009;
+const ID_REFRESH_COMBO: usize = 2010;
+
+/// 面板刷新间隔（显示文案, 毫秒）
+const REFRESH_OPTIONS: [(&str, i32); 3] = [("0.5 秒", 500), ("1 秒", 1000), ("2 秒", 2000)];
 
 const GAUGE_OPTIONS: [(&str, &str); 6] = [
     ("跟随当前视图", "view"),
@@ -56,7 +61,7 @@ struct DialogState {
     interfaces: Vec<String>,
 }
 
-pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str) {
+pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str, refresh_ms: i32) {
     unsafe {
         // 已经开着就提到前面（同一时间只允许一个）
         let class = wide(CLASS_NAME);
@@ -92,7 +97,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str) {
         // （GetDpiForWindow 对挂在任务栏下的子窗口会返回 96，偏小）
         let dpi = crate::screen_scale();
         let width_px = (460.0 * dpi) as i32;
-        let height_px = (310.0 * dpi) as i32;
+        let height_px = (350.0 * dpi) as i32;
 
         let mut screen = windows_sys::Win32::Foundation::RECT {
             left: 0,
@@ -137,7 +142,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str) {
         }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-        create_children(hwnd, width, gauge, interface, dpi);
+        create_children(hwnd, width, gauge, interface, refresh_ms, dpi);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
@@ -157,7 +162,7 @@ unsafe extern "system" fn enum_settings(hwnd: HWND, lparam: LPARAM) -> i32 {
     1
 }
 
-fn create_children(hwnd: HWND, width: i32, gauge: &str, interface: &str, dpi: f32) {
+fn create_children(hwnd: HWND, width: i32, gauge: &str, interface: &str, refresh_ms: i32, dpi: f32) {
     unsafe {
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let pad = (18.0 * dpi) as i32;
@@ -284,13 +289,42 @@ fn create_children(hwnd: HWND, width: i32, gauge: &str, interface: &str, dpi: f3
             SendMessageW(interface_combo, CB_SETCURSEL, selected, 0);
         }
 
+        label("刷新间隔", (182.0 * dpi) as i32, (110.0 * dpi) as i32);
+
+        let refresh_combo = CreateWindowExW(
+            0,
+            wide("ComboBox").as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            (110.0 * dpi) as i32,
+            (178.0 * dpi) as i32,
+            (320.0 * dpi) as i32,
+            (200.0 * dpi) as i32,
+            hwnd,
+            ID_REFRESH_COMBO as *mut _,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        SendMessageW(refresh_combo, WM_SETFONT, font as usize, 1);
+        {
+            let mut selected = 0;
+            for (index, (text, ms)) in REFRESH_OPTIONS.iter().enumerate() {
+                let item = wide(text);
+                SendMessageW(refresh_combo, CB_ADDSTRING, 0, item.as_ptr() as isize);
+                if *ms == refresh_ms {
+                    selected = index;
+                }
+            }
+            SendMessageW(refresh_combo, CB_SETCURSEL, selected, 0);
+        }
+
         let close = CreateWindowExW(
             0,
             wide("Button").as_ptr(),
             wide("关闭").as_ptr(),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             (338.0 * dpi) as i32,
-            (200.0 * dpi) as i32,
+            (240.0 * dpi) as i32,
             (90.0 * dpi) as i32,
             (30.0 * dpi) as i32,
             hwnd,
@@ -311,6 +345,7 @@ fn create_children(hwnd: HWND, width: i32, gauge: &str, interface: &str, dpi: f3
         let _ = ID_WIDTH_LABEL;
         let _ = ID_GAUGE_LABEL;
         let _ = ID_INTERFACE_LABEL;
+        let _ = ID_REFRESH_LABEL;
     }
 }
 
@@ -364,6 +399,12 @@ unsafe extern "system" fn dialog_proc(
                         .unwrap_or_else(|| "auto".to_string())
                 };
                 crate::apply_network_interface(state.parent, &interface);
+            } else if id == ID_REFRESH_COMBO && code == CBN_SELCHANGE {
+                let combo = lparam as HWND;
+                let index = SendMessageW(combo, CB_GETCURSEL, 0, 0) as usize;
+                if let Some((_, ms)) = REFRESH_OPTIONS.get(index) {
+                    crate::apply_refresh_ms(state.parent, *ms);
+                }
             } else if id == ID_CLOSE {
                 DestroyWindow(hwnd);
             }

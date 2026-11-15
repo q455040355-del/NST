@@ -196,7 +196,13 @@ fn main() {
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
-            settings_ui::open(hwnd, settings.panel_width, &settings.gauge_source, &settings.network_interface);
+            settings_ui::open(
+                hwnd,
+                settings.panel_width,
+                &settings.gauge_source,
+                &settings.network_interface,
+                settings.refresh_ms,
+            );
         }
         if std::env::args().any(|arg| arg == "--history") {
             history_ui::open(hwnd);
@@ -472,6 +478,11 @@ unsafe extern "system" fn wnd_proc(
             if let Some(panel) = panel_mut(hwnd) {
                 panel.paint();
             }
+            // 面板是分层窗口，内容用 UpdateLayeredWindow 直接提交，不需要 BeginPaint。
+            // 但更新区必须自己清掉：不清的话 WM_PAINT 会一直重发（面板又是 TOPMOST，
+            // 每次都排在前面），同线程的其它窗口就拿不到 WM_PAINT ——
+            // 截图编辑器里拖箭头/马赛克卡顿就是这么来的。
+            windows_sys::Win32::Graphics::Gdi::ValidateRect(hwnd, std::ptr::null());
             0
         }
         WM_PRINTCLIENT => {
@@ -626,7 +637,8 @@ fn show_menu(hwnd: HWND) {
                 let width = panel.settings.panel_width;
                 let gauge = panel.settings.gauge_source.clone();
                 let interface = panel.settings.network_interface.clone();
-                settings_ui::open(hwnd, width, &gauge, &interface);
+                let refresh_ms = panel.settings.refresh_ms;
+                settings_ui::open(hwnd, width, &gauge, &interface, refresh_ms);
             }
             ID_SHOT => {
                 shot::request(hwnd);
@@ -720,6 +732,13 @@ pub(crate) fn apply_panel_width(parent: HWND, width: i32) {
 pub(crate) fn apply_network_interface(parent: HWND, interface: &str) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_network_interface(interface);
+    }
+}
+
+/// 设置里改刷新间隔：立刻按新节奏采样重绘。
+pub(crate) fn apply_refresh_ms(parent: HWND, ms: i32) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.set_refresh_ms(ms);
     }
 }
 
