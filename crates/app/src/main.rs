@@ -28,6 +28,7 @@ use theme::wide;
 
 const WM_APP_TICK: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
+const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 const TIMER_ID: usize = 1;
 const TRAY_ID: u32 = 1;
 
@@ -59,8 +60,8 @@ const ID_GAUGE_MEMORY: usize = 1103;
 const ID_GAUGE_CPU: usize = 1104;
 const ID_GAUGE_AI: usize = 1105;
 const ID_GAUGE_NONE: usize = 1106;
-const ID_HISTORY: usize = 1101;
-const ID_SETTINGS: usize = 1100;
+const ID_HISTORY: usize = 1300;
+const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
 const ID_QUIT: usize = 1099;
 
@@ -330,12 +331,13 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_RBUTTONDOWN => {
-            // 任务栏会抢走右键的抬起消息：按下时就抓鼠标，抬起必然回到我们这里
-            SetCapture(hwnd);
+
+            PostMessageW(hwnd, WM_APP_SHOW_MENU, 0, 0);
             0
         }
-        WM_RBUTTONUP => {
-            ReleaseCapture();
+
+        WM_APP_SHOW_MENU => {
+
             show_menu(hwnd);
             0
         }
@@ -408,7 +410,7 @@ fn show_menu(hwnd: HWND) {
         // 关键：先把自己（隐藏顶层窗口）设为前台，否则 TrackPopupMenu 会立刻返回、菜单根本不显示
         let owner = if MENU_HOST.is_null() { hwnd } else { MENU_HOST };
         let fg = SetForegroundWindow(owner);
-        debug_log(&format!("menu: owner={} fg={fg}", owner as usize));
+        let _ = fg;
 
         let command = TrackPopupMenu(
             menu,
@@ -419,6 +421,7 @@ fn show_menu(hwnd: HWND) {
             owner,
             std::ptr::null(),
         ) as usize;
+
 
         PostMessageW(owner, WM_NULL, 0, 0);
 

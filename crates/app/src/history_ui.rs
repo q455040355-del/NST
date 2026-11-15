@@ -235,6 +235,7 @@ pub fn open(parent: HWND) {
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        SetForegroundWindow(hwnd);
 
         // 后台加载
         start_loading(hwnd);
