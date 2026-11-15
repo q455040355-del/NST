@@ -1429,7 +1429,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: crate::tray::create_icon(),
+            hIcon: crate::tray::shared_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
@@ -1641,6 +1641,11 @@ unsafe extern "system" fn dialog_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 系统切了明暗主题：整套颜色会变，重画一次就够了（内部按 2 秒缓存读注册表）
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_PAINT => {
             paint(hwnd);
             0

@@ -197,7 +197,7 @@ pub fn open(_parent: HWND) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: crate::tray::create_icon(),
+            hIcon: crate::tray::shared_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
@@ -212,7 +212,7 @@ pub fn open(_parent: HWND) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: crate::tray::create_icon(),
+            hIcon: crate::tray::shared_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
@@ -221,7 +221,7 @@ pub fn open(_parent: HWND) {
         RegisterClassW(&canvas_wc);
 
         let width = (900.0 * scale) as i32;
-        let height = (760.0 * scale) as i32;
+        let mut height = (760.0 * scale) as i32;
 
         let mut work = RECT {
             left: 0,
@@ -230,8 +230,14 @@ pub fn open(_parent: HWND) {
             bottom: 0,
         };
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
-        let left = work.left + ((work.right - work.left) - width) / 2;
-        let top = work.top + ((work.bottom - work.top) - height) / 3;
+
+        // 小屏 / 高缩放（1366×768 @125% 之类）下 760px 会顶出去，
+        // 压到工作区里；图表高度会跟着缩（见 layout），表格至少留一行的高度
+        let margin = (48.0 * scale) as i32;
+        let available = (work.bottom - work.top - margin).max((560.0 * scale) as i32);
+        height = height.min(available);
+        let left = work.left + ((work.right - work.left) - width).max(0) / 2;
+        let top = (work.top + ((work.bottom - work.top) - height) / 3).max(work.top);
 
         let state = Box::into_raw(Box::new(State {
             records: Vec::new(),
@@ -434,6 +440,11 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 系统切明暗主题：父窗口也要重画（canvas 那边同样会收到）
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_ACTIVATE => {
             // 窗口失活就收掉高亮，别让提示卡留在别的窗口上
             if (wparam as u32 & 0xFFFF) == 0 {
@@ -681,6 +692,11 @@ unsafe extern "system" fn canvas_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // 系统切明暗主题：整套配色要重画
+        WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_APP_HISTORY_ANIM => {
             let parent = GetParent(hwnd);
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
@@ -1228,6 +1244,10 @@ struct Layout {
     pad: i32,
     row_top: i32,
     chips_h: i32,
+    /// 来源组所在行（窄窗口时换到第二行）
+    source_top: i32,
+    /// 两组胶囊是否分了两行
+    wrap: bool,
     cards_top: i32,
     cards_h: i32,
     chart_top: i32,
@@ -1261,19 +1281,61 @@ fn chart_ready(rect: &RECT) -> bool {
     rect.right > rect.left && rect.bottom > rect.top
 }
 
+/// 两组胶囊各自的宽度（含组内间距和「来源」小标题）：布局和绘制共用
+unsafe fn chip_widths(p: &Painter) -> (i32, i32) {
+    let chip_pad = p.s(14.0);
+    let gap = p.s(4.0);
+
+    let mut range = 0;
+    for label in RANGE_LABELS {
+        range += p.text_width(label, 8.5, 500) + chip_pad * 2;
+    }
+    range += gap * (RANGE_LABELS.len() as i32 - 1);
+
+    let mut source = p.text_width("来源", 8.5, 400) + p.s(14.0) + p.s(16.0);
+    for (index, label) in SOURCE_LABELS.iter().enumerate() {
+        source += p.text_width(label, 8.5, 500) + p.s(26.0);
+        if index > 0 {
+            source += p.s(10.0);
+        }
+    }
+    source += gap * (SOURCE_LABELS.len() as i32 - 1);
+
+    (range, source)
+}
+
 fn layout(p: &Painter) -> Layout {
     let pad = p.s(26.0);
     let row_top = p.s(86.0);
     let chips_h = p.s(30.0);
-    let cards_top = p.s(130.0);
+
+    // 窗口窄（1366×768 @125% 这种）时两组胶囊挤不进一行：来源组挪到第二行，
+    // 以前是右对齐硬摆，两组的字会直接叠在一起
+    let (range_w, source_w) = unsafe { chip_widths(p) };
+    let wrap = range_w + source_w > p.width - pad * 2;
+    let source_top = row_top + if wrap { p.s(32.0) } else { 0 };
+
+    // 换行时卡片要整体下移，给第二行胶囊留出位置
+    let cards_top = if wrap {
+        source_top + chips_h + p.s(10.0)
+    } else {
+        p.s(130.0)
+    };
     let cards_h = p.s(92.0);
-    let chart_top = p.s(238.0);
-    let chart_bottom = chart_top + p.s(250.0);
+    let chart_top = cards_top + p.s(108.0);
+
+    // 窗口矮的时候优先压图表，别把下面的明细表挤没（小屏 / 高缩放）
+    let table_min = p.s(150.0);
+    let chart_h = (p.height - p.s(16.0) - chart_top - p.s(16.0) - table_min)
+        .clamp(p.s(96.0), p.s(250.0));
+    let chart_bottom = chart_top + chart_h;
     let table_top = chart_bottom + p.s(16.0);
     Layout {
         pad,
         row_top,
         chips_h,
+        source_top,
+        wrap,
         cards_top,
         cards_h,
         chart_top,
@@ -1441,7 +1503,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         x += widths[index] + gap;
     }
 
-    // ---- 来源：右侧轻量按钮
+    // ---- 来源：右侧轻量按钮（窄窗口时换到第二行，从左边排）
     state.source_rects.clear();
     let labels = SOURCE_LABELS;
     let mut widths = [0_i32; 5];
@@ -1452,25 +1514,29 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
     }
     total += gap * (labels.len() as i32 - 1);
     let label_width = p.text_width("来源", 8.5, 400) + p.s(14.0);
-    let mut sx = p.width - l.pad - total - label_width - p.s(16.0);
+    let mut sx = if l.wrap {
+        l.pad + label_width
+    } else {
+        p.width - l.pad - total - label_width - p.s(16.0)
+    };
     p.text(
         "来源",
         8.5,
         400,
         p.ui.text3,
-        sx - label_width,
-        l.row_top,
-        sx - p.s(12.0),
-        l.row_top + l.chips_h,
+        if l.wrap { l.pad } else { sx - label_width },
+        l.source_top,
+        if l.wrap { sx - p.s(8.0) } else { sx - p.s(12.0) },
+        l.source_top + l.chips_h,
         DT_RIGHT,
     );
 
     for (index, label) in labels.iter().enumerate() {
         let rect = RECT {
             left: sx,
-            top: l.row_top,
+            top: l.source_top,
             right: sx + widths[index],
-            bottom: l.row_top + l.chips_h,
+            bottom: l.source_top + l.chips_h,
         };
         let accent = if index == 0 {
             None
@@ -1702,12 +1768,14 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
         }
     }
 
-    // 轴上限取「好看的」整数刻度（1/2/2.5/5 × 10ⁿ），柱子按它缩放
-    let (axis_max, tick_step) = nice_axis(state.max_now.max(1.0), 3);
+    // 轴上限取「好看的」整数刻度（1/2/2.5/5 × 10ⁿ），柱子按它缩放。
+    // 图表被压矮时少画两条刻度线，不然 Y 轴数字自己先叠在一起
+    let ticks = ((plot_height / p.s(46.0)).clamp(1, 3)) as i32;
+    let (axis_max, tick_step) = nice_axis(state.max_now.max(1.0), ticks);
 
     // 网格 + 刻度
-    for step in 0..=3 {
-        let y = plot_bottom - plot_height * step / 3;
+    for step in 0..=ticks {
+        let y = plot_bottom - plot_height * step / ticks;
         p.dashed(plot_left, y, plot_right, y, p.ui.border);
         let value = (tick_step * step as f64) as i64;
         let label = if value == 0 {

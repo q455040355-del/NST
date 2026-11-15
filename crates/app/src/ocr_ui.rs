@@ -282,7 +282,7 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: crate::tray::create_icon(),
+            hIcon: crate::tray::shared_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),

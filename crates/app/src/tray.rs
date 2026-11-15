@@ -157,6 +157,24 @@ pub fn create_icon() -> HICON {
     create_at(DEFAULT_SIZE)
 }
 
+/// 进程内共用的窗口图标。
+///
+/// 每个窗口类注册时都会拿一张图标；以前是每次打开窗口都新画一张，
+/// 而 `RegisterClassW` 第二次必然失败——那张新图标就没人释放了（HICON 泄漏）。
+pub fn shared_icon() -> HICON {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static ICON: AtomicIsize = AtomicIsize::new(0);
+    let cached = ICON.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached as HICON;
+    }
+
+    let icon = create_icon();
+    ICON.store(icon as isize, Ordering::Relaxed);
+    icon
+}
+
 /// 托盘图标：按 `SM_CXSMICON` 出图。
 ///
 /// 以前只有 32×32 一张，150% 缩放时托盘要 24×24，靠系统缩放会糊；
