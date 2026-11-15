@@ -360,9 +360,10 @@ impl Panel {
     pub fn render(&mut self, hdc: HDC) {
         unsafe {
             self.ensure_buffer();
-            // 直接按主题取标准任务栏底色：采样相邻像素很容易采到图标，反而更花
+            // 采样任务栏底色（取面板左右两侧的空隙，避开图标）
             let light = taskbar_is_light();
-            let background = if light { 0x00F3F3F3 } else { 0x001F1F1F };
+            let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
+            let background = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
             if self.colors.background != background {
                 self.colors = Colors::for_theme(light, background);
             }
@@ -510,6 +511,48 @@ fn fill(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
         };
         FillRect(dc, &rect, brush);
         DeleteObject(brush as *mut _);
+    }
+}
+
+/// 从面板两侧的空隙取样任务栏底色：取多个点的中位数，避免采到图标/文字。
+fn sample_taskbar_color(hwnd: HWND) -> Option<u32> {
+    unsafe {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(hwnd, &mut rect);
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return None;
+        }
+
+        let y = (rect.top + rect.bottom) / 2;
+        let mut samples: Vec<u32> = Vec::new();
+        for dx in [4, 7, 10, 14] {
+            for x in [rect.right + dx, rect.left - dx] {
+                let pixel = GetPixel(screen, x, y);
+                if pixel != u32::MAX && pixel != 0x00FF_FFFF {
+                    samples.push(pixel);
+                }
+            }
+        }
+
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if samples.is_empty() {
+            return None;
+        }
+
+        samples.sort_by_key(|color| {
+            let r = (color & 0xFF) as u32;
+            let g = ((color >> 8) & 0xFF) as u32;
+            let b = ((color >> 16) & 0xFF) as u32;
+            r * 299 + g * 587 + b * 114
+        });
+
+        samples.get(samples.len() / 2).copied()
     }
 }
 

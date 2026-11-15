@@ -21,6 +21,7 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use theme::wide;
@@ -37,6 +38,10 @@ thread_local! {
 
 /// 任务栏句柄：用来发现 Explorer 重启（我们的子窗口会被连带销毁）
 static mut TASKBAR: HWND = std::ptr::null_mut();
+
+/// 隐藏的顶层窗口：TrackPopupMenu 要求调用线程在前台，
+/// 子窗口没法变前台，只能借一个自己的顶层窗口来"占前台"
+static mut MENU_HOST: HWND = std::ptr::null_mut();
 
 /// 托盘图标句柄（进程内唯一）
 static mut TRAY_ICON: windows_sys::Win32::UI::WindowsAndMessaging::HICON = std::ptr::null_mut();
@@ -120,7 +125,40 @@ fn main() {
             return;
         }
 
+        // 菜单宿主：隐藏的顶层窗口
+        let host_class = wide("NetSpeedTaskbarRs.MenuHost");
+        let host_wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(DefWindowProcW),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: host_class.as_ptr(),
+        };
+        RegisterClassW(&host_wc);
+        // 必须是个“可见”的顶层窗口才能拿到前台（隐藏窗口不行），放到屏幕外 1x1
+        MENU_HOST = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            host_class.as_ptr(),
+            wide("NetSpeedTaskbarRs.MenuHost").as_ptr(),
+            WS_POPUP,
+            -200,
+            -200,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        ShowWindow(MENU_HOST, SW_SHOWNOACTIVATE);
+
         position_panel(hwnd, taskbar, width, height);
+        keep_on_top(hwnd);
         add_tray(hwnd);
         SetTimer(hwnd, TIMER_ID, 500, None);
 
@@ -159,6 +197,21 @@ fn scale_for_dpi(value: i32) -> i32 {
     panel::scale(dpi, value)
 }
 
+
+/// 任务栏里的 MSTaskListWClass 会压在我们上面（点击都给它），必须周期性置顶。
+fn keep_on_top(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0 as HWND, // HWND_TOP
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
 
 fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
     unsafe {
@@ -224,6 +277,7 @@ unsafe extern "system" fn wnd_proc(
                 std::process::exit(0);
             }
 
+            keep_on_top(hwnd);
             if let Some(panel) = panel_mut(hwnd) {
                 panel.tick();
                 let tip = panel.tip_text();
@@ -275,7 +329,13 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_RBUTTONDOWN => {
+            // 任务栏会抢走右键的抬起消息：按下时就抓鼠标，抬起必然回到我们这里
+            SetCapture(hwnd);
+            0
+        }
         WM_RBUTTONUP => {
+            ReleaseCapture();
             show_menu(hwnd);
             0
         }
@@ -344,15 +404,23 @@ fn show_menu(hwnd: HWND) {
 
         let mut point: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
         GetCursorPos(&mut point);
+
+        // 关键：先把自己（隐藏顶层窗口）设为前台，否则 TrackPopupMenu 会立刻返回、菜单根本不显示
+        let owner = if MENU_HOST.is_null() { hwnd } else { MENU_HOST };
+        let fg = SetForegroundWindow(owner);
+        debug_log(&format!("menu: owner={} fg={fg}", owner as usize));
+
         let command = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
             point.x,
             point.y,
             0,
-            hwnd,
+            owner,
             std::ptr::null(),
         ) as usize;
+
+        PostMessageW(owner, WM_NULL, 0, 0);
 
         DestroyMenu(menu);
 
