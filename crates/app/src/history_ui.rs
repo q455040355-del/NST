@@ -20,6 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 const DT_NOPREFIX: u32 = 0x0800;
 const DT_CALCRECT: u32 = 0x0400;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
@@ -166,6 +167,10 @@ struct State {
     full_dirty: bool,
     /// 当前是否「按小时」视图（今天 / 昨天）
     hourly: bool,
+    /// 鼠标悬停的柱子下标（高亮带 + 提示卡）
+    hover: Option<usize>,
+    /// 图表绘图区（命中测试用）
+    plot: RECT,
 }
 
 pub fn open(_parent: HWND) {
@@ -262,6 +267,13 @@ pub fn open(_parent: HWND) {
             },
             hourly: false,
             full_dirty: true,
+            hover: None,
+            plot: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
         }));
 
         let hwnd = CreateWindowExW(
@@ -712,6 +724,39 @@ unsafe extern "system" fn canvas_proc(
             }
             0
         }
+        WM_MOUSEMOVE => {
+            let x = (lparam as i32) & 0xFFFF;
+            let y = ((lparam as i32) >> 16) & 0xFFFF;
+            let parent = GetParent(hwnd);
+            let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
+            if !state.is_null() {
+                let state = &mut *state;
+                let plot = state.plot;
+                let count = state.days.len();
+                let hover = if count > 0
+                    && x >= plot.left
+                    && x <= plot.right
+                    && y >= plot.top - (plot.bottom - plot.top) / 3
+                    && y <= plot.bottom + (plot.bottom - plot.top) / 6
+                {
+                    let slot = (plot.right - plot.left) as f32 / count as f32;
+                    let index = (((x - plot.left) as f32) / slot.max(1.0)) as usize;
+                    Some(index.min(count - 1))
+                } else {
+                    None
+                };
+
+                if hover != state.hover {
+                    state.hover = hover;
+                    let chart = state.chart_rect;
+                    if chart_ready(&chart) {
+                        InvalidateRect(hwnd, &chart, 0);
+                        UpdateWindow(hwnd);
+                    }
+                }
+            }
+            0
+        }
         WM_MOUSEWHEEL => {
             let parent = GetParent(hwnd);
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
@@ -836,6 +881,16 @@ fn series_color(source: &str) -> u32 {
     }
 }
 
+/// 把颜色往白色方向混，模拟「同色按不透明度叠在白卡片上」
+fn mix_white(color: u32, amount: f32) -> u32 {
+    let t = amount.clamp(0.0, 1.0);
+    let mix = |shift: u32| {
+        let value = ((color >> shift) & 0xFF) as f32;
+        ((value + (255.0 - value) * t).round() as u32) & 0xFF
+    };
+    mix(0) | (mix(8) << 8) | (mix(16) << 16)
+}
+
 fn thousands(value: i64) -> String {
     let text = value.to_string();
     let mut out = String::new();
@@ -918,6 +973,24 @@ impl Painter {
         LineTo(self.dc, x2, y2);
         SelectObject(self.dc, old);
         DeleteObject(pen as *mut _);
+    }
+
+    /// 竖向渐变：自上而下逐渐变淡（模拟同色 62% 不透明度叠在白卡片上）
+    unsafe fn vertical_fade(&self, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
+        let height = bottom - top;
+        if height <= 0 || right <= left {
+            return;
+        }
+        const STEPS: i32 = 10;
+        for step in 0..STEPS {
+            let y0 = top + height * step / STEPS;
+            let y1 = top + height * (step + 1) / STEPS;
+            if y1 <= y0 {
+                continue;
+            }
+            let t = (step + 1) as f32 / STEPS as f32;
+            self.fill(left, y0, right, y1, mix_white(color, 0.38 * t));
+        }
     }
 
     unsafe fn dot(&self, cx: i32, cy: i32, radius: i32, color: u32) {
@@ -1435,6 +1508,32 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     let plot_height = (plot_bottom - plot_top).max(10);
     let plot_width = (plot_right - plot_left).max(10);
 
+    state.plot = RECT {
+        left: plot_left,
+        top: plot_top,
+        right: plot_right,
+        bottom: plot_bottom,
+    };
+
+    // 悬停：整列浅色高亮带（画在柱子下层）
+    let bar_count = state.days.len();
+    let bar_slot = plot_width as f32 / bar_count.max(1) as f32;
+    if let Some(index) = state.hover {
+        if index < bar_count {
+            let width = (bar_slot * 0.9).max(8.0);
+            let cx = plot_left as f32 + bar_slot * (index as f32 + 0.5);
+            p.round(
+                (cx - width / 2.0) as i32,
+                plot_top - p.s(4.0),
+                (cx + width / 2.0) as i32,
+                plot_bottom + p.s(4.0),
+                p.s(6.0),
+                0x00F5_F6F9,
+                0x00F5_F6F9,
+            );
+        }
+    }
+
     // 轴上限取「好看的」整数刻度（1/2/2.5/5 × 10ⁿ），柱子按它缩放
     let (axis_max, tick_step) = nice_axis(state.max_now.max(1.0), 3);
 
@@ -1480,6 +1579,8 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             continue;
         }
 
+
+        let single = row.iter().filter(|value| **value > 0.0).count() == 1;
         // 像素对齐，1px 的边不会糊
         let slot_left = plot_left as f32 + slot * index as f32;
         let left = (slot_left + (slot - bar_width) / 2.0).round() as i32;
@@ -1509,9 +1610,85 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 if bottom_px - radius > top {
                     p.fill(left, bottom_px - radius, right, bottom_px, color);
                 }
+                // 单一来源的柱子再叠一层竖向渐变（上满色 → 下 62% 不透明度）
+                if single {
+                    p.vertical_fade(left, top + radius, right, bottom_px, color);
+                }
             } else {
                 p.fill(left, top, right, bottom_px, color);
             }
+        }
+    }
+
+    // 悬停提示卡：日期/小时 + 输出与请求
+    if let Some(index) = state.hover {
+        if let Some(day) = state.days.get(index) {
+            let title = if state.hourly {
+                format!("{:02}:00", day.day)
+            } else {
+                day_full_label(day.day)
+            };
+            let line = format!(
+                "输出 {} · 请求 {}",
+                history::format_tokens(day.output),
+                thousands(day.requests)
+            );
+            let padding = p.s(12.0);
+            let width = (p
+                .text_width(&title, 8.5, 600)
+                .max(p.text_width(&line, 8.0, 400))
+                + padding * 2)
+                .max(p.s(150.0));
+            let height = p.s(52.0);
+
+            let total = *state.now_heights.get(index).unwrap_or(&0.0);
+            let bar_top = if total > 0.0 {
+                plot_bottom - (plot_height as f32 * total / max_output).max(1.0) as i32
+            } else {
+                plot_bottom
+            };
+
+            let cx = plot_left as f32 + slot * (index as f32 + 0.5);
+            let min_left = l.pad + p.s(10.0);
+            let max_left = p.width - l.pad - width - p.s(10.0);
+            let left = ((cx - width as f32 / 2.0) as i32).clamp(min_left, max_left.max(min_left));
+
+            let mut top = bar_top - height - p.s(10.0);
+            if top < l.chart_top + p.s(36.0) {
+                top = (bar_top + p.s(10.0)).min(plot_bottom - height - p.s(6.0));
+            }
+
+            p.round(
+                left,
+                top,
+                left + width,
+                top + height,
+                p.s(10.0),
+                0x00FF_FFFF,
+                BORDER,
+            );
+            p.text(
+                &title,
+                8.5,
+                600,
+                TEXT,
+                left + padding,
+                top + p.s(4.0),
+                left + width - padding,
+                top + p.s(26.0),
+                DT_LEFT,
+            );
+            p.text(
+                &line,
+                8.0,
+                400,
+                TEXT2,
+                left + padding,
+                top + p.s(24.0),
+                left + width - padding,
+                top + p.s(46.0),
+                DT_LEFT,
+            );
         }
     }
 
