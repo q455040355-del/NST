@@ -48,6 +48,14 @@ const ACCENT_ORANGE: u32 = 0x0032_8AE0;
 /// 0.30s 的周期够快、0.86 的阻尼几乎不过冲，收得干净。
 const SPRING_RESPONSE: f64 = 0.30;
 const SPRING_DAMPING: f64 = 0.86;
+/// AgentSpeed 的 HistoryChart 里有个硬上限：0.45s 到点就收，不等速度衰减完，
+/// 免得尾巴上还有肉眼几乎看不见的微动，看起来发飘。
+const SPRING_MAX_DURATION: f64 = 0.45;
+/// 判定「已经到位」的阈值（值 / 速度），和 AgentSpeed 的 IsSettled(1, 0.002) 一致
+const SPRING_EPSILON: f64 = 0.002;
+
+/// 每帧最多推进多少秒（掉帧时别让弹簧一步跳太远）
+const MAX_STEP: f64 = 1.0 / 20.0;
 
 /// 动画投递线程的代（每次重启动画就 +1，旧线程看到代变了就退出）
 static ANIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -121,7 +129,7 @@ impl Spring {
     }
 
     fn settled(&self, target: f64) -> bool {
-        (self.value - target).abs() < 0.002 && self.velocity.abs() < 0.02
+        (self.value - target).abs() < SPRING_EPSILON && self.velocity.abs() < SPRING_EPSILON * 10.0
     }
 }
 
@@ -142,6 +150,7 @@ struct State {
     max_to: f32,
     max_now: f32,
     animating: bool,
+    animation_elapsed: f64,
     last_tick: std::time::Instant,
     loader: Option<Receiver<Vec<UsageRecord>>>,
     canvas: HWND,
@@ -152,7 +161,7 @@ struct State {
     scroll: usize,
 }
 
-pub fn open(parent: HWND) {
+pub fn open(_parent: HWND) {
     unsafe {
         if let Some(existing) = find_existing() {
             ShowWindow(existing, SW_RESTORE);
@@ -226,6 +235,7 @@ pub fn open(parent: HWND) {
             max_to: 1.0,
             max_now: 1.0,
             animating: false,
+            animation_elapsed: 0.0,
             last_tick: std::time::Instant::now(),
             loader: None,
             canvas: std::ptr::null_mut(),
@@ -244,7 +254,8 @@ pub fn open(parent: HWND) {
             top,
             width,
             height,
-            parent,
+            // 不要挂到任务栏面板（TOPMOST 的拥有者会把拥有窗口一起变成置顶，挡住别的软件）
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
             state as *const _,
@@ -415,6 +426,7 @@ unsafe extern "system" fn window_proc(
             let canvas = canvas_of(hwnd);
             if !canvas.is_null() {
                 InvalidateRect(canvas, std::ptr::null(), 0);
+                UpdateWindow(canvas);
             }
             0
         }
@@ -518,7 +530,7 @@ fn recalc(state: &mut State) {
 
     state.spring = Spring::new(SPRING_RESPONSE, SPRING_DAMPING);
     state.animating = true;
-
+    state.animation_elapsed = 0.0;
     state.last_tick = std::time::Instant::now();
 }
 
@@ -535,28 +547,39 @@ unsafe extern "system" fn canvas_proc(
             if !state.is_null() {
                 let state = &mut *state;
                 let now = std::time::Instant::now();
-                let dt = now.duration_since(state.last_tick).as_secs_f64().clamp(0.0, 0.05);
+                let dt = now
+                    .duration_since(state.last_tick)
+                    .as_secs_f64()
+                    .clamp(0.0, MAX_STEP);
                 state.last_tick = now;
+                state.animation_elapsed += dt;
 
                 state.spring.step(1.0, dt);
+
+                // 和 AgentSpeed 的 HistoryChart 一样：0.45s 到点、或者判定已到位，就收尾吸附
+                if state.animation_elapsed >= SPRING_MAX_DURATION || state.spring.settled(1.0) {
+                    state.now_heights = state.to_heights.clone();
+                    state.max_now = state.max_to;
+                    state.animating = false;
+                    // 让投递线程自然退出
+                    ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    UpdateWindow(hwnd);
+                    return 0;
+                }
+
+                // 柱子用原始 t（允许回弹），坐标轴最大值把 t 夹在 [0, 1.1]，别让刻度跟着过冲
                 let t = state.spring.value as f32;
-                state.max_now = state.max_from + (state.max_to - state.max_from) * t;
+                let axis_t = t.clamp(0.0, 1.1);
+                state.max_now = state.max_from + (state.max_to - state.max_from) * axis_t;
                 for index in 0..state.now_heights.len() {
                     let from = *state.from_heights.get(index).unwrap_or(&0.0);
                     let to = *state.to_heights.get(index).unwrap_or(&0.0);
                     state.now_heights[index] = from + (to - from) * t;
                 }
 
-                if state.spring.settled(1.0) {
-                    state.now_heights = state.to_heights.clone();
-                    state.max_now = state.max_to;
-
-                    state.animating = false;
-                    // 让投递线程自然退出
-                    ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-
                 InvalidateRect(hwnd, std::ptr::null(), 0);
+                UpdateWindow(hwnd);
             }
             0
         }

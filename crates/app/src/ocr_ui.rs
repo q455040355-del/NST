@@ -18,7 +18,7 @@ const ID_COPY: usize = 2002;
 const ID_CLOSE: usize = 2003;
 const ID_STATUS: usize = 2004;
 
-pub fn open(parent: HWND, text: &str, error: Option<&str>) {
+pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class = wide(CLASS_NAME);
@@ -68,7 +68,8 @@ pub fn open(parent: HWND, text: &str, error: Option<&str>) {
             y,
             window_w,
             window_h,
-            parent,
+            // 不挂任务栏面板当 owner（否则会变成置顶窗口，挡住别的软件）
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
             std::ptr::null(),

@@ -108,7 +108,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
         }));
 
         let hwnd = CreateWindowExW(
-            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            WS_EX_DLGMODALFRAME,
             class_name.as_ptr(),
             wide("网速显示设置").as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
@@ -116,7 +116,8 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
             top,
             width_px,
             height_px,
-            parent,
+            // 不挂任务栏面板当 owner：否则会跟着变成 TOPMOST，压住别的软件
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
             state as *const _,
