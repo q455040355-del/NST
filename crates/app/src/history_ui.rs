@@ -10,11 +10,11 @@ use std::sync::mpsc::{channel, Receiver};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePatternBrush, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, LineTo, MoveToEx, InvalidateRect, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER,
     CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-    HBITMAP, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
+    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 
 const DT_NOPREFIX: u32 = 0x0800;
@@ -233,7 +233,8 @@ pub fn open(_parent: HWND) {
 
         let state = Box::into_raw(Box::new(State {
             records: Vec::new(),
-            range: 3,
+            // 默认「今天」：打开就是按小时的当日视图
+            range: 0,
             loading: true,
             days: Vec::new(),
             stack: Vec::new(),
@@ -398,6 +399,25 @@ unsafe extern "system" fn enum_history(hwnd: HWND, lparam: LPARAM) -> i32 {
     1
 }
 
+/// 清掉悬停高亮（移到标题栏、窗口失活、切区间时调用）
+unsafe fn clear_hover(hwnd: HWND) {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+    if state.hover.take().is_some() {
+        let canvas = state.canvas;
+        if !canvas.is_null() {
+            let chart = state.chart_rect;
+            if chart_ready(&chart) {
+                InvalidateRect(canvas, &chart, 0);
+                UpdateWindow(canvas);
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: u32,
@@ -405,6 +425,18 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ACTIVATE => {
+            // 窗口失活就收掉高亮，别让提示卡留在别的窗口上
+            if (wparam as u32 & 0xFFFF) == 0 {
+                clear_hover(hwnd);
+            }
+            0
+        }
+        WM_NCMOUSEMOVE => {
+            // 光标移到标题栏/边框，说明已经离开图表
+            clear_hover(hwnd);
+            0
+        }
         WM_SIZE => {
             let canvas = canvas_of(hwnd);
             if !canvas.is_null() {
@@ -816,6 +848,65 @@ fn font(points: f32, weight: i32) -> HFONT {
     })
 }
 
+thread_local! {
+    /// 「今天」柱子的斜纹画刷（按颜色缓存）
+    static HATCH: RefCell<std::collections::HashMap<u32, HBRUSH>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// 6×6 的斜纹图案：淡色底 + 一道斜线，表示当天数据还在涨
+unsafe fn hatch_brush(color: u32) -> HBRUSH {
+    HATCH.with(|cell| {
+        if let Some(handle) = cell.borrow().get(&color) {
+            return *handle;
+        }
+
+        let scale = crate::screen_scale();
+        let size = (6.0 * scale).round().max(6.0) as i32;
+
+        let screen = GetDC(std::ptr::null_mut());
+        let dc = CreateCompatibleDC(screen);
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = size;
+        info.bmiHeader.biHeight = -size;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = 0;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(screen, &info, 0, &mut bits, std::ptr::null_mut(), 0);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if dib.is_null() || dc.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        let old = SelectObject(dc, dib as HGDIOBJ);
+        let tint = CreateSolidBrush(mix_white(color, 0.62));
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: size,
+            bottom: size,
+        };
+        FillRect(dc, &rect, tint);
+        DeleteObject(tint as *mut _);
+
+        let pen = CreatePen(0, (1.4 * scale).round().max(1.0) as i32, mix_white(color, 0.05));
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        MoveToEx(dc, -size / 6, size + size / 6, std::ptr::null_mut());
+        LineTo(dc, size + size / 6, -size / 6);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen as *mut _);
+        SelectObject(dc, old);
+        DeleteDC(dc);
+
+        let brush = CreatePatternBrush(dib);
+        DeleteObject(dib as *mut _);
+        cell.borrow_mut().insert(color, brush);
+        brush
+    })
+}
+
 fn back_buffer(width: i32, height: i32) -> Option<HDC> {
     BACK.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -991,6 +1082,16 @@ impl Painter {
             let t = (step + 1) as f32 / STEPS as f32;
             self.fill(left, y0, right, y1, mix_white(color, 0.38 * t));
         }
+    }
+
+    unsafe fn fill_brush(&self, left: i32, top: i32, right: i32, bottom: i32, brush: HBRUSH) {
+        let rect = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        FillRect(self.dc, &rect, brush);
     }
 
     unsafe fn dot(&self, cx: i32, cy: i32, radius: i32, color: u32) {
@@ -1605,7 +1706,18 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             let bottom_px = (bottom + segment).round() as i32;
             // 只有整根柱子最上面一段带圆角，堆叠处保持平直
             let is_top = bottom_px >= plot_bottom - 1;
-            if is_top {
+            let is_today = !state.hourly
+                && state.days.get(index).map(|day| day.day).unwrap_or(-1)
+                    == history::today(now_ms());
+            if is_top && is_today {
+                // 今天那根：淡色圆角顶 + 斜纹主体（数据还在增长）
+                let tint = mix_white(color, 0.62);
+                p.round(left, top, right, bottom_px, radius, tint, tint);
+                let brush = hatch_brush(color);
+                if !brush.is_null() {
+                    p.fill_brush(left, top + radius, right, bottom_px, brush);
+                }
+            } else if is_top {
                 p.round(left, top, right, bottom_px, radius, color, color);
                 if bottom_px - radius > top {
                     p.fill(left, bottom_px - radius, right, bottom_px, color);
