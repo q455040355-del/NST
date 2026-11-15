@@ -79,8 +79,8 @@ impl Panel {
 
         let mut panel = Self {
             hwnd,
+            sampler: NetSampler::new(&settings.network_interface),
             settings,
-            sampler: NetSampler::new(),
             sample: NetSample::default(),
             memory: MemorySnapshot::default(),
             up_text: format_speed(0.0),
@@ -145,6 +145,17 @@ impl Panel {
     pub fn set_view(&mut self, view: &str) {
         self.settings.view = view.to_string();
         self.settings.save();
+        self.refresh();
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    /// 切换要统计的网卡（"auto" = 全部合计）
+    pub fn set_network_interface(&mut self, interface: &str) {
+        self.settings.network_interface = interface.to_string();
+        self.settings.save();
+        self.sampler.set_interface(interface);
         self.refresh();
         unsafe {
             InvalidateRect(self.hwnd, std::ptr::null(), 0);

@@ -196,7 +196,7 @@ fn main() {
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
-            settings_ui::open(hwnd, settings.panel_width, &settings.gauge_source);
+            settings_ui::open(hwnd, settings.panel_width, &settings.gauge_source, &settings.network_interface);
         }
         if std::env::args().any(|arg| arg == "--history") {
             history_ui::open(hwnd);
@@ -625,7 +625,8 @@ fn show_menu(hwnd: HWND) {
             ID_SETTINGS => {
                 let width = panel.settings.panel_width;
                 let gauge = panel.settings.gauge_source.clone();
-                settings_ui::open(hwnd, width, &gauge);
+                let interface = panel.settings.network_interface.clone();
+                settings_ui::open(hwnd, width, &gauge, &interface);
             }
             ID_SHOT => {
                 shot::request(hwnd);
@@ -713,6 +714,12 @@ pub(crate) fn apply_panel_width(parent: HWND, width: i32) {
         panel.set_panel_width(width);
         let taskbar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
         position_panel(parent, taskbar, panel.desired_width(), panel.height());
+    }
+}
+
+pub(crate) fn apply_network_interface(parent: HWND, interface: &str) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.set_network_interface(interface);
     }
 }
 

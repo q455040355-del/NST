@@ -35,6 +35,8 @@ const ID_WIDTH_TRACK: usize = 2003;
 const ID_GAUGE_LABEL: usize = 2004;
 const ID_GAUGE_COMBO: usize = 2005;
 const ID_CLOSE: usize = 2006;
+const ID_INTERFACE_LABEL: usize = 2007;
+const ID_INTERFACE_COMBO: usize = 2008;
 
 const GAUGE_OPTIONS: [(&str, &str); 6] = [
     ("跟随当前视图", "view"),
@@ -50,9 +52,11 @@ struct DialogState {
     track: HWND,
     combo: HWND,
     value_label: HWND,
+    /// 网卡下拉的顺序（第 0 项是「自动」，从第 1 项起对应这里的连接名）
+    interfaces: Vec<String>,
 }
 
-pub fn open(parent: HWND, width: i32, gauge: &str) {
+pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str) {
     unsafe {
         // 已经开着就提到前面（同一时间只允许一个）
         let class = wide(CLASS_NAME);
@@ -88,7 +92,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
         // （GetDpiForWindow 对挂在任务栏下的子窗口会返回 96，偏小）
         let dpi = crate::screen_scale();
         let width_px = (460.0 * dpi) as i32;
-        let height_px = (300.0 * dpi) as i32;
+        let height_px = (310.0 * dpi) as i32;
 
         let mut screen = windows_sys::Win32::Foundation::RECT {
             left: 0,
@@ -105,6 +109,10 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
             track: std::ptr::null_mut(),
             combo: std::ptr::null_mut(),
             value_label: std::ptr::null_mut(),
+            interfaces: netspeed_core::net::adapters()
+                .into_iter()
+                .map(|adapter| adapter.alias)
+                .collect(),
         }));
 
         let hwnd = CreateWindowExW(
@@ -129,7 +137,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
         }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-        create_children(hwnd, width, gauge, dpi);
+        create_children(hwnd, width, gauge, interface, dpi);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
@@ -149,7 +157,7 @@ unsafe extern "system" fn enum_settings(hwnd: HWND, lparam: LPARAM) -> i32 {
     1
 }
 
-fn create_children(hwnd: HWND, width: i32, gauge: &str, dpi: f32) {
+fn create_children(hwnd: HWND, width: i32, gauge: &str, interface: &str, dpi: f32) {
     unsafe {
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let pad = (18.0 * dpi) as i32;
@@ -236,13 +244,53 @@ fn create_children(hwnd: HWND, width: i32, gauge: &str, dpi: f32) {
             }
         }
 
+        label("网卡", (130.0 * dpi) as i32, (110.0 * dpi) as i32);
+
+        let interface_combo = CreateWindowExW(
+            0,
+            wide("ComboBox").as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            (110.0 * dpi) as i32,
+            (126.0 * dpi) as i32,
+            (320.0 * dpi) as i32,
+            (240.0 * dpi) as i32,
+            hwnd,
+            ID_INTERFACE_COMBO as *mut _,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        SendMessageW(interface_combo, WM_SETFONT, font as usize, 1);
+
+        {
+            let auto = wide("自动（全部合计）");
+            SendMessageW(interface_combo, CB_ADDSTRING, 0, auto.as_ptr() as isize);
+
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DialogState;
+            let aliases: &[String] = if state.is_null() {
+                &[]
+            } else {
+                &(*state).interfaces
+            };
+
+            let mut selected = 0;
+            for (index, alias) in aliases.iter().enumerate() {
+                let item = wide(alias);
+                SendMessageW(interface_combo, CB_ADDSTRING, 0, item.as_ptr() as isize);
+                if alias.eq_ignore_ascii_case(interface) {
+                    selected = index + 1;
+                }
+            }
+            SendMessageW(interface_combo, CB_SETCURSEL, selected, 0);
+        }
+
         let close = CreateWindowExW(
             0,
             wide("Button").as_ptr(),
             wide("关闭").as_ptr(),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             (338.0 * dpi) as i32,
-            (220.0 * dpi) as i32,
+            (200.0 * dpi) as i32,
             (90.0 * dpi) as i32,
             (30.0 * dpi) as i32,
             hwnd,
@@ -262,6 +310,7 @@ fn create_children(hwnd: HWND, width: i32, gauge: &str, dpi: f32) {
 
         let _ = ID_WIDTH_LABEL;
         let _ = ID_GAUGE_LABEL;
+        let _ = ID_INTERFACE_LABEL;
     }
 }
 
@@ -301,6 +350,20 @@ unsafe extern "system" fn dialog_proc(
                 if let Some((_, value)) = GAUGE_OPTIONS.get(index) {
                     crate::apply_gauge(state.parent, value);
                 }
+            } else if id == ID_INTERFACE_COMBO && code == CBN_SELCHANGE {
+                let combo = lparam as HWND;
+                let index = SendMessageW(combo, CB_GETCURSEL, 0, 0) as usize;
+                // 0 = 自动，其余对应 interfaces[index - 1]
+                let interface = if index == 0 {
+                    "auto".to_string()
+                } else {
+                    state
+                        .interfaces
+                        .get(index - 1)
+                        .cloned()
+                        .unwrap_or_else(|| "auto".to_string())
+                };
+                crate::apply_network_interface(state.parent, &interface);
             } else if id == ID_CLOSE {
                 DestroyWindow(hwnd);
             }

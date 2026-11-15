@@ -3,7 +3,7 @@
 //! 只统计“已连接”的物理接口（跳过回环/隧道/断开），和任务管理器口径接近。
 
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
+    FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 // MIB_IF_ROW2.OperStatus == IfOperStatusUp
 const IF_OPER_STATUS_UP: i32 = 1;
@@ -18,7 +18,81 @@ pub struct Counters {
 }
 
 /// 累计计数器快照。
-pub fn read_counters() -> Counters {
+/// 一张网卡（用于设置里选择）。
+#[derive(Debug, Clone)]
+pub struct Adapter {
+    /// 系统里的连接名，例如 "WLAN" / "以太网"
+    pub alias: String,
+    /// 驱动描述，作为提示用
+    pub description: String,
+}
+
+fn utf16_field(raw: &[u16]) -> String {
+    let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end]).trim().to_string()
+}
+
+/// NDIS 过滤层/虚拟交换机的端口（名字多以 `-0000` 结尾）。
+///
+/// 它们和底层网卡上报同一份计数，参与求和会把网速放大好几倍，
+/// 在设置里列出来也全是噪音，所以统一排除。
+fn is_filter_port(row: &MIB_IF_ROW2) -> bool {
+    row.InterfaceAndOperStatusFlags._bitfield & 0b10 != 0
+}
+
+/// 真正有数据要走的网卡：物理网卡，或者已经在跑流量的虚拟网卡
+/// （Tailscale、vEthernet 之类）。纯虚拟的口子（vSwitch、Wi-Fi Direct）不列。
+fn is_usable(row: &MIB_IF_ROW2) -> bool {
+    if is_filter_port(row) {
+        return false;
+    }
+
+    let hardware = row.InterfaceAndOperStatusFlags._bitfield & 0b1 != 0;
+    hardware || row.InOctets + row.OutOctets > 0
+}
+
+/// 列出所有「已连接」的网卡（排除回环、隧道、过滤层）。
+pub fn adapters() -> Vec<Adapter> {
+    let mut list = Vec::new();
+    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+
+    if unsafe { GetIfTable2(&mut table) } != 0 || table.is_null() {
+        return list;
+    }
+
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
+        for row in rows {
+            if row.Type == IF_TYPE_SOFTWARE_LOOPBACK || row.Type == IF_TYPE_TUNNEL {
+                continue;
+            }
+            if row.OperStatus != IF_OPER_STATUS_UP {
+                continue;
+            }
+            if !is_usable(row) {
+                continue;
+            }
+
+            let alias = utf16_field(&row.Alias);
+            if alias.is_empty() {
+                continue;
+            }
+            list.push(Adapter {
+                alias,
+                description: utf16_field(&row.Description),
+            });
+        }
+
+        FreeMibTable(table as *const _);
+    }
+
+    list.sort_by(|a, b| a.alias.cmp(&b.alias));
+    list.dedup_by(|a, b| a.alias == b.alias);
+    list
+}
+
+pub fn read_counters(interface: Option<&str>) -> Counters {
     let mut counters = Counters::default();
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
 
@@ -36,6 +110,15 @@ pub fn read_counters() -> Counters {
             }
 
             if row.OperStatus != IF_OPER_STATUS_UP {
+                continue;
+            }
+
+            if let Some(wanted) = interface {
+                if utf16_field(&row.Alias) != wanted {
+                    continue;
+                }
+            } else if is_filter_port(row) {
+                // 合计模式下必须跳过过滤层端口，否则同一份流量会被算 5~6 次
                 continue;
             }
 
@@ -60,20 +143,48 @@ pub struct NetSampler {
     last: Option<(Counters, std::time::Instant)>,
     smoothed_up: f64,
     smoothed_down: f64,
+    /// None = 所有网卡合计；Some(连接名) = 只看这一块
+    interface: Option<String>,
+}
+
+fn normalize_interface(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 impl NetSampler {
-    pub fn new() -> Self {
+    pub fn new(interface: &str) -> Self {
         Self {
             last: None,
             smoothed_up: 0.0,
             smoothed_down: 0.0,
+            interface: normalize_interface(interface),
         }
+    }
+
+    /// 切换网卡：清掉基线，避免换卡瞬间算出一个巨大的速率
+    pub fn set_interface(&mut self, interface: &str) {
+        let next = normalize_interface(interface);
+        if next == self.interface {
+            return;
+        }
+        self.interface = next;
+        self.last = None;
+        self.smoothed_up = 0.0;
+        self.smoothed_down = 0.0;
+    }
+
+    pub fn interface(&self) -> Option<&str> {
+        self.interface.as_deref()
     }
 
     pub fn sample(&mut self) -> NetSample {
         let now = std::time::Instant::now();
-        let counters = read_counters();
+        let counters = read_counters(self.interface.as_deref());
 
         let Some((previous, previous_at)) = self.last else {
             self.last = Some((counters, now));
@@ -110,6 +221,6 @@ impl NetSampler {
 
 impl Default for NetSampler {
     fn default() -> Self {
-        Self::new()
+        Self::new("auto")
     }
 }
