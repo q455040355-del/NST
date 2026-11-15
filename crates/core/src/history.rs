@@ -227,7 +227,7 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
 
     // 3) 先把索引写回去（下次打开就只剩目录扫描），再按天数过滤出结果
     if dirty {
-        Index::save(&entries);
+        index.save(&entries);
     }
 
     let mut out = Vec::new();
@@ -243,7 +243,7 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
 
 // ------------------------------------------------------------ 磁盘索引
 
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const INDEX_MAGIC: &[u8; 4] = b"NSUI";
 
 struct IndexEntry {
@@ -252,25 +252,70 @@ struct IndexEntry {
     records: Vec<UsageRecord>,
 }
 
-/// 假设索引文件没坏时的样子；读失败就当空的（退化成全量解析）
+/// 索引按「文件 mtime 的那一天」分片存。
+///
+/// 以前是一个 12 MB 的大文件，只要有一个会话文件变了就得整份重写（AI 一聊天就变）。
+/// 现在只有今天这一片会被重写（几百 KB），历史那些天的字节原封不动。
+/// 每片的头部存一个内容指纹，指纹没变就直接跳过——不用重算要不要写。
 struct Index {
     entries: HashMap<PathBuf, IndexEntry>,
+    /// 每片读进来时的内容指纹（day → hash）
+    shards: HashMap<i64, u64>,
+    /// 数据是从老的单文件索引读出来的：下次保存时顺手迁移
+    legacy: bool,
 }
 
 impl Index {
-    fn path() -> Option<PathBuf> {
+    fn dir() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|dir| PathBuf::from(dir).join("NetSpeedTaskbar").join("index"))
+    }
+
+    /// v1 的单文件索引（只在迁移时读一次）
+    fn legacy_path() -> Option<PathBuf> {
         std::env::var_os("LOCALAPPDATA")
             .map(|dir| PathBuf::from(dir).join("NetSpeedTaskbar").join("usage-index.bin"))
     }
 
+    fn shard_path(day: i64) -> Option<PathBuf> {
+        Some(Self::dir()?.join(format!("usage-{day}.bin")))
+    }
+
     fn load() -> Self {
         let mut entries = HashMap::new();
-        if let Some(path) = Self::path() {
-            if let Ok(loaded) = read_index(&path) {
-                entries = loaded;
+        let mut shards = HashMap::new();
+
+        if let Some(dir) = Self::dir() {
+            if let Ok(list) = std::fs::read_dir(&dir) {
+                for item in list.flatten() {
+                    let path = item.path();
+                    let Some(day) = shard_day(&path) else {
+                        continue;
+                    };
+                    if let Ok((hash, loaded)) = read_index(&path) {
+                        shards.insert(day, hash);
+                        entries.extend(loaded);
+                    }
+                }
             }
         }
-        Self { entries }
+
+        // 没有分片就找老索引：读完在下次保存时迁到分片目录
+        let mut legacy = false;
+        if entries.is_empty() {
+            if let Some(path) = Self::legacy_path() {
+                if let Ok((_, loaded)) = read_index(&path) {
+                    legacy = !loaded.is_empty();
+                    entries = loaded;
+                }
+            }
+        }
+
+        Self {
+            entries,
+            shards,
+            legacy,
+        }
     }
 
     /// 取出一个文件的记录：mtime、长度、来源都对得上才算新鲜
@@ -282,30 +327,103 @@ impl Index {
         Some(entry.records)
     }
 
-    fn save(entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)]) {
-        let Some(path) = Self::path() else {
+    fn save(&mut self, entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)]) {
+        let Some(dir) = Self::dir() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // 按 mtime 所在的那一天分组：只有今天写入的文件会落到今天的片上
+        let mut groups: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let day = (entry.1 .0 / 86_400) as i64;
+            groups.entry(day).or_default().push(index);
         }
 
-        // 先写临时文件再改名：写一半崩掉也不会留下坏索引
-        let temp = path.with_extension("bin.tmp");
-        let Ok(file) = std::fs::File::create(&temp) else {
-            return;
-        };
-        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
-        if write_index(&mut writer, entries).is_ok() {
-            use std::io::Write;
-            let _ = writer.flush();
+        let mut written: HashMap<i64, u64> = HashMap::new();
+        for (day, picks) in &groups {
+            let hash = fingerprint(entries, picks);
+            if self.shards.get(day) == Some(&hash) {
+                written.insert(*day, hash);
+                continue;
+            }
+
+            let Some(path) = Self::shard_path(*day) else {
+                continue;
+            };
+            let temp = path.with_extension("bin.tmp");
+            let Ok(file) = std::fs::File::create(&temp) else {
+                continue;
+            };
+            let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+            let ok = write_index(&mut writer, hash, entries, picks).is_ok();
+            if ok {
+                use std::io::Write;
+                let _ = writer.flush();
+            }
             drop(writer);
-            let _ = std::fs::rename(&temp, &path);
-        } else {
-            drop(writer);
+
+            if ok && std::fs::rename(&temp, &path).is_ok() {
+                written.insert(*day, hash);
+                continue;
+            }
             let _ = std::fs::remove_file(&temp);
         }
+
+        // 已经不存在的那一天：把整片删掉
+        for day in self.shards.keys() {
+            if !groups.contains_key(day) {
+                if let Some(path) = Self::shard_path(*day) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        // 老的单文件索引已经迁移完，删掉省 12 MB
+        if self.legacy {
+            if let Some(path) = Self::legacy_path() {
+                let _ = std::fs::remove_file(path);
+            }
+            self.legacy = false;
+        }
+
+        self.shards = written;
     }
+}
+
+/// `usage-20772.bin` → 20772
+fn shard_day(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("usage-")?.strip_suffix(".bin")?;
+    rest.parse().ok()
+}
+
+/// 一片内容的指纹：路径、时间戳、来源、每条记录都参与
+fn fingerprint(
+    entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)],
+    picks: &[usize],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for index in picks {
+        let (path, stamp, source, records) = &entries[*index];
+        path.to_string_lossy().hash(&mut hasher);
+        stamp.0.hash(&mut hasher);
+        stamp.1.hash(&mut hasher);
+        source_code(source).hash(&mut hasher);
+        records.len().hash(&mut hasher);
+        for record in records {
+            record.day.hash(&mut hasher);
+            record.hour.hash(&mut hasher);
+            record.model.hash(&mut hasher);
+            record.output.hash(&mut hasher);
+            record.input.hash(&mut hasher);
+            record.cache_read.hash(&mut hasher);
+            record.duration_ms.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn source_code(source: &str) -> u8 {
@@ -328,13 +446,17 @@ fn source_of_code(code: u8) -> &'static str {
 
 fn write_index(
     writer: &mut impl std::io::Write,
+    hash: u64,
     entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)],
+    picks: &[usize],
 ) -> std::io::Result<()> {
     writer.write_all(INDEX_MAGIC)?;
     put_u32(writer, INDEX_VERSION)?;
-    put_u32(writer, entries.len() as u32)?;
+    put_u64(writer, hash)?;
+    put_u32(writer, picks.len() as u32)?;
 
-    for (path, stamp, source, records) in entries {
+    for index in picks {
+        let (path, stamp, source, records) = &entries[*index];
         put_u8(writer, source_code(source))?;
         put_str(writer, &path.to_string_lossy())?;
         put_u64(writer, stamp.0)?;
@@ -355,7 +477,7 @@ fn write_index(
     Ok(())
 }
 
-fn read_index(path: &Path) -> std::io::Result<HashMap<PathBuf, IndexEntry>> {
+fn read_index(path: &Path) -> std::io::Result<(u64, HashMap<PathBuf, IndexEntry>)> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
@@ -364,9 +486,13 @@ fn read_index(path: &Path) -> std::io::Result<HashMap<PathBuf, IndexEntry>> {
     if &magic != INDEX_MAGIC {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "magic"));
     }
-    if get_u32(&mut reader)? != INDEX_VERSION {
+
+    // v1 是单文件、没有指纹；读出来照用，下次保存会迁成 v2 分片
+    let version = get_u32(&mut reader)?;
+    if version != 1 && version != 2 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "version"));
     }
+    let hash = if version >= 2 { get_u64(&mut reader)? } else { 0 };
 
     let count = get_u32(&mut reader)? as usize;
     let mut entries = HashMap::with_capacity(count);
@@ -393,7 +519,7 @@ fn read_index(path: &Path) -> std::io::Result<HashMap<PathBuf, IndexEntry>> {
         entries.insert(path, IndexEntry { stamp, source, records });
     }
 
-    Ok(entries)
+    Ok((hash, entries))
 }
 
 fn put_u8(writer: &mut impl std::io::Write, value: u8) -> std::io::Result<()> {
@@ -963,6 +1089,70 @@ mod tests {
             cache_read: 0,
             duration_ms: 1000,
         }
+    }
+
+    #[test]
+    fn shard_names_roundtrip() {
+        assert_eq!(shard_day(Path::new("C:/x/usage-20772.bin")), Some(20772));
+        assert_eq!(shard_day(Path::new("C:/x/usage-20772.bin.tmp")), None);
+        assert_eq!(shard_day(Path::new("C:/x/other.bin")), None);
+    }
+
+    #[test]
+    fn fingerprint_tracks_every_field() {
+        let base = vec![(
+            PathBuf::from("C:/a.jsonl"),
+            (100_u64, 200_u64),
+            SOURCE_WORKBUDDY_AI,
+            vec![record(10, SOURCE_WORKBUDDY_AI, "m", 100)],
+        )];
+        let picks = vec![0];
+        let original = fingerprint(&base, &picks);
+
+        // 同一份数据指纹稳定（否则每次启动都会重写所有分片）
+        assert_eq!(original, fingerprint(&base, &picks));
+
+        // 时间戳、长度、记录内容任何一项变了都得换指纹
+        let mut touched = base.clone();
+        touched[0].1 .1 += 1;
+        assert_ne!(original, fingerprint(&touched, &picks));
+
+        let mut rewritten = base.clone();
+        rewritten[0].3[0].output += 1;
+        assert_ne!(original, fingerprint(&rewritten, &picks));
+    }
+
+    #[test]
+    fn index_roundtrip_preserves_entries() {
+        let entries = vec![
+            (
+                PathBuf::from("C:/x/a.jsonl"),
+                (1_700_000_000_u64, 1234_u64),
+                SOURCE_DSH,
+                vec![record(10, SOURCE_DSH, "m1", 11)],
+            ),
+            (
+                PathBuf::from("C:/x/b.jsonl"),
+                (1_700_000_100_u64, 99_u64),
+                SOURCE_WORKBUDDY,
+                vec![record(11, SOURCE_WORKBUDDY, "m2", 22)],
+            ),
+        ];
+
+        let mut buffer = Vec::new();
+        let hash = fingerprint(&entries, &[0, 1]);
+        write_index(&mut buffer, hash, &entries, &[0, 1]).unwrap();
+
+        let dir = std::env::temp_dir().join("nst-index-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("usage-test.bin");
+        std::fs::write(&path, &buffer).unwrap();
+
+        let (read_hash, loaded) = read_index(&path).unwrap();
+        assert_eq!(read_hash, hash);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[&PathBuf::from("C:/x/b.jsonl")].records[0].output, 22);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

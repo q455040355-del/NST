@@ -7,11 +7,11 @@ use netspeed_core::memory::read_memory;
 use netspeed_core::temperature::{append_watts, format_temperature as format_celsius, TemperatureMonitor};
 use netspeed_core::net::{NetSample, NetSampler};
 use netspeed_core::settings::{Settings, GAUGE_AI, GAUGE_MEMORY};
-use netspeed_core::{format_bytes_gb, format_speed, format_temperature, MemorySnapshot};
+use netspeed_core::{format_bytes_gb, format_speed, MemorySnapshot};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, GetDC, GetPixel, GetTextExtentPoint32W, InvalidateRect,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
+    DeleteObject, FillRect, GetDC, GetPixel, GetTextExtentPoint32W, InvalidateRect,
     ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DT_LEFT,
     DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
 };
@@ -80,6 +80,8 @@ pub struct Panel {
     bg_color: u32,
     bg_rect: (i32, i32, i32, i32),
     bg_at: std::time::Instant,
+    /// 上一次真正画出来的内容指纹：一样就不重绘（数字常几十秒不动）
+    last_frame: String,
 }
 
 impl Panel {
@@ -123,6 +125,7 @@ impl Panel {
             bg_color: 0,
             bg_rect: (0, 0, 0, 0),
             bg_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            last_frame: String::new(),
         };
 
         panel.ensure_buffer();
@@ -157,12 +160,38 @@ impl Panel {
 
         self.refresh();
         let refresh_us = started.elapsed().as_micros();
-        unsafe {
-            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+
+        // 内容没变就不重绘：网速/内存这些数字常常几十秒才动一次，
+        // 以前每 500ms 无条件整窗重画一遍（分层窗口还要重新提交位图）
+        let signature = self.frame_signature();
+        if signature != self.last_frame {
+            self.last_frame = signature;
+            unsafe {
+                InvalidateRect(self.hwnd, std::ptr::null(), 0);
+            }
         }
+
         if refresh_us > 5_000 {
             crate::debug_log(&format!("tick refresh={refresh_us}us"));
         }
+    }
+
+    /// 面板上所有可见内容的指纹（数字文本 + 视图 + 指示条目标 + 明暗主题）
+    fn frame_signature(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.1}|{}",
+            self.settings.view,
+            self.up_text,
+            self.down_text,
+            self.used_text,
+            self.total_text,
+            self.temp_text,
+            self.temp_gpu_text,
+            self.ai_speed_text,
+            self.ai_today_text,
+            self.gauge_target,
+            crate::theme::taskbar_is_light() as u8,
+        )
     }
 
     /// 改刷新间隔（毫秒）：立刻生效，下一次 tick 就会采一次样。

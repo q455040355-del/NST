@@ -4,7 +4,7 @@
 
 use netspeed_core::ai::now_ms;
 use netspeed_core::history::{
-    self, all_sources, source_color, source_name, DailyRow, UsageRecord, DAY_MS,
+    self, all_sources, source_name, DailyRow, UsageRecord, DAY_MS,
 };
 use std::sync::mpsc::{channel, Receiver};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -989,23 +989,19 @@ fn back_buffer(width: i32, height: i32) -> Option<HDC> {
     })
 }
 
-// ---- 2026 视觉规范（0x00BBGGRR）----
-const BG: u32 = 0x00F8_F6F5; // #F5F6F8
-const SURFACE: u32 = 0x00FF_FFFF;
-const BORDER: u32 = 0x00EF_EAE8; // #E8EAEF
-const TEXT: u32 = 0x001A_1614; // #14161A
-const TEXT2: u32 = 0x0080_726B; // #6B7280
-const TEXT3: u32 = 0x00AF_A39A; // #9AA3AF
-const CHIP: u32 = 0x00F3_F1EF; // 分段控件底色
-const ROW_TINT: u32 = 0x00FC_FBFA;
-const DARK: u32 = 0x001A_1614;
 
 fn series_color(source: &str) -> u32 {
-    match source {
+    let base = match source {
         "opencode" => 0x00F6_823B,   // #3B82F6
         "dsh" => 0x00F6_5C8B,        // #8B5CF6
         "workbuddy" => 0x000B_9EF5,  // #F59E0B
         _ => 0x0081_B910,            // #10B981
+    };
+    // 深色底上把系列色提亮一点，否则紫/蓝在 #1B1C1E 上发闷
+    if crate::theme::is_dark() {
+        mix_white(base, 0.18)
+    } else {
+        base
     }
 }
 
@@ -1033,6 +1029,7 @@ fn thousands(value: i64) -> String {
 }
 
 struct Painter {
+    ui: crate::theme::Ui,
     dc: HDC,
     width: i32,
     height: i32,
@@ -1300,14 +1297,14 @@ unsafe fn draw_chip(
             rect.right,
             rect.bottom,
             (rect.bottom - rect.top) / 2,
-            DARK,
-            DARK,
+            p.ui.dark,
+            p.ui.dark,
         );
     } else if accent.is_some() {
         // 来源按钮：透明底，只在悬停时才明显（这里保持轻量）
     }
 
-    let color = if active { 0x00FF_FFFF } else { TEXT2 };
+    let color = if active { 0x00FF_FFFF } else { p.ui.text2 };
     if let Some(dot_color) = accent {
         let cx = rect.left + p.s(12.0);
         let cy = (rect.top + rect.bottom) / 2;
@@ -1329,14 +1326,14 @@ unsafe fn draw_chip(
 /// 整页绘制（数据变化、尺寸变化、露出时用）
 unsafe fn draw_all(p: &Painter, state: &mut State) {
     let l = layout(p);
-    p.fill(0, 0, p.width, p.height, BG);
+    p.fill(0, 0, p.width, p.height, p.ui.bg);
 
     // ---- 标题
     p.text(
         "用量历史",
         17.0,
         700,
-        TEXT,
+        p.ui.text,
         l.pad,
         p.s(18.0),
         p.width - l.pad,
@@ -1357,8 +1354,8 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         let cx = (c.left + c.right) / 2;
         let cy = (c.top + c.bottom) / 2;
         let arm = p.s(5.0);
-        p.solid_line(cx - arm, cy - arm, cx + arm, cy + arm, TEXT3);
-        p.solid_line(cx - arm, cy + arm, cx + arm, cy - arm, TEXT3);
+        p.solid_line(cx - arm, cy - arm, cx + arm, cy + arm, p.ui.text3);
+        p.solid_line(cx - arm, cy + arm, cx + arm, cy - arm, p.ui.text3);
     }
 
     let subtitle = if state.loading {
@@ -1395,7 +1392,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         &subtitle,
         8.5,
         400,
-        TEXT3,
+        p.ui.text3,
         l.pad,
         p.s(50.0),
         p.width - l.pad,
@@ -1427,8 +1424,8 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         group.right,
         group.bottom,
         (group.bottom - group.top) / 2,
-        CHIP,
-        CHIP,
+        p.ui.chip,
+        p.ui.chip,
     );
 
     let mut x = group.left + p.s(3.0);
@@ -1460,7 +1457,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         "来源",
         8.5,
         400,
-        TEXT3,
+        p.ui.text3,
         sx - label_width,
         l.row_top,
         sx - p.s(12.0),
@@ -1561,8 +1558,8 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             left + card_w,
             l.cards_top + l.cards_h,
             p.s(14.0),
-            SURFACE,
-            BORDER,
+            p.ui.surface,
+            p.ui.border,
         );
 
         let dot_y = l.cards_top + p.s(22.0);
@@ -1571,7 +1568,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             title,
             8.5,
             400,
-            TEXT2,
+            p.ui.text2,
             left + p.s(26.0),
             dot_y - p.s(10.0),
             left + card_w - p.s(14.0),
@@ -1582,7 +1579,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             value,
             17.5,
             700,
-            TEXT,
+            p.ui.text,
             left + p.s(15.0),
             l.cards_top + p.s(32.0),
             left + card_w - p.s(12.0),
@@ -1593,7 +1590,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             caption,
             8.0,
             400,
-            TEXT3,
+            p.ui.text3,
             left + p.s(16.0),
             l.cards_top + p.s(64.0),
             left + card_w - p.s(12.0),
@@ -1622,15 +1619,15 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
         p.width - l.pad,
         l.chart_bottom,
         p.s(14.0),
-        SURFACE,
-        BORDER,
+        p.ui.surface,
+        p.ui.border,
     );
 
     p.text(
         if state.hourly { "每小时输出" } else { "每日输出" },
         9.5,
         600,
-        TEXT,
+        p.ui.text,
         l.pad + p.s(18.0),
         l.chart_top + p.s(10.0),
         l.pad + p.s(200.0),
@@ -1662,7 +1659,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             name,
             8.0,
             400,
-            TEXT2,
+            p.ui.text2,
             legend_x + p.s(12.0),
             l.chart_top + p.s(10.0),
             legend_x + p.s(140.0),
@@ -1699,8 +1696,8 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 (cx + width / 2.0) as i32,
                 plot_bottom + p.s(4.0),
                 p.s(6.0),
-                0x00F5_F6F9,
-                0x00F5_F6F9,
+                p.ui.row_tint,
+                p.ui.row_tint,
             );
         }
     }
@@ -1711,7 +1708,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     // 网格 + 刻度
     for step in 0..=3 {
         let y = plot_bottom - plot_height * step / 3;
-        p.dashed(plot_left, y, plot_right, y, 0x00E6_E9EE);
+        p.dashed(plot_left, y, plot_right, y, p.ui.border);
         let value = (tick_step * step as f64) as i64;
         let label = if value == 0 {
             "0".to_string()
@@ -1722,7 +1719,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             &label,
             7.5,
             400,
-            TEXT3,
+            p.ui.text3,
             l.pad,
             y - p.s(9.0),
             plot_left - p.s(10.0),
@@ -1847,13 +1844,13 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 top + height,
                 p.s(10.0),
                 0x00FF_FFFF,
-                BORDER,
+                p.ui.border,
             );
             p.text(
                 &title,
                 8.5,
                 600,
-                TEXT,
+                p.ui.text,
                 left + padding,
                 top + p.s(4.0),
                 left + width - padding,
@@ -1864,7 +1861,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 &line,
                 8.0,
                 400,
-                TEXT2,
+                p.ui.text2,
                 left + padding,
                 top + p.s(24.0),
                 left + width - padding,
@@ -1885,7 +1882,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             &if state.hourly { format!("{:02}", day.day) } else { day_label(day.day) },
             7.5,
             400,
-            TEXT3,
+            p.ui.text3,
             (x - p.s(22.0) as f32) as i32,
             plot_bottom + p.s(6.0),
             (x + slot + p.s(22.0) as f32) as i32,
@@ -1902,8 +1899,8 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
         p.width - l.pad,
         l.table_bottom,
         p.s(14.0),
-        SURFACE,
-        BORDER,
+        p.ui.surface,
+        p.ui.border,
     );
 
     let columns = [0.17f32, 0.10, 0.12, 0.12, 0.10, 0.10, 0.28];
@@ -1929,7 +1926,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
             header,
             8.0,
             500,
-            TEXT3,
+            p.ui.text3,
             column_left[index],
             header_top,
             right,
@@ -1943,7 +1940,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
         header_bottom + p.s(4.0),
         p.width - l.pad - p.s(14.0),
         header_bottom + p.s(4.0),
-        BORDER,
+        p.ui.border,
     );
 
     let row_height = p.s(30.0);
@@ -1968,7 +1965,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
                 y,
                 p.width - l.pad - p.s(8.0),
                 y + row_height,
-                ROW_TINT,
+                p.ui.row_tint,
             );
         }
 
@@ -1977,7 +1974,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
             &if state.hourly { format!("{:02}:00", day.day) } else { day_full_label(day.day) },
             8.5,
             500,
-            TEXT,
+            p.ui.text,
             column_left[0],
             y,
             column_left[0] + p.s(120.0),
@@ -2014,7 +2011,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
                 &text,
                 8.5,
                 400,
-                if column == 5 { TEXT3 } else { TEXT },
+                if column == 5 { p.ui.text3 } else { p.ui.text },
                 column_left[column],
                 y,
                 right,
@@ -2027,7 +2024,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
             &day.main_model,
             8.5,
             400,
-            TEXT3,
+            p.ui.text3,
             column_left[6],
             y,
             column_left[6] + p.s(250.0),
@@ -2060,6 +2057,7 @@ fn paint(hwnd: HWND, hdc: HDC, ps: &PAINTSTRUCT) {
         };
 
         let p = Painter {
+            ui: crate::theme::ui(),
             dc,
             width: client.right,
             height: client.bottom,

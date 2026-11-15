@@ -1,10 +1,10 @@
-﻿//! 面板配色与字体：跟随任务栏明暗主题。
+//! 面板配色与字体：跟随任务栏明暗主题。
 
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, HFONT, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL,
 };
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+    RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -155,4 +155,92 @@ fn create_font(dpi: u32, points: f32, weight: u32, face: &str) -> HFONT {
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ---------------------------------------------------------------- 窗口配色
+
+/// 设置窗 / 历史窗 / 取字窗共用的一套颜色（跟随系统明暗）。
+///
+/// 面板本身早就跟着任务栏深浅走了，但这两个窗口以前写死浅色卡片，
+/// 晚上切到深色模式会亮得刺眼。
+#[derive(Debug, Clone, Copy)]
+pub struct Ui {
+    /// 窗口底色
+    pub bg: u32,
+    /// 卡片 / 输入框底色
+    pub surface: u32,
+    /// 1px 描边
+    pub border: u32,
+    /// 主文字
+    pub text: u32,
+    /// 次要文字（标签、说明）
+    pub text2: u32,
+    /// 更弱的文字（占位、刻度）
+    pub text3: u32,
+    /// 控件底（下拉、开关轨道）
+    pub chip: u32,
+    pub chip_hover: u32,
+    /// 表格斑马纹
+    pub row_tint: u32,
+    pub accent: u32,
+    pub accent_pressed: u32,
+    /// 深色底上画箭头/勾用的强调色
+    pub dark: u32,
+}
+
+impl Ui {
+    fn light() -> Self {
+        Self {
+            bg: rgb(0xF5, 0xF6, 0xF8),
+            surface: rgb(0xFF, 0xFF, 0xFF),
+            border: rgb(0xE8, 0xEA, 0xEF),
+            text: rgb(0x14, 0x16, 0x1A),
+            text2: rgb(0x6B, 0x72, 0x80),
+            text3: rgb(0x9A, 0xA3, 0xAF),
+            chip: rgb(0xEF, 0xF1, 0xF3),
+            chip_hover: rgb(0xE7, 0xEA, 0xEE),
+            row_tint: rgb(0xFA, 0xFB, 0xFC),
+            accent: rgb(0x2F, 0x6F, 0xE4),
+            accent_pressed: rgb(0x1F, 0x5A, 0xC2),
+            dark: rgb(0x14, 0x16, 0x1A),
+        }
+    }
+
+    fn dark() -> Self {
+        Self {
+            bg: rgb(0x1B, 0x1C, 0x1E),
+            surface: rgb(0x23, 0x24, 0x27),
+            border: rgb(0x34, 0x36, 0x3A),
+            text: rgb(0xF2, 0xF3, 0xF5),
+            text2: rgb(0xB9, 0xBD, 0xC4),
+            text3: rgb(0x85, 0x8A, 0x93),
+            chip: rgb(0x2C, 0x2E, 0x32),
+            chip_hover: rgb(0x36, 0x38, 0x3D),
+            row_tint: rgb(0x26, 0x28, 0x2B),
+            accent: rgb(0x4C, 0x8D, 0xFF),
+            accent_pressed: rgb(0x3B, 0x76, 0xE0),
+            dark: rgb(0x14, 0x16, 0x1A),
+        }
+    }
+}
+
+/// 当前该用哪套配色（AppsUseLightTheme，2 秒缓存）
+pub fn ui() -> Ui {
+    if forced_dark() {
+        Ui::dark()
+    } else if taskbar_is_light() {
+        Ui::light()
+    } else {
+        Ui::dark()
+    }
+}
+
+/// 调试用：设了 NST_FORCE_DARK 就强制深色，方便截图验证（正常使用不受影响）
+fn forced_dark() -> bool {
+    std::env::var_os("NST_FORCE_DARK").is_some()
+}
+
+/// 系统是否深色（ui() 的另一面，图表配色要用）
+pub fn is_dark() -> bool {
+    forced_dark() || !taskbar_is_light()
 }

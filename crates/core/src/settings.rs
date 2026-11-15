@@ -32,6 +32,8 @@ pub struct Settings {
     pub ai_dsh: bool,
     pub ai_workbuddy: bool,
     pub ai_workbuddy_ai: bool,
+    /// 开机自启（写 HKCU\…\Run）
+    pub auto_start: bool,
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
     extra: BTreeMap<String, String>,
 }
@@ -54,6 +56,7 @@ impl Default for Settings {
             ai_dsh: true,
             ai_workbuddy: true,
             ai_workbuddy_ai: true,
+            auto_start: false,
             extra: BTreeMap::new(),
         }
     }
@@ -103,6 +106,7 @@ impl Settings {
                 "AiDsh" => settings.ai_dsh = parse_bool(value),
                 "AiWorkBuddy" => settings.ai_workbuddy = parse_bool(value),
                 "AiWorkBuddyAi" => settings.ai_workbuddy_ai = parse_bool(value),
+                "AutoStart" => settings.auto_start = parse_bool(value),
                 _ => {
                     settings.extra.insert(key.to_string(), value.to_string());
                 }
@@ -132,7 +136,7 @@ impl Settings {
         }
 
         let mut out = String::new();
-        out.push_str("SettingsVersion=6\n");
+        out.push_str("SettingsVersion=7\n");
         out.push_str(&format!("PanelWidth={}\n", self.panel_width));
         out.push_str(&format!("PanelX={}\n", self.panel_x));
         out.push_str(&format!("PanelY={}\n", self.panel_y));
@@ -149,6 +153,7 @@ impl Settings {
         out.push_str(&format!("AiDsh={}\n", self.ai_dsh));
         out.push_str(&format!("AiWorkBuddy={}\n", self.ai_workbuddy));
         out.push_str(&format!("AiWorkBuddyAi={}\n", self.ai_workbuddy_ai));
+        out.push_str(&format!("AutoStart={}\n", self.auto_start));
 
         for (key, value) in &self.extra {
             // 上面这些键已经写过，不再重复
@@ -171,12 +176,21 @@ impl Settings {
                     | "AiDsh"
                     | "AiWorkBuddy"
                     | "AiWorkBuddyAi"
+                    | "AutoStart"
             ) {
                 continue;
             }
             out.push_str(&format!("{key}={value}\n"));
         }
 
+        // 先写临时文件再改名：写到一半崩掉/断电时不会留下半个 ini
+        // （以前是直接 fs::write，崩一次配置就全丢，面板位置、字号、AI 开关全重置）
+        let temp = path.with_extension("ini.tmp");
+        if fs::write(&temp, &out).is_ok() && fs::rename(&temp, &path).is_ok() {
+            return;
+        }
+        // 改名被别的进程占着（比如 C# 版正开着它）就退回直接覆盖
+        let _ = fs::remove_file(&temp);
         let _ = fs::write(path, out);
     }
 

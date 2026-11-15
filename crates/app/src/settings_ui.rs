@@ -1,4 +1,4 @@
-﻿//! 设置窗口（全自绘，纯 Win32/GDI）。
+//! 设置窗口（全自绘，纯 Win32/GDI）。
 //!
 //! 视觉和历史窗口一致：浅色卡片 + 圆角 + 1px 描边，
 //! 控件全部自己画（滑杆 / 下拉 / 按钮），所以没有系统控件的土味边框。
@@ -32,19 +32,7 @@ const POPUP_CLASS: &str = "NetSpeedTaskbarRs.Settings.Popup";
 const WM_APP_PICK: u32 = WM_APP + 0x31;
 
 const DT_NOPREFIX: u32 = 0x0800;
-const DT_CALCRECT: u32 = 0x0400;
 
-// 和 history_ui 一套色（浅色）
-const BG: u32 = 0x00F8_F6F5; // #F5F6F8
-const SURFACE: u32 = 0x00FF_FFFF;
-const BORDER: u32 = 0x00EF_EAE8; // #E8EAEF
-const TEXT: u32 = 0x001A_1614; // #14161A
-const TEXT2: u32 = 0x0080_726B; // #6B7280
-const TEXT3: u32 = 0x00AF_A39A; // #9AA3AF
-const CHIP: u32 = 0x00F3_F1EF;
-const CHIP_HOVER: u32 = 0x00FE_F7F2; // 悬停时略暖一点
-const ACCENT: u32 = 0x00E4_6F_2F; // #2F6FE4 蓝（COLORREF 倒序）
-const ACCENT_PRESSED: u32 = 0x00C2_5A_1F;
 
 const ID_WIDTH_LABEL: usize = 2001;
 const ID_GAUGE_LABEL: usize = 2004;
@@ -92,6 +80,8 @@ enum Hit {
     Select(usize),
     AiToggle,
     AiSource(usize),
+    Scrollbar,
+    AutoStart,
 }
 
 struct Fonts {
@@ -148,6 +138,9 @@ fn s(value: f32, scale: f32) -> i32 {
     (value * scale).round() as i32
 }
 
+/// 加一档对比度的前景色：accent 上的圆钮、勾和滑块都用它（深色下也一样亮）
+const KNOB: u32 = 0x00FF_FFFF;
+
 /// 位图 → 偏白（t=0 原色，t=1 纯白）
 fn mix_white(color: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
@@ -158,12 +151,7 @@ fn mix_white(color: u32, t: f32) -> u32 {
     (ch(0)) | (ch(8) << 8) | (ch(16) << 16)
 }
 
-/// 位图 → 偏黑（t=0 原色，t=1 纯黑）
-fn mix_black(color: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let ch = |shift: u32| -> u32 { (((color >> shift) & 0xFF) as f32 * (1.0 - t)).round() as u32 };
-    (ch(0)) | (ch(8) << 8) | (ch(16) << 16)
-}
+
 
 fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
     unsafe {
@@ -200,7 +188,7 @@ impl Painter {
 
     unsafe fn fill(&self, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
         let brush = CreateSolidBrush(color);
-        let mut rect = RECT {
+        let rect = RECT {
             left,
             top,
             right,
@@ -289,25 +277,7 @@ impl Painter {
         SelectObject(self.dc, old);
     }
 
-    unsafe fn text_width(&self, text: &str, font: HFONT) -> i32 {
-        let old = SelectObject(self.dc, font as HGDIOBJ);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        let units = wide(text);
-        DrawTextW(
-            self.dc,
-            units.as_ptr(),
-            (units.len() - 1) as i32,
-            &mut rect,
-            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        SelectObject(self.dc, old);
-        rect.right - rect.left
-    }
+
 }
 
 // ---------------------------------------------------------------- 状态
@@ -322,10 +292,13 @@ struct State {
     font: usize,
     ai_enabled: bool,
     ai_sources: [bool; 4],
+    auto_start: bool,
     fonts: Fonts,
     scale: f32,
     hover: Option<Hit>,
     slider_drag: bool,
+    /// 正在拖滚动条滑块
+    scroll_drag: bool,
     /// 内容区滚动位置（像素，0 = 顶部）
     scroll: i32,
     popup: HWND,
@@ -340,6 +313,8 @@ struct Layout {
     selects: [RECT; 4],
     ai_toggle: RECT,
     ai_sources: [RECT; 4],
+    /// 页脚左边的「开机自启」整行热区
+    auto_start: RECT,
 }
 
 fn layout(state: &State, client: RECT) -> Layout {
@@ -408,6 +383,13 @@ fn layout(state: &State, client: RECT) -> Layout {
             bottom: s(AI_TOGGLE_TOP + AI_ROW_H, scale),
         },
         ai_sources: ai_source_rects(scale, right),
+        // 页脚左边：标签 + 开关都在这个热区里
+        auto_start: RECT {
+            left: pad + s(4.0, scale),
+            top: done.top,
+            right: (pad + s(4.0, scale) + s(170.0, scale)).min(done.left - s(12.0, scale)),
+            bottom: done.bottom,
+        },
     }
 }
 
@@ -445,7 +427,75 @@ fn content_viewport(state: &State, client: RECT) -> (i32, i32) {
 fn max_scroll(state: &State, client: RECT) -> i32 {
     let (top, bottom) = content_viewport(state, client);
     let content = s(CONTENT_BOTTOM - CONTENT_TOP, state.scale);
-    (content - (bottom - top)).max(0)
+    let overflow = content - (bottom - top);
+    // 留 2px 容差：默认高度下正好铺满，别因为取整差 1px 就冒出一条没用的滚动条
+    if overflow <= s(2.0, state.scale) {
+        0
+    } else {
+        overflow
+    }
+}
+
+/// 竖向滚动条的几何：绘制和拖动共用同一套算法
+struct ScrollBar {
+    x: i32,
+    track_w: i32,
+    track_top: i32,
+    track_bottom: i32,
+    thumb_h: i32,
+    travel: i32,
+}
+
+impl ScrollBar {
+    fn thumb_top(&self, scroll: i32, max: i32) -> i32 {
+        if self.travel <= 0 || max <= 0 {
+            return self.track_top;
+        }
+        let ratio = scroll.clamp(0, max) as f32 / max as f32;
+        self.track_top + (self.travel as f32 * ratio).round() as i32
+    }
+
+    /// 鼠标 y → 新的 scroll（让滑块中心跟着鼠标走）
+    fn scroll_at(&self, y: i32, max: i32) -> i32 {
+        if self.travel <= 0 || max <= 0 {
+            return 0;
+        }
+        let offset = y - self.track_top - self.thumb_h / 2;
+        let ratio = offset as f32 / self.travel as f32;
+        (ratio * max as f32).round().clamp(0.0, max as f32) as i32
+    }
+
+    /// 命中区比画出来的 4px 宽一点，不然不好点
+    fn hot(&self, scale: f32) -> RECT {
+        let pad = s(4.0, scale);
+        RECT {
+            left: self.x - pad,
+            top: self.track_top,
+            right: self.x + self.track_w + pad,
+            bottom: self.track_bottom,
+        }
+    }
+}
+
+fn scroll_bar(state: &State, client: RECT) -> ScrollBar {
+    let scale = state.scale;
+    let (view_top, view_bottom) = content_viewport(state, client);
+    let track_w = s(4.0, scale);
+    let x = client.right - s(9.0, scale);
+    let track_top = view_top + s(4.0, scale);
+    let track_bottom = view_bottom - s(4.0, scale);
+    let track_h = (track_bottom - track_top).max(1);
+    let span = s(CONTENT_BOTTOM - CONTENT_TOP, scale).max(1);
+    let thumb_h = ((track_h as f32) * (track_h as f32) / (span as f32)).round() as i32;
+    let thumb_h = thumb_h.clamp(s(24.0, scale), track_h);
+    ScrollBar {
+        x,
+        track_w,
+        track_top,
+        track_bottom,
+        thumb_h,
+        travel: (track_h - thumb_h).max(0),
+    }
 }
 
 fn state_of(hwnd: HWND) -> *mut State {
@@ -496,6 +546,7 @@ fn row_label(row: usize) -> &'static str {
 // ---------------------------------------------------------------- 绘画
 
 unsafe fn paint(hwnd: HWND) {
+    let c = crate::theme::ui();
     let state = state_of(hwnd);
     if state.is_null() {
         return;
@@ -525,15 +576,15 @@ unsafe fn paint(hwnd: HWND) {
     let l = layout(state, client);
 
     // 底色 + 卡片（卡片铺满客户区，圆角靠 DWM）
-    p.fill(0, 0, client.right, client.bottom, BG);
+    p.fill(0, 0, client.right, client.bottom, c.bg);
     p.round(
         0,
         0,
         client.right,
         client.bottom,
         p.s(16.0),
-        SURFACE,
-        BORDER,
+        c.surface,
+        c.border,
     );
 
     let pad = p.s(20.0);
@@ -543,7 +594,7 @@ unsafe fn paint(hwnd: HWND) {
     p.text(
         "显示设置",
         state.fonts.title,
-        TEXT,
+        c.text,
         pad + p.s(4.0),
         p.s(16.0),
         content_right,
@@ -560,19 +611,19 @@ unsafe fn paint(hwnd: HWND) {
             l.close.right,
             l.close.bottom,
             p.s(8.0),
-            CHIP,
-            CHIP,
+            c.chip,
+            c.chip,
         );
     }
     let cx = (l.close.left + l.close.right) / 2;
     let cy = (l.close.top + l.close.bottom) / 2;
     let arm = p.s(5.0);
-    let ink = if close_hover { TEXT } else { TEXT2 };
+    let ink = if close_hover { c.text } else { c.text2 };
     p.line(cx - arm, cy - arm, cx + arm, cy + arm, ink, p.s(1.4));
     p.line(cx - arm, cy + arm, cx + arm, cy - arm, ink, p.s(1.4));
 
     // 顶部分割线
-    p.fill(0, p.s(64.0), client.right, p.s(65.0), BORDER);
+    p.fill(0, p.s(64.0), client.right, p.s(65.0), c.border);
 
     // ---------------------------------------------------------------- 可滚动内容
     //
@@ -611,7 +662,7 @@ unsafe fn paint(hwnd: HWND) {
         p.text(
             label,
             state.fonts.label,
-            TEXT,
+            c.text,
             pad + p.s(4.0),
             center - p.s(11.0),
             s(CONTROL_X, state.scale) - p.s(12.0),
@@ -626,7 +677,7 @@ unsafe fn paint(hwnd: HWND) {
                 bottom,
                 content_right,
                 bottom + 1,
-                mix_white(BORDER, 0.45),
+                mix_white(c.border, 0.45),
             );
         }
     }
@@ -655,8 +706,8 @@ unsafe fn paint(hwnd: HWND) {
             track.right,
             mid + track_h / 2,
             track_h,
-            CHIP,
-            CHIP,
+            c.chip,
+            c.chip,
         );
         p.round(
             track.left,
@@ -664,17 +715,17 @@ unsafe fn paint(hwnd: HWND) {
             knob_x.max(track.left + track_h),
             mid + track_h / 2,
             track_h,
-            ACCENT,
-            ACCENT,
+            c.accent,
+            c.accent,
         );
-        p.circle(knob_x, mid, knob_r, SURFACE, mix_white(BORDER, 0.1));
-        p.circle(knob_x, mid, knob_r - p.s(3.0), SURFACE, SURFACE);
+        p.circle(knob_x, mid, knob_r, KNOB, mix_white(c.border, 0.1));
+        p.circle(knob_x, mid, knob_r - p.s(3.0), KNOB, KNOB);
 
         // 数值（固定在右侧，不跟着圆钮跑，避免文字框被挤成负数）
         p.text(
             &format!("{} px", state.width),
             state.fonts.value,
-            TEXT2,
+            c.text2,
             content_right - p.s(80.0),
             mid - p.s(10.0),
             content_right,
@@ -690,11 +741,11 @@ unsafe fn paint(hwnd: HWND) {
         let hovered = state.hover == Some(Hit::Select(row));
         let open = state.popup != std::ptr::null_mut();
         let fill = if hovered || open {
-            CHIP_HOVER
+            c.chip_hover
         } else {
-            CHIP
+            c.chip
         };
-        let border = if open { ACCENT } else { fill };
+        let border = if open { c.accent } else { fill };
         p.round(
             rect.left,
             rect.top,
@@ -707,7 +758,7 @@ unsafe fn paint(hwnd: HWND) {
         p.text(
             &text_of_row(state, row),
             state.fonts.value,
-            TEXT,
+            c.text,
             rect.left + p.s(12.0),
             rect.top,
             rect.right - p.s(34.0),
@@ -719,8 +770,8 @@ unsafe fn paint(hwnd: HWND) {
         let ax = rect.right - p.s(22.0);
         let ay = (rect.top + rect.bottom) / 2 - p.s(2.0);
         let step = p.s(4.5);
-        p.line(ax, ay, ax + step, ay + step, TEXT2, p.s(1.4));
-        p.line(ax + step, ay + step, ax + step * 2, ay, TEXT2, p.s(1.4));
+        p.line(ax, ay, ax + step, ay + step, c.text2, p.s(1.4));
+        p.line(ax + step, ay + step, ax + step * 2, ay, c.text2, p.s(1.4));
     }
 
     // ---------------------------------------------------------------- AI 统计
@@ -729,12 +780,12 @@ unsafe fn paint(hwnd: HWND) {
         p.s(AI_HEAD_TOP),
         client.right,
         p.s(AI_HEAD_TOP) + 1,
-        BORDER,
+        c.border,
     );
     p.text(
         "AI 统计",
         state.fonts.small,
-        TEXT3,
+        c.text3,
         pad + p.s(4.0),
         p.s(AI_TITLE_TOP),
         content_right,
@@ -751,14 +802,14 @@ unsafe fn paint(hwnd: HWND) {
             content_right,
             toggle.bottom - p.s(1.0),
             p.s(8.0),
-            CHIP,
-            CHIP,
+            c.chip,
+            c.chip,
         );
     }
     p.text(
         "启用 AI 统计",
         state.fonts.label,
-        TEXT,
+        c.text,
         pad + p.s(4.0),
         toggle.top,
         toggle.right - p.s(70.0),
@@ -772,7 +823,7 @@ unsafe fn paint(hwnd: HWND) {
             "关闭时不起线程、不读任何会话文件"
         },
         state.fonts.small,
-        TEXT3,
+        c.text3,
         pad + p.s(4.0),
         mid,
         toggle.right - p.s(70.0),
@@ -786,13 +837,13 @@ unsafe fn paint(hwnd: HWND) {
     let sx = content_right - sw_w;
     let sy = mid - sw_h / 2;
     if state.ai_enabled {
-        p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, ACCENT, ACCENT);
+        p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
         p.circle(
             sx + sw_w - sw_h / 2,
             mid,
             sw_h / 2 - p.s(3.0),
-            SURFACE,
-            SURFACE,
+            KNOB,
+            KNOB,
         );
     } else {
         p.round(
@@ -801,15 +852,15 @@ unsafe fn paint(hwnd: HWND) {
             sx + sw_w,
             sy + sw_h,
             sw_h,
-            CHIP,
-            mix_white(BORDER, 0.05),
+            c.chip,
+            mix_white(c.border, 0.05),
         );
         p.circle(
             sx + sw_h / 2,
             mid,
             sw_h / 2 - p.s(3.0),
-            SURFACE,
-            mix_white(BORDER, 0.05),
+            KNOB,
+            mix_white(c.border, 0.05),
         );
     }
 
@@ -824,14 +875,14 @@ unsafe fn paint(hwnd: HWND) {
                 content_right,
                 rect.bottom - p.s(1.0),
                 p.s(7.0),
-                CHIP,
-                CHIP,
+                c.chip,
+                c.chip,
             );
         }
         p.text(
             AI_SOURCE_LABELS[index],
             state.fonts.value,
-            if state.ai_enabled { TEXT } else { TEXT3 },
+            if state.ai_enabled { c.text } else { c.text3 },
             pad + p.s(16.0),
             rect.top,
             rect.right - p.s(44.0),
@@ -843,11 +894,11 @@ unsafe fn paint(hwnd: HWND) {
         let bx = content_right - size;
         let by = (rect.top + rect.bottom) / 2 - size / 2;
         let (fill, border) = if !state.ai_enabled {
-            (SURFACE, mix_white(BORDER, 0.25))
+            (c.surface, mix_white(c.border, 0.25))
         } else if on {
-            (ACCENT, ACCENT)
+            (c.accent, c.accent)
         } else {
-            (SURFACE, mix_white(BORDER, 0.05))
+            (c.surface, mix_white(c.border, 0.05))
         };
         p.round(bx, by, bx + size, by + size, p.s(4.0), fill, border);
         if on && state.ai_enabled {
@@ -856,7 +907,7 @@ unsafe fn paint(hwnd: HWND) {
                 by + p.s(8.0),
                 bx + p.s(7.0),
                 by + p.s(11.0),
-                SURFACE,
+                KNOB,
                 p.s(1.6),
             );
             p.line(
@@ -864,7 +915,7 @@ unsafe fn paint(hwnd: HWND) {
                 by + p.s(11.0),
                 bx + p.s(12.0),
                 by + p.s(5.0),
-                SURFACE,
+                KNOB,
                 p.s(1.6),
             );
         }
@@ -877,45 +928,44 @@ unsafe fn paint(hwnd: HWND) {
 
     // 滚动条（只有在内容放不下时才出现）
     if max > 0 {
-        let track_w = p.s(4.0);
-        let x = client.right - p.s(9.0);
-        let track_top = view_top + p.s(4.0);
-        let track_bottom = view_bottom - p.s(4.0);
-        let track_h = (track_bottom - track_top).max(1);
+        let bar = scroll_bar(state, client);
+        let track_w = bar.track_w;
         p.round(
-            x,
-            track_top,
-            x + track_w,
-            track_bottom,
+            bar.x,
+            bar.track_top,
+            bar.x + track_w,
+            bar.track_bottom,
             track_w,
-            mix_white(BORDER, 0.35),
-            mix_white(BORDER, 0.35),
+            mix_white(c.border, 0.35),
+            mix_white(c.border, 0.35),
         );
 
-        let span = s(CONTENT_BOTTOM - CONTENT_TOP, state.scale).max(1);
-        let thumb_h = ((track_h as f32) * (track_h as f32) / (span as f32)).round() as i32;
-        let thumb_h = thumb_h.clamp(p.s(24.0), track_h);
-        let travel = (track_h - thumb_h).max(0);
-        let thumb_top = track_top + (travel as f32 * scroll as f32 / max as f32).round() as i32;
+        // 拖动中把滑块画深一点，和悬停的其他控件一个反馈
+        let active = if state.scroll_drag || state.hover == Some(Hit::Scrollbar) {
+            c.text2
+        } else {
+            c.text3
+        };
+        let thumb_top = bar.thumb_top(scroll, max);
         p.round(
-            x,
+            bar.x,
             thumb_top,
-            x + track_w,
-            thumb_top + thumb_h,
+            bar.x + track_w,
+            thumb_top + bar.thumb_h,
             track_w,
-            TEXT3,
-            TEXT3,
+            active,
+            active,
         );
     }
 
     // 底部分割线
-    let foot_top = client.bottom - p.s(64.0);    p.fill(0, foot_top, client.right, foot_top + 1, BORDER);
+    let foot_top = client.bottom - p.s(64.0);    p.fill(0, foot_top, client.right, foot_top + 1, c.border);
 
     let done_hover = state.hover == Some(Hit::Done);
     let done_fill = if done_hover {
-        ACCENT_PRESSED
+        c.accent_pressed
     } else {
-        ACCENT
+        c.accent
     };
     p.round(
         l.done.left,
@@ -936,6 +986,56 @@ unsafe fn paint(hwnd: HWND) {
         l.done.bottom,
         DT_CENTER_ALIGN,
     );
+
+    // 页脚左边：开机自启（放在这里就不用让内容区再长一行、也不会多出滚动条）
+    {
+        let hovered = state.hover == Some(Hit::AutoStart);
+        let sw_w = p.s(38.0);
+        let sw_h = p.s(22.0);
+        let area = l.auto_start;
+        let sx = area.right - sw_w;
+        let mid = (area.top + area.bottom) / 2;
+        let sy = mid - sw_h / 2;
+
+        p.text(
+            "开机自启",
+            state.fonts.value,
+            if hovered { c.text } else { c.text2 },
+            area.left,
+            area.top,
+            sx - p.s(10.0),
+            area.bottom,
+            DT_LEFT,
+        );
+
+        if state.auto_start {
+            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
+            p.circle(
+                sx + sw_w - sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                KNOB,
+            );
+        } else {
+            p.round(
+                sx,
+                sy,
+                sx + sw_w,
+                sy + sw_h,
+                sw_h,
+                c.chip,
+                mix_white(c.border, 0.05),
+            );
+            p.circle(
+                sx + sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                KNOB,
+            );
+        }
+    }
 
     // 提交
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -968,6 +1068,7 @@ const POPUP_PAD: f32 = 6.0;
 const POPUP_ITEM: f32 = 36.0;
 
 unsafe fn popup_paint(hwnd: HWND) {
+    let c = crate::theme::ui();
     let state = popup_state(hwnd);
     if state.is_null() {
         return;
@@ -994,15 +1095,15 @@ unsafe fn popup_paint(hwnd: HWND) {
         scale: state.scale,
     };
 
-    p.fill(0, 0, client.right, client.bottom, SURFACE);
+    p.fill(0, 0, client.right, client.bottom, c.surface);
     p.round(
         0,
         0,
         client.right,
         client.bottom,
         p.s(10.0),
-        SURFACE,
-        BORDER,
+        c.surface,
+        c.border,
     );
 
     let item_h = p.s(POPUP_ITEM);
@@ -1023,15 +1124,15 @@ unsafe fn popup_paint(hwnd: HWND) {
                 client.right - pad,
                 bottom,
                 p.s(7.0),
-                CHIP,
-                CHIP,
+                c.chip,
+                c.chip,
             );
         }
 
         p.text(
             item,
             if selected { f_selected } else { f },
-            if selected { TEXT } else { TEXT },
+            if selected { c.text } else { c.text },
             pad + p.s(10.0),
             top,
             client.right - p.s(34.0),
@@ -1042,13 +1143,13 @@ unsafe fn popup_paint(hwnd: HWND) {
         if selected {
             let ax = client.right - p.s(24.0);
             let ay = (top + bottom) / 2;
-            p.line(ax, ay, ax + p.s(4.0), ay + p.s(4.0), ACCENT, p.s(1.8));
+            p.line(ax, ay, ax + p.s(4.0), ay + p.s(4.0), c.accent, p.s(1.8));
             p.line(
                 ax + p.s(4.0),
                 ay + p.s(4.0),
                 ax + p.s(11.0),
                 ay - p.s(5.0),
-                ACCENT,
+                c.accent,
                 p.s(1.8),
             );
         }
@@ -1402,10 +1503,12 @@ pub fn open(parent: HWND, settings: &Settings) {
                 settings.ai_workbuddy,
                 settings.ai_workbuddy_ai,
             ],
+            auto_start: settings.auto_start,
             fonts: Fonts::create(scale),
             scale,
             hover: None,
             slider_drag: false,
+            scroll_drag: false,
             scroll: 0,
             popup: std::ptr::null_mut(),
         }));
@@ -1473,6 +1576,17 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     }
     if contains(&l.done, point) {
         return Some(Hit::Done);
+    }
+    if contains(&l.auto_start, point) {
+        return Some(Hit::AutoStart);
+    }
+
+    // 滚动条比内容区窄，得先判：否则会被下面「内容区偏移」的逻辑吃掉
+    if max_scroll(state, client) > 0 {
+        let bar = scroll_bar(state, client);
+        if contains(&bar.hot(state.scale), point) {
+            return Some(Hit::Scrollbar);
+        }
     }
 
     // 滚出可见区的控件既不该响应悬停也不该响应点击
@@ -1579,6 +1693,18 @@ unsafe extern "system" fn dialog_proc(
                 return 0;
             }
 
+            if state.scroll_drag {
+                let max = max_scroll(state, client);
+                let bar = scroll_bar(state, client);
+                let next = bar.scroll_at(point.y, max);
+                if next != state.scroll {
+                    state.scroll = next;
+                    state.hover = None;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                return 0;
+            }
+
             let hover = hit_test(state, client, point);
             if state.hover != hover {
                 state.hover = hover;
@@ -1613,11 +1739,21 @@ unsafe extern "system" fn dialog_proc(
                     SetCapture(hwnd);
                     apply_width(hwnd, state, point.x, client);
                 }
+                Some(Hit::Scrollbar) => {
+                    // 按下就跳到鼠标位置（和系统滚动条一样），然后跟着拖
+                    let max = max_scroll(state, client);
+                    let bar = scroll_bar(state, client);
+                    state.scroll_drag = true;
+                    SetCapture(hwnd);
+                    state.scroll = bar.scroll_at(point.y, max);
+                    state.hover = Some(Hit::Scrollbar);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 Some(Hit::Select(row)) => {
                     open_popup(hwnd, row);
                 }
                 Some(Hit::AiToggle) => {
-                    let mut enabled = !state.ai_enabled;
+                    let enabled = !state.ai_enabled;
                     // 打开总开关时如果四个来源全关着，默认全开，否则什么也采不到
                     if enabled && !state.ai_sources.iter().any(|flag| *flag) {
                         state.ai_sources = [true; 4];
@@ -1634,6 +1770,11 @@ unsafe extern "system" fn dialog_proc(
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 }
+                Some(Hit::AutoStart) => {
+                    state.auto_start = !state.auto_start;
+                    crate::apply_auto_start(state.parent, state.auto_start);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 None => {}
             }
             0
@@ -1643,6 +1784,7 @@ unsafe extern "system" fn dialog_proc(
             let state = state_of(hwnd);
             if !state.is_null() {
                 (*state).slider_drag = false;
+                (*state).scroll_drag = false;
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0

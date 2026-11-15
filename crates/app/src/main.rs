@@ -6,6 +6,7 @@
 
 mod history_ui;
 mod hint;
+mod autostart;
 mod menu;
 mod ocr;
 mod ocr_ui;
@@ -31,7 +32,7 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ShowWindow, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, MOD_CONTROL, MOD_SHIFT, TME_LEAVE,
@@ -46,6 +47,8 @@ const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
 const WM_APP_ANIM: u32 = WM_APP + 6;
+/// 另一个实例启动时叫醒已有面板（单实例互斥体挡住重复启动，但得给点反馈）
+const WM_APP_REVEAL: u32 = WM_APP + 7;
 
 /// windows-sys 0.59 没导出 WM_MOUSELEAVE，自己补一个
 /// （不能省：漏了会变成变量绑定模式，把后面的消息分支全吃掉）
@@ -133,7 +136,8 @@ fn main() {
         let mutex_name = wide("Local\\NetSpeedTaskbar.Rust");
         let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
         if mutex.is_null() || GetLastError() == 183 {
-            // 已经在跑了
+            // 已经在跑了：把已有面板叫出来，别让用户双击了没反应
+            reveal_existing();
             return;
         }
 
@@ -161,6 +165,8 @@ fn main() {
         TASKBAR = taskbar;
 
         let settings = Settings::load();
+        // 自启项对一遍：exe 挪过位置的话这里会把注册表里的路径修正
+        autostart::sync(settings.auto_start);
         let width = scale_for_dpi(settings.panel_width);
         let height = scale_for_dpi(40);
 
@@ -314,6 +320,34 @@ fn keep_on_top(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+}
+
+/// 有第二个实例启动时：找到已经在跑的面板，让它自己亮一下。
+///
+/// 单实例互斥体挡住重复启动是对的，但以前是静默 `return`——用户双击
+/// 快捷方式什么都没发生，会以为程序坏了。
+fn reveal_existing() {
+    unsafe {
+        let mut found: HWND = std::ptr::null_mut();
+        EnumWindows(Some(find_panel), &mut found as *mut HWND as isize);
+        if found.is_null() {
+            return;
+        }
+        // 允许前台化：这是用户主动双击触发的，Windows 会放行
+        AllowSetForegroundWindow(0xFFFF_FFFF);
+        PostMessageW(found, WM_APP_REVEAL, 0, 0);
+    }
+}
+
+unsafe extern "system" fn find_panel(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let mut class = [0u16; 64];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    let name = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+    if name == CLASS_NAME {
+        *(lparam as *mut HWND) = hwnd;
+        return 0;
+    }
+    1
 }
 
 /// 是否到了重新定位面板的时间（2 秒一次）
@@ -555,6 +589,18 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_APP_REVEAL => {
+            // 第二个实例被启动：把面板亮出来（用户双击了图标总得有点反应）
+            HIDDEN_BY_USER = false;
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            keep_on_top(hwnd);
+            if let Some(panel) = panel_mut(hwnd) {
+                panel.tick();
+            }
+            SetForegroundWindow(hwnd);
+            hint::hide();
+            0
+        }
         WM_APP_TRAY => {
             let event = (lparam as u32) & 0xFFFF;
             match event {
@@ -649,7 +695,12 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONUP => {
             ReleaseCapture();
-            let moved = std::mem::replace(&mut DRAG_ACTIVE, false) && DRAG_MOVED;
+            let moved = {
+                // 单线程 UI，直接读+清标志；以前写 &mut DRAG_ACTIVE 属于可变静态引用
+                let active = DRAG_ACTIVE;
+                DRAG_ACTIVE = false;
+                active && DRAG_MOVED
+            };
             if moved {
                 // 记住拖到的位置（夹在任务栏里），下次启动还在这儿
                 let mut rect = RECT {
@@ -996,6 +1047,15 @@ pub(crate) fn apply_ai_enabled(parent: HWND, enabled: bool) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_ai_enabled(enabled);
     }
+}
+
+/// 设置窗里勾/取消「开机自启」：落盘 + 写注册表
+pub(crate) fn apply_auto_start(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.auto_start = enabled;
+        panel.settings.save();
+    }
+    autostart::set(enabled);
 }
 
 /// 设置里勾选的 AI 来源（OpenCode / dsh / WorkBuddy / WorkBuddy AI）。
