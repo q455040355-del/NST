@@ -6,16 +6,30 @@ use netspeed_core::temperature::{append_watts, format_temperature as format_cels
 use netspeed_core::net::{NetSample, NetSampler};
 use netspeed_core::settings::{Settings, GAUGE_AI, GAUGE_CPU, GAUGE_MEMORY, GAUGE_SPEED};
 use netspeed_core::{format_bytes_gb, format_speed, format_temperature, MemorySnapshot};
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
     DeleteObject, EndPaint, FillRect, GetDC, GetPixel, InvalidateRect, ReleaseDC, SelectObject,
     SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DT_LEFT, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    GetClientRect, GetWindowRect, SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER,
 };
+
+// 分层窗口常量（windows-sys 没在这个 feature 集里导出）
+const ULW_ALPHA: u32 = 0x0000_0002;
+const AC_SRC_OVER: u8 = 0x00;
+const AC_SRC_ALPHA: u8 = 0x01;
+
+#[repr(C)]
+struct BlenFunction {
+    blend_op: u8,
+    blend_flags: u8,
+    source_constant_alpha: u8,
+    alpha_format: u8,
+}
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -345,15 +359,11 @@ impl Panel {
         }
     }
 
+    /// 分层窗口：把背缓冲整块推给 DWM（不依赖 WM_PAINT，任务栏重绘也刷不掉）。
     pub fn paint(&mut self) {
-        let started = std::time::Instant::now();
         unsafe {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(self.hwnd, &mut ps);
-            self.render(hdc);
-            EndPaint(self.hwnd, &mut ps);
+            self.render(std::ptr::null_mut());
         }
-        let _ = started.elapsed();
     }
 
     /// 画到任意 DC：WM_PAINT 和 WM_PRINTCLIENT（截图/打印）共用。
@@ -407,7 +417,45 @@ impl Panel {
                 }
             }
 
-            BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+            if hdc.is_null() {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                GetWindowRect(self.hwnd, &mut rect);
+
+                let destination = POINT {
+                    x: rect.left,
+                    y: rect.top,
+                };
+                let size = SIZE {
+                    cx: width,
+                    cy: height,
+                };
+                let source = POINT { x: 0, y: 0 };
+                let blend = BlenFunction {
+                    blend_op: AC_SRC_OVER,
+                    blend_flags: 0,
+                    source_constant_alpha: 255,
+                    alpha_format: AC_SRC_ALPHA,
+                };
+
+                UpdateLayeredWindow(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    &destination,
+                    &size,
+                    dc,
+                    &source,
+                    0,
+                    &blend as *const BlenFunction as *const _,
+                    ULW_ALPHA,
+                );
+            } else {
+                BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+            }
         }
     }
 

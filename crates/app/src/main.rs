@@ -15,21 +15,24 @@ use panel::Panel;
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    ShowWindow, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use theme::wide;
 
 const WM_APP_TICK: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
-const TIMER_ID: usize = 1;
 const TRAY_ID: u32 = 1;
 
 thread_local! {
@@ -39,6 +42,9 @@ thread_local! {
 
 /// 任务栏句柄：用来发现 Explorer 重启（我们的子窗口会被连带销毁）
 static mut TASKBAR: HWND = std::ptr::null_mut();
+
+/// 用户从菜单里「隐藏面板」后不再自动显示（只有双击托盘才恢复）
+static mut HIDDEN_BY_USER: bool = false;
 
 /// 隐藏的顶层窗口：TrackPopupMenu 要求调用线程在前台，
 /// 子窗口没法变前台，只能借一个自己的顶层窗口来"占前台"
@@ -107,16 +113,18 @@ fn main() {
         let width = scale_for_dpi(settings.panel_width);
         let height = scale_for_dpi(40);
 
+        // 顶层 + 分层：任务栏会不断重绘自己的子窗口区域，挂在下面会被刷掉；
+        // 分层窗口自己负责呈现（UpdateLayeredWindow），和 AgentSpeed / C# 稳定版一致
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             class_name.as_ptr(),
             wide(WINDOW_TITLE).as_ptr(),
-            WS_CHILD | WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE,
             0,
             0,
             width,
             height,
-            taskbar,
+            taskbar, // owner = 任务栏：拥有窗口永远排在 owner 之上，Explorer 重绘也盖不住
             std::ptr::null_mut(),
             instance,
             std::ptr::null(),
@@ -161,7 +169,10 @@ fn main() {
         position_panel(hwnd, taskbar, width, height);
         keep_on_top(hwnd);
         add_tray(hwnd);
-        SetTimer(hwnd, TIMER_ID, 500, None);
+
+        // 注意：本进程里的 SetTimer / WM_TIMER 完全不可靠（实测 set 成功但永不触发，
+        // 回调形式也一样），所以周期刷新用一个后台线程投递消息，保证一定能到。
+        start_ticker(hwnd);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
@@ -199,18 +210,64 @@ fn scale_for_dpi(value: i32) -> i32 {
 }
 
 
-/// 任务栏里的 MSTaskListWClass 会压在我们上面（点击都给它），必须周期性置顶。
+/// 顶层置顶窗口不用改 z 序，这里只负责跟随任务栏位置（任务栏可能移动/改尺寸）。
 fn keep_on_top(hwnd: HWND) {
     unsafe {
-        SetWindowPos(
-            hwnd,
-            0 as HWND, // HWND_TOP
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+        if taskbar.is_null() {
+            return;
+        }
+
+        let mut bar = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(taskbar, &mut bar);
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(hwnd, &mut rect);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        let tray = FindWindowExW(
+            taskbar,
+            std::ptr::null_mut(),
+            wide("TrayNotifyWnd").as_ptr(),
+            std::ptr::null(),
         );
+        let gap = scale_for_dpi(8);
+        let left = if !tray.is_null() {
+            let mut tray_rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetWindowRect(tray, &mut tray_rect);
+            tray_rect.left - width - gap
+        } else {
+            bar.right - width - scale_for_dpi(220)
+        };
+        let top = bar.top + ((bar.bottom - bar.top) - height) / 2;
+
+        if rect.left != left || rect.top != top {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                left.max(bar.left),
+                top.max(bar.top),
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+        }
     }
 }
 
@@ -237,19 +294,88 @@ fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
 
         let top = bar.top + ((bar.bottom - bar.top) - height) / 2;
 
-        // 子窗口的 SetWindowPos 用「父窗口客户区」坐标，要减去任务栏原点
         SetWindowPos(
             hwnd,
-            std::ptr::null_mut(),
-            left.max(bar.left) - bar.left,
-            top.max(bar.top) - bar.top,
+            HWND_TOPMOST,
+            left.max(bar.left),
+            top.max(bar.top),
             width,
             height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOACTIVATE,
         );
     }
 }
 
+/// 周期刷新：后台线程每 500ms 投递一次 WM_APP_TICK。
+/// （本进程 SetTimer/WM_TIMER 实测完全收不到，改用线程投递最稳。）
+/// 前台是不是一个占满整块显示器的窗口（游戏、视频全屏）。
+/// 任务栏/桌面/有 owner 的弹窗都不算。
+fn fullscreen_foreground() -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+
+        let mut class = [0u16; 96];
+        let length = GetClassNameW(foreground, class.as_mut_ptr(), class.len() as i32);
+        let name = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+        if name == "Shell_TrayWnd"
+            || name == "Shell_SecondaryTrayWnd"
+            || name == "Progman"
+            || name == "WorkerW"
+        {
+            return false;
+        }
+
+        // 有 owner 的窗口是对话框/弹出菜单，不算全屏
+        if !GetWindow(foreground, GW_OWNER).is_null() {
+            return false;
+        }
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(foreground, &mut rect) == 0 {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return false;
+        }
+
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return false;
+        }
+
+        rect.left <= info.rcMonitor.left
+            && rect.top <= info.rcMonitor.top
+            && rect.right >= info.rcMonitor.right
+            && rect.bottom >= info.rcMonitor.bottom
+    }
+}
+
+fn start_ticker(hwnd: HWND) {
+    let handle = hwnd as usize;
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe {
+            let target = handle as HWND;
+            if IsWindow(target) == 0 {
+                break;
+            }
+            if PostMessageW(target, WM_APP_TICK, 0, 0) == 0 {
+                break;
+            }
+        }
+    });
+}
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -266,23 +392,30 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_APP_TICK => {
-            if let Some(panel) = panel_mut(hwnd) {
-                panel.tick();
-            }
-            0
-        }
-        WM_TIMER => {
-            // Explorer 重启会把我们的子窗口连带销毁：此时直接退出，
-            // 否则进程会变成“没有窗口、还占着单实例互斥体”的僵尸（再次启动就闪退）
+            // Explorer 重启后我们的窗口会跟着销毁，这时直接退出进程，
+            // 否则会留下「没有窗口但占着互斥体」的僵尸进程，导致再也打不开。
             if !TASKBAR.is_null() && IsWindow(TASKBAR) == 0 {
                 std::process::exit(0);
             }
 
             keep_on_top(hwnd);
+
+            // 全屏程序（游戏/视频）在前台时把自己藏起来，否则一个 TOPMOST 面板会糊在画面上
+            let fullscreen = fullscreen_foreground();
+            let visible = IsWindowVisible(hwnd) != 0;
+            if fullscreen && visible {
+                ShowWindow(hwnd, SW_HIDE);
+            } else if !fullscreen && !visible && !HIDDEN_BY_USER {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            if fullscreen {
+                return 0;
+            }
+
             if let Some(panel) = panel_mut(hwnd) {
                 panel.tick();
                 let tip = panel.tip_text();
-                // NIM_MODIFY 很贵，文本没变就别调
+                // NIM_MODIFY 只在文字变了才发，否则托盘会频繁闪烁
                 let changed = LAST_TIP.with(|cell| {
                     let mut value = cell.borrow_mut();
                     if *value == tip {
@@ -303,6 +436,7 @@ unsafe extern "system" fn wnd_proc(
             match event {
                 WM_LBUTTONUP | WM_RBUTTONUP => show_menu(hwnd),
                 WM_LBUTTONDBLCLK => {
+                    HIDDEN_BY_USER = false;
                     ShowWindow(hwnd, SW_SHOW);
                     if let Some(panel) = panel_mut(hwnd) {
                         panel.tick();
@@ -347,7 +481,6 @@ unsafe extern "system" fn wnd_proc(
                 drop(Box::from_raw(ptr));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
-            KillTimer(hwnd, TIMER_ID);
             remove_tray(hwnd);
             // 窗口没了就退出整个进程（包括托盘/AI 线程），避免留下僵尸占着互斥体
             std::process::exit(0);
@@ -451,6 +584,7 @@ fn show_menu(hwnd: HWND) {
                 settings_ui::open(hwnd, width, &gauge);
             }
             ID_PANEL_HIDE => {
+                HIDDEN_BY_USER = true;
                 ShowWindow(hwnd, SW_HIDE);
             }
             ID_QUIT => {
@@ -551,6 +685,13 @@ pub(crate) fn screen_scale() -> f32 {
 
 pub(crate) fn dpi_for_window(hwnd: HWND) -> u32 {
     unsafe {
+        // 分层窗口刚创建、还没显示时 GetDC(hwnd)+LOGPIXELSX 会返回 96（虚拟化值），
+        // 会让面板算出 109x40 这种未缩放尺寸。优先用 GetDpiForWindow。
+        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+        if dpi >= 96 {
+            return dpi;
+        }
+
         let dc = GetDC(hwnd);
         let dpi = GetDeviceCaps(dc, 88) as u32;
         ReleaseDC(hwnd, dc);

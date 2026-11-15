@@ -702,6 +702,26 @@ pub fn local_midnight_ms(now_ms: i64) -> i64 {
 }
 
 /// token 数压成 K/M/B。
+/// 本地时区相对 UTC 的偏移（毫秒，东八区为 +28800000）。
+pub fn local_offset_ms() -> i64 {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+
+    unsafe {
+        let mut info: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let state = GetTimeZoneInformation(&mut info);
+        let mut bias = info.Bias as i64;
+        // 2 = TIME_ZONE_ID_DAYLIGHT
+        if state == 2 {
+            bias += info.DaylightBias as i64;
+        }
+        -bias * 60_000
+    }
+}
+
+/// 「天序号」：按本地日期切分，和 today() 保持同一坐标系。
+pub fn day_index(ms: i64) -> i64 {
+    (ms + local_offset_ms()).div_euclid(86_400_000)
+}
 pub fn format_tokens(value: i64) -> String {
     let value = value.max(0);
     if value < 1_000 {

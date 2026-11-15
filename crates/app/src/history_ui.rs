@@ -26,6 +26,7 @@ const CLASS_NAME: &str = "NetSpeedTaskbarRs.History";
 const CANVAS_CLASS: &str = "NetSpeedTaskbarRs.HistoryCanvas";
 
 const WM_APP_HISTORY_READY: u32 = WM_APP + 30;
+const WM_APP_HISTORY_ANIM: u32 = WM_APP + 31;
 
 const RANGE_LABELS: [&str; 5] = ["今天", "昨天", "7 天", "30 天", "全部"];
 
@@ -39,6 +40,31 @@ const ACCENT_BLUE: u32 = 0x00D8_8440;
 const ACCENT_GREEN: u32 = 0x008C_A92F;
 const ACCENT_PURPLE: u32 = 0x00FF_617B;
 const ACCENT_ORANGE: u32 = 0x0032_8AE0;
+
+/// 动画投递线程的代（每次重启动画就 +1，旧线程看到代变了就退出）
+static ANIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 每 16ms 给画布投一次 WM_APP_HISTORY_ANIM。
+/// 本进程 SetTimer/WM_TIMER 实测收不到消息，只能用线程投递（和面板刷新同因）。
+fn start_animator(canvas: HWND) {
+    let generation = ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let handle = canvas as usize;
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        if ANIM_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            break;
+        }
+        unsafe {
+            let target = handle as HWND;
+            if IsWindow(target) == 0 {
+                break;
+            }
+            if PostMessageW(target, WM_APP_HISTORY_ANIM, 0, 0) == 0 {
+                break;
+            }
+        }
+    });
+}
 
 struct Spring {
     omega: f64,
@@ -133,7 +159,7 @@ pub fn open(parent: HWND) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: std::ptr::null_mut(),
+            hIcon: crate::tray::create_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: (15 + 1) as usize as *mut _, // COLOR_BTNFACE
             lpszMenuName: std::ptr::null(),
@@ -148,7 +174,7 @@ pub fn open(parent: HWND) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: std::ptr::null_mut(),
+            hIcon: crate::tray::create_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
@@ -360,7 +386,7 @@ unsafe extern "system" fn window_proc(
 
                         let canvas = canvas_of(hwnd);
                         if !canvas.is_null() {
-                            SetTimer(canvas, 1, 15, None);
+                            start_animator(canvas);
                         }
                     }
                 }
@@ -415,7 +441,17 @@ fn recalc(state: &mut State) {
     state.to_day = to;
 
     state.days = history::summarize(&state.records, from, to);
-    state.stack = history::daily_by_source(&state.records, from, to, &all_sources());
+    // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
+    // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
+    let rows = history::daily_by_source(&state.records, from, to, &all_sources());
+    state.stack = state
+        .days
+        .iter()
+        .map(|day| {
+            let index = (day.day - from).max(0) as usize;
+            rows.get(index).cloned().unwrap_or_default()
+        })
+        .collect();
 
     let target: Vec<f32> = state
         .days
@@ -442,7 +478,7 @@ unsafe extern "system" fn canvas_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_TIMER => {
+        WM_APP_HISTORY_ANIM => {
             let parent = GetParent(hwnd);
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
@@ -462,7 +498,8 @@ unsafe extern "system" fn canvas_proc(
                 if state.spring.settled(1.0) {
                     state.now_heights = state.to_heights.clone();
                     state.animating = false;
-                    KillTimer(hwnd, 1);
+                    // 让投递线程自然退出
+                    ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
 
                 InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -481,7 +518,7 @@ unsafe extern "system" fn canvas_proc(
                         if state.range != index {
                             state.range = index;
                             recalc(state);
-                            SetTimer(hwnd, 1, 15, None);
+                            start_animator(hwnd);
                         }
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                         break;

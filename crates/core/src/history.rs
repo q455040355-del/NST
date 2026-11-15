@@ -98,8 +98,7 @@ pub fn all_sources() -> [&'static str; 4] {
 
 /// 今天的日期序号（本地时区）。
 pub fn today(now_ms: i64) -> i64 {
-    let midnight = super::ai::local_midnight_ms(now_ms);
-    midnight.div_euclid(DAY_MS)
+    super::ai::day_index(now_ms)
 }
 
 /// 只读 OpenCode（毫秒级），用于历史窗口首屏。
@@ -174,7 +173,7 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
         }
 
         records.push(UsageRecord {
-            day: created.div_euclid(DAY_MS),
+            day: super::ai::day_index(created),
             source: SOURCE_OPENCODE,
             model,
             output,
@@ -202,7 +201,7 @@ fn load_files(
         };
 
         for record in parsed {
-            if record.day * DAY_MS >= from_ms - DAY_MS {
+            if record.day >= super::ai::day_index(from_ms) - 1 {
                 records.push(record);
             }
         }
@@ -302,7 +301,7 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             .to_string();
 
         records.push(UsageRecord {
-            day: time.div_euclid(DAY_MS),
+            day: super::ai::day_index(time),
             source,
             model,
             output,
@@ -357,7 +356,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             .to_string();
 
         let entry = map.entry(message_id.to_string()).or_insert_with(|| UsageRecord {
-            day: timestamp.div_euclid(DAY_MS),
+            day: super::ai::day_index(timestamp),
             source,
             model: model.clone(),
             output: 0,
@@ -378,7 +377,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
         }
 
         if timestamp > 0 {
-            entry.day = timestamp.div_euclid(DAY_MS);
+            entry.day = super::ai::day_index(timestamp);
             if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 180_000 {
                 entry.duration_ms = timestamp - last_ts;
             }

@@ -76,7 +76,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: std::ptr::null_mut(),
+            hIcon: crate::tray::create_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: (COLOR_BTNFACE + 1) as usize as *mut _,
             lpszMenuName: std::ptr::null(),
