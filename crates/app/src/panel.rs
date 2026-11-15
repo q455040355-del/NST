@@ -1,10 +1,12 @@
 ﻿//! 任务栏子窗口面板：GDI 绘制、视图切换、指示条。
 
-use netspeed_core::ai::{format_speed as format_ai_speed, format_tokens, AiEngine, AiSnapshot};
+use netspeed_core::ai::{
+    format_speed as format_ai_speed, format_tokens, AiEngine, AiSnapshot, Sources,
+};
 use netspeed_core::memory::read_memory;
 use netspeed_core::temperature::{append_watts, format_temperature as format_celsius, TemperatureMonitor};
 use netspeed_core::net::{NetSample, NetSampler};
-use netspeed_core::settings::{Settings, GAUGE_AI, GAUGE_CPU, GAUGE_MEMORY, GAUGE_SPEED};
+use netspeed_core::settings::{Settings, GAUGE_AI, GAUGE_MEMORY};
 use netspeed_core::{format_bytes_gb, format_speed, format_temperature, MemorySnapshot};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -54,7 +56,6 @@ pub struct Panel {
     total_text: String,
     temp_text: String,
     temp_gpu_text: String,
-    cpu_celsius: f64,
     temperatures: Option<TemperatureMonitor>,
     ai_speed_text: String,
     ai_today_text: String,
@@ -69,6 +70,10 @@ pub struct Panel {
     width: i32,
     height: i32,
     gauge: f32,
+    /// 指示条的目标值（动画缓动到它）
+    gauge_target: f32,
+    /// 上一帧动画的时间，用来算缓动步长
+    last_anim: std::time::Instant,
     /// 上一次真正采样/重绘的时间（用来按设置的间隔限流）
     last_refresh: std::time::Instant,
 }
@@ -78,6 +83,9 @@ impl Panel {
         let dpi = unsafe { crate::dpi_for_window(hwnd) };
         let light = taskbar_is_light();
         let colors = Colors::for_theme(light, 0x00F3F3F3);
+
+        let font_scale = settings.font_scale;
+        let ai_sources = sources_of(&settings);
 
         let mut panel = Self {
             hwnd,
@@ -91,25 +99,30 @@ impl Panel {
             total_text: "--".to_string(),
             temp_text: "--".to_string(),
             temp_gpu_text: "--".to_string(),
-            cpu_celsius: f64::NAN,
             temperatures: None,
             ai_speed_text: "0.0 t/s".to_string(),
             ai_today_text: "0".to_string(),
-            ai: AiWorker::new(),
+            ai: AiWorker::new(ai_sources),
             ai_snapshot: AiSnapshot::default(),
             dpi,
             colors,
-            fonts: Fonts::create(dpi),
+            fonts: Fonts::create(dpi, font_scale),
             back_dc: std::ptr::null_mut(),
             back_bitmap: std::ptr::null_mut(),
             back_bits: std::ptr::null_mut(),
             width: 0,
             height: 0,
             gauge: 0.0,
+            gauge_target: 0.0,
+            last_anim: std::time::Instant::now(),
             last_refresh: std::time::Instant::now(),
         };
 
         panel.ensure_buffer();
+        // 设置里开了 AI 才起采集线程（关掉时连线程都不存在）
+        if panel.settings.ai_enabled {
+            panel.ai.start();
+        }
         panel.refresh();
         panel
     }
@@ -154,7 +167,13 @@ impl Panel {
     }
 
     pub fn cycle_view(&mut self) {
-        self.settings.cycle_view();
+        // AI 关着就跳过 AI 视图
+        loop {
+            self.settings.cycle_view();
+            if self.settings.view != VIEW_AI || self.settings.ai_enabled {
+                break;
+            }
+        }
         self.settings.save();
         self.refresh();
         unsafe {
@@ -163,6 +182,10 @@ impl Panel {
     }
 
     pub fn set_view(&mut self, view: &str) {
+        // 没开 AI 统计就不允许切到 AI 视图
+        if view == VIEW_AI && !self.settings.ai_enabled {
+            return;
+        }
         self.settings.view = view.to_string();
         self.settings.save();
         self.refresh();
@@ -193,6 +216,61 @@ impl Panel {
 
     pub fn gauge_source(&self) -> &str {
         &self.settings.gauge_source
+    }
+
+    /// AI 统计总开关：开了才起采集线程（常驻记录），关了立刻停。
+    pub fn set_ai_enabled(&mut self, enabled: bool) {
+        self.settings.ai_enabled = enabled;
+        if enabled {
+            self.ai.start();
+        } else {
+            self.ai.stop();
+            // 关掉 AI 后不能停在 AI 视图 / AI 指示条上
+            if self.settings.view == VIEW_AI {
+                self.settings.view = VIEW_SPEED.to_string();
+            }
+            if self.settings.gauge_source == GAUGE_AI {
+                self.settings.gauge_source = GAUGE_MEMORY.to_string();
+            }
+            self.ai_snapshot = AiSnapshot::default();
+            self.ai_speed_text = format_ai_speed(0.0);
+            self.ai_today_text = format_tokens(0);
+        }
+        self.settings.save();
+        self.refresh();
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    /// 采集哪些来源（OpenCode / dsh / WorkBuddy / WorkBuddy AI）
+    pub fn set_ai_sources(&mut self, flags: [bool; 4]) {
+        self.settings.ai_opencode = flags[0];
+        self.settings.ai_dsh = flags[1];
+        self.settings.ai_workbuddy = flags[2];
+        self.settings.ai_workbuddy_ai = flags[3];
+        self.ai.set_sources(sources_of(&self.settings));
+        self.settings.save();
+        self.refresh();
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    /// 改字号（百分比）：重建字体并重绘。
+    pub fn set_font_scale(&mut self, percent: i32) {        self.settings.font_scale = netspeed_core::settings::normalize_font_scale(percent);
+        self.settings.save();
+        self.fonts = Fonts::create(self.dpi, self.settings.font_scale);
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    /// 取消拖动定位，重新贴回任务栏
+    pub fn reset_anchor(&mut self) {
+        self.settings.panel_x = -1;
+        self.settings.panel_y = -1;
+        self.settings.save();
     }
 
     /// 改面板宽度：更新设置、保存、立刻改窗口尺寸并重绘。
@@ -232,73 +310,123 @@ impl Panel {
         self.up_text = format_speed(self.sample.up_bytes_per_sec);
         self.down_text = format_speed(self.sample.down_bytes_per_sec);
 
-        if self.settings.view == VIEW_MEMORY {
+        // 指示条盯内存时，即使当前视图不是内存视图也要采一次
+        let need_memory =
+            self.settings.view == VIEW_MEMORY || self.settings.gauge_source == GAUGE_MEMORY;
+        if need_memory {
             self.memory = read_memory();
             self.used_text = format_bytes_gb(self.memory.used_bytes());
             self.total_text = format_bytes_gb(self.memory.total_bytes);
-        } else if self.settings.view == VIEW_TEMPERATURE {
+        }
+
+        if self.settings.view == VIEW_TEMPERATURE {
             if self.temperatures.is_none() {
                 self.temperatures = Some(TemperatureMonitor::start());
             }
 
             if let Some(monitor) = self.temperatures.as_ref() {
                 let snapshot = monitor.read();
-                self.cpu_celsius = snapshot.cpu_celsius;
                 self.temp_text = append_watts(format_celsius(snapshot.cpu_celsius), f64::NAN);
                 self.temp_gpu_text =
                     append_watts(format_celsius(snapshot.gpu_celsius), snapshot.gpu_watts);
             }
         }
 
-        // AI 采集懒启动：只有 AI 视图或 AI 指示条才让后台线程读文件/数据库
-        let need_ai = self.settings.view == VIEW_AI || self.settings.gauge_source == GAUGE_AI;
-        self.ai.set_enabled(need_ai);
-        if need_ai {
+        // AI：设置里开着就一直采（常驻记录），关着就什么都不做
+        if self.settings.ai_enabled {
             self.ai_snapshot = self.ai.snapshot();
             self.ai_speed_text = format_ai_speed(self.ai_snapshot.speed);
             self.ai_today_text = format_tokens(self.ai_snapshot.today_output);
+        } else {
+            self.ai_snapshot = AiSnapshot::default();
+            self.ai_speed_text = format_ai_speed(0.0);
+            self.ai_today_text = format_tokens(0);
         }
 
-        self.gauge = self.compute_gauge();
+        self.gauge_target = self.compute_gauge();
+        if (self.gauge_target - self.gauge).abs() > 0.001 {
+            crate::request_anim(true);
+        }
+    }
+
+    /// 推进一帧指示条动画（缓动到目标值）；返回 true 表示还要下一帧。
+    pub fn animate(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let dt = now
+            .duration_since(self.last_anim)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.last_anim = now;
+
+        // 面板被藏起来（全屏程序 / 截图）就别白跑了，直接跳到目标值
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd) } == 0 {
+            self.gauge = self.gauge_target;
+            return false;
+        }
+
+        let diff = self.gauge_target - self.gauge;
+        if diff.abs() <= 0.002 {
+            if self.gauge != self.gauge_target {
+                self.gauge = self.gauge_target;
+                unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+            }
+            return false;
+        }
+
+        // 指数逼近：时间常数 120ms，小波动看起来是滑动而不是跳变
+        let factor = 1.0 - (-dt / 0.12).exp();
+        self.gauge += diff * factor;
+        unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+        true
+    }
+
+    /// 指示条当前代表的指标（给悬浮说明用）
+    pub fn gauge_hint(&self) -> String {
+        match self.settings.gauge_source.as_str() {
+            GAUGE_AI => format!("Token {} · 今日 {}", self.ai_speed_text, self.ai_today_text),
+            GAUGE_MEMORY => format!(
+                "内存 {:.0}%（{} / {}）",
+                self.memory.used_ratio() * 100.0,
+                self.used_text,
+                self.total_text
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// 指示条的悬浮热区（屏幕坐标）；指示条关掉时返回 None
+    pub fn gauge_hot_rect(&self) -> Option<RECT> {
+        if !self.settings.gauge_visible() {
+            return None;
+        }
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut rect);
+        }
+        // 底边往上 12px 都算「指着指示条」，比 3px 的条本身好点
+        let band = scale(self.dpi, 12);
+        if rect.bottom - rect.top <= band {
+            return None;
+        }
+        Some(RECT {
+            left: rect.left,
+            top: rect.bottom - band,
+            right: rect.right,
+            bottom: rect.bottom,
+        })
     }
 
     fn compute_gauge(&self) -> f32 {
-        let source = if self.settings.gauge_source == "view" {
-            match self.settings.view.as_str() {
-                VIEW_MEMORY => GAUGE_MEMORY,
-                VIEW_TEMPERATURE => GAUGE_CPU,
-                VIEW_AI => GAUGE_AI,
-                _ => GAUGE_SPEED,
-            }
-        } else {
-            self.settings.gauge_source.as_str()
-        };
-
-        match source {
-            GAUGE_SPEED => {
-                let bytes = self
-                    .sample
-                    .up_bytes_per_sec
-                    .max(self.sample.down_bytes_per_sec);
-                // 1KB/s → 0，100MB/s → 1，对数刻度
-                let floor = 1024.0_f64;
-                let ceiling = 100.0 * 1024.0 * 1024.0;
-                if bytes <= floor {
-                    0.0
-                } else {
-                    let ratio = (bytes / floor).ln() / (ceiling / floor).ln();
-                    (ratio as f32).clamp(0.0, 1.0)
-                }
-            }
-            GAUGE_MEMORY => self.memory.used_ratio(),
-            GAUGE_CPU => {
-                if self.cpu_celsius.is_finite() {
-                    (((self.cpu_celsius - 30.0) / 60.0) as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                }
-            }
-            GAUGE_AI => (self.ai_snapshot.speed / 50.0) as f32,
+        match self.settings.gauge_source.as_str() {
+            // 内存占用百分比
+            GAUGE_MEMORY => self.memory.used_ratio().clamp(0.0, 1.0),
+            // Token 速度：0 ~ 250 t/s 铺满整条
+            GAUGE_AI => (self.ai_snapshot.speed / 250.0).clamp(0.0, 1.0) as f32,
             _ => 0.0,
         }
     }
@@ -522,6 +650,16 @@ impl Panel {
             }
 
             let label_w = text_width(dc, label, label_font);
+            let value_w = text_width(dc, value, value_font);
+            if label_w + value_w + gap > available {
+                // 最小的一档还塞不下（字号调大 + 面板又窄）：按比例继续缩，
+                // 宁可字小一点也别被 DrawText 裁掉半截
+                let ratio = (available as f32 / (label_w + value_w + gap) as f32).clamp(0.6, 1.0);
+                let percent = self.settings.font_scale as f32 / 100.0;
+                let scale = self.dpi as f32 / 96.0;
+                label_font = crate::ui::font(9.5 * percent * ratio, 700, scale);
+                value_font = crate::ui::font(11.0 * percent * ratio, 400, scale);
+            }
             let font = SelectObject(dc, label_font as HGDIOBJ);
             SetTextColor(dc, color);
             draw_text(
@@ -704,6 +842,16 @@ pub fn scale(dpi: u32, value: i32) -> i32 {
     (value as f32 * dpi as f32 / 96.0).round() as i32
 }
 
+/// 设置里的四个来源开关 → 采集器的来源掩码
+fn sources_of(settings: &Settings) -> Sources {
+    Sources {
+        opencode: settings.ai_opencode,
+        dsh: settings.ai_dsh,
+        workbuddy: settings.ai_workbuddy,
+        workbuddy_ai: settings.ai_workbuddy_ai,
+    }
+}
+
 pub fn font_is_alive(font: HFONT) -> bool {
     !font.is_null()
 }
@@ -711,48 +859,73 @@ pub fn font_is_alive(font: HFONT) -> bool {
 // ---------------------------------------------------------------- AI 采集线程
 
 /// 采集放在后台线程：WorkBuddy 的 jsonl 首次解析要读几百 MB，不能卡 UI。
+///
+/// 只在设置里打开「AI 统计」时才真的起线程：关掉就立刻停，连文件都不读。
 struct AiWorker {
-    enabled: Arc<AtomicBool>,
+    sources: Sources,
     stop: Arc<AtomicBool>,
     snapshot: Arc<Mutex<AiSnapshot>>,
+    running: bool,
 }
 
 impl AiWorker {
-    fn new() -> Self {
-        let enabled = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let snapshot = Arc::new(Mutex::new(AiSnapshot::default()));
+    fn new(sources: Sources) -> Self {
+        Self {
+            sources,
+            stop: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(AiSnapshot::default())),
+            running: false,
+        }
+    }
 
-        let thread_enabled = Arc::clone(&enabled);
-        let thread_stop = Arc::clone(&stop);
-        let thread_snapshot = Arc::clone(&snapshot);
+    fn start(&mut self) {
+        if self.running || !self.sources.any() {
+            return;
+        }
+        // 每轮跑自己的 snapshot：老线程退出前写的是旧 Arc，不会污染新数据
+        self.snapshot = Arc::new(Mutex::new(AiSnapshot::default()));
+        self.stop = Arc::new(AtomicBool::new(false));
+
+        let stop = Arc::clone(&self.stop);
+        let snapshot = Arc::clone(&self.snapshot);
+        let sources = self.sources;
 
         std::thread::spawn(move || {
-            let mut engine = AiEngine::new();
-            while !thread_stop.load(Ordering::Relaxed) {
-                if thread_enabled.load(Ordering::Relaxed) {
-                    let now = netspeed_core::ai::now_ms();
-                    engine.poll(now);
-                    let next = engine.snapshot(now);
+            let mut engine = AiEngine::new(sources);
+            while !stop.load(Ordering::Relaxed) {
+                let now = netspeed_core::ai::now_ms();
+                engine.poll(now);
+                let next = engine.snapshot(now);
 
-                    if let Ok(mut slot) = thread_snapshot.lock() {
-                        *slot = next;
-                    }
+                if let Ok(mut slot) = snapshot.lock() {
+                    *slot = next;
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(700));
             }
         });
 
-        Self {
-            enabled,
-            stop,
-            snapshot,
-        }
+        self.running = true;
     }
 
-    fn set_enabled(&self, value: bool) {
-        self.enabled.store(value, Ordering::Relaxed);
+    fn stop(&mut self) {
+        if !self.running {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.running = false;
+        self.snapshot = Arc::new(Mutex::new(AiSnapshot::default()));
+    }
+
+    fn set_sources(&mut self, sources: Sources) {
+        if self.sources == sources {
+            return;
+        }
+        self.sources = sources;
+        if self.running {
+            self.stop();
+            self.start();
+        }
     }
 
     fn snapshot(&self) -> AiSnapshot {

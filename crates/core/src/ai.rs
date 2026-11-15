@@ -36,6 +36,30 @@ struct Response {
 /// 每个文件解析出来的响应（key = 来源内唯一 id）。
 type FileRows = Vec<(String, Response)>;
 
+/// 采集哪些来源：设置里关掉的来源连文件/数据库都不打开
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sources {
+    pub opencode: bool,
+    pub dsh: bool,
+    pub workbuddy: bool,
+    pub workbuddy_ai: bool,
+}
+
+impl Sources {
+    pub fn all() -> Self {
+        Self {
+            opencode: true,
+            dsh: true,
+            workbuddy: true,
+            workbuddy_ai: true,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.opencode || self.dsh || self.workbuddy || self.workbuddy_ai
+    }
+}
+
 // ---------------------------------------------------------------- 引擎
 
 pub struct AiEngine {
@@ -44,6 +68,7 @@ pub struct AiEngine {
     in_flight: i64,
     today_start: i64,
     today_output: i64,
+    sources: Sources,
     opencode: OpenCodeSource,
     dsh: FileSource,
     workbuddy: FileSource,
@@ -53,7 +78,7 @@ pub struct AiEngine {
 }
 
 impl AiEngine {
-    pub fn new() -> Self {
+    pub fn new(sources: Sources) -> Self {
         let home = home_dir();
         Self {
             responses: HashMap::new(),
@@ -61,6 +86,7 @@ impl AiEngine {
             in_flight: 0,
             today_start: 0,
             today_output: 0,
+            sources,
             opencode: OpenCodeSource::new(),
             dsh: FileSource::new(
                 home.join(".dsh").join("sessions"),
@@ -91,6 +117,9 @@ impl AiEngine {
 
     /// 采集一次（阻塞，调用方放在后台线程）。内部 2 秒节流。
     pub fn poll(&mut self, now_ms: i64) {
+        if !self.sources.any() {
+            return;
+        }
         let midnight = local_midnight_ms(now_ms);
         if midnight != self.today_start {
             self.today_start = midnight;
@@ -115,20 +144,28 @@ impl AiEngine {
         self.in_flight = 0;
 
         let t0 = std::time::Instant::now();
-        let opencode_rows = self.opencode.poll(now_ms, midnight);
-        let opencode_ms = t0.elapsed().as_millis();
-        for (key, response) in opencode_rows {
-            self.merge(key, response);
+        let mut file_rows = Vec::new();
+        if self.sources.opencode {
+            let opencode_rows = self.opencode.poll(now_ms, midnight);
+            let _opencode_ms = t0.elapsed().as_millis();
+            for (key, response) in opencode_rows {
+                self.merge(key, response);
+            }
         }
 
         let t1 = std::time::Instant::now();
-        let dsh_rows = self.dsh.poll(now_ms, midnight);
-        let workbuddy_rows = self.workbuddy.poll(now_ms, midnight);
-        let workbuddy_ai_rows = self.workbuddy_ai.poll(now_ms, midnight);
-        let files_ms = t1.elapsed().as_millis();
+        if self.sources.dsh {
+            file_rows.push(self.dsh.poll(now_ms, midnight));
+        }
+        if self.sources.workbuddy {
+            file_rows.push(self.workbuddy.poll(now_ms, midnight));
+        }
+        if self.sources.workbuddy_ai {
+            file_rows.push(self.workbuddy_ai.poll(now_ms, midnight));
+        }
+        let _files_ms = t1.elapsed().as_millis();
 
-
-        for result in [dsh_rows, workbuddy_rows, workbuddy_ai_rows] {
+        for result in file_rows {
             match result {
                 Ok(rows) => {
                     for (key, response) in rows {
@@ -245,7 +282,7 @@ impl AiEngine {
 
 impl Default for AiEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(Sources::all())
     }
 }
 

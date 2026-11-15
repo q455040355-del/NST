@@ -5,6 +5,7 @@
 #![windows_subsystem = "windows"]
 
 mod history_ui;
+mod hint;
 mod menu;
 mod ocr;
 mod ocr_ui;
@@ -33,7 +34,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, ReleaseCapture, SetCapture, MOD_CONTROL, MOD_SHIFT,
+    RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, MOD_CONTROL, MOD_SHIFT, TME_LEAVE,
+    TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use theme::wide;
@@ -43,6 +45,11 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
+const WM_APP_ANIM: u32 = WM_APP + 6;
+
+/// windows-sys 0.59 没导出 WM_MOUSELEAVE，自己补一个
+/// （不能省：漏了会变成变量绑定模式，把后面的消息分支全吃掉）
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const HOTKEY_SHOT: i32 = 1;
 const HOTKEY_OCR: i32 = 2;
 const TRAY_ID: u32 = 1;
@@ -57,6 +64,15 @@ static mut TASKBAR: HWND = std::ptr::null_mut();
 
 /// 用户从菜单里「隐藏面板」后不再自动显示（只有双击托盘才恢复）
 static mut HIDDEN_BY_USER: bool = false;
+
+/// 指示条动画是否在跑（ticker 线程看它决定推不推帧）
+static ANIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 是否已经向系统登记了 WM_MOUSELEAVE
+static mut TRACKING_LEAVE: bool = false;
+
+pub(crate) fn request_anim(active: bool) {
+    ANIM_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
 
 // 拖动面板（左键按住移动）：记起点和窗口原位，超过 3px 才算拖动
 static mut DRAG_ACTIVE: bool = false;
@@ -74,15 +90,13 @@ const ID_SPEED: usize = 1001;
 const ID_MEMORY: usize = 1002;
 const ID_TEMPERATURE: usize = 1003;
 const ID_AI: usize = 1004;
-const ID_GAUGE_VIEW: usize = 1101;
-const ID_GAUGE_SPEED: usize = 1102;
 const ID_GAUGE_MEMORY: usize = 1103;
-const ID_GAUGE_CPU: usize = 1104;
 const ID_GAUGE_AI: usize = 1105;
 const ID_GAUGE_NONE: usize = 1106;
 const ID_HISTORY: usize = 1300;
 const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
+const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
 const ID_OCR: usize = 1303;
 const ID_QUIT: usize = 1099;
@@ -170,13 +184,7 @@ fn main() {
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
-            settings_ui::open(
-                hwnd,
-                settings.panel_width,
-                &settings.gauge_source,
-                &settings.network_interface,
-                settings.refresh_ms,
-            );
+            settings_ui::open(hwnd, &settings);
         }
         if std::env::args().any(|arg| arg == "--history") {
             history_ui::open(hwnd);
@@ -403,15 +411,27 @@ fn fullscreen_foreground() -> bool {
 
 fn start_ticker(hwnd: HWND) {
     let handle = hwnd as usize;
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        unsafe {
-            let target = handle as HWND;
-            if IsWindow(target) == 0 {
-                break;
-            }
-            if PostMessageW(target, WM_APP_TICK, 0, 0) == 0 {
-                break;
+    std::thread::spawn(move || {
+        // 采样还是 500ms 一次；指示条动画在跑的时候按 ~60fps 推帧。
+        // （本进程 SetTimer/WM_TIMER 实测完全收不到，只能靠线程投递。）
+        let mut last_tick = std::time::Instant::now();
+        loop {
+            let animating = ANIM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(if animating { 16 } else { 50 }));
+            unsafe {
+                let target = handle as HWND;
+                if IsWindow(target) == 0 {
+                    break;
+                }
+                if animating && PostMessageW(target, WM_APP_ANIM, 0, 0) == 0 {
+                    break;
+                }
+                if last_tick.elapsed().as_millis() >= 500 {
+                    last_tick = std::time::Instant::now();
+                    if PostMessageW(target, WM_APP_TICK, 0, 0) == 0 {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -471,6 +491,11 @@ unsafe extern "system" fn wnd_proc(
                     update_tray(hwnd, &tip);
                 }
             }
+
+            // 悬浮说明开着就顺手刷一下数值（不动鼠标也能看到最新值）
+            if hint::visible() {
+                update_gauge_hint(hwnd);
+            }
             0
         }
         WM_APP_TRAY => {
@@ -520,6 +545,7 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONDOWN => {
+            hint::hide();
             // 拖面板挪位置：按下先记起点，移动超过 3px 才算拖动，否则松手还是切视图
             let mut cursor = POINT { x: 0, y: 0 };
             GetCursorPos(&mut cursor);
@@ -538,9 +564,13 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_MOUSEMOVE => {
+            // 鼠标停在底部指示条上 → 弹个说明
             if !DRAG_ACTIVE {
+                track_mouse_leave(hwnd);
+                update_gauge_hint(hwnd);
                 return 0;
             }
+            update_gauge_hint(hwnd);
             let mut cursor = POINT { x: 0, y: 0 };
             GetCursorPos(&mut cursor);
             let dx = cursor.x - DRAG_FROM.x;
@@ -596,8 +626,15 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_MOUSELEAVE => {
+            unsafe {
+                TRACKING_LEAVE = false;
+            }
+            hint::hide();
+            0
+        }
         WM_RBUTTONDOWN => {
-
+            hint::hide();
             PostMessageW(hwnd, WM_APP_SHOW_MENU, 0, 0);
             0
         }
@@ -605,6 +642,16 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_SHOW_MENU => {
 
             show_menu(hwnd);
+            0
+        }
+        WM_APP_ANIM => {
+            let mut keep = false;
+            if let Some(panel) = panel_mut(hwnd) {
+                keep = panel.animate();
+            }
+            if !keep {
+                request_anim(false);
+            }
             0
         }
         msg if msg == menu::WM_APP_MENU_PICK => {
@@ -633,6 +680,7 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_DESTROY => {
+            hint::hide();
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Panel;
             if !ptr.is_null() {
                 drop(Box::from_raw(ptr));
@@ -653,38 +701,96 @@ fn panel_mut(hwnd: HWND) -> Option<&'static mut Panel> {
     }
 }
 
+/// 登记 WM_MOUSELEAVE：鼠标移出面板时才能把悬浮说明收掉
+fn track_mouse_leave(hwnd: HWND) {
+    unsafe {
+        if TRACKING_LEAVE {
+            return;
+        }
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        if TrackMouseEvent(&mut track) != 0 {
+            TRACKING_LEAVE = true;
+        }
+    }
+}
+
+/// 光标在指示条上就弹说明，离开就收掉
+fn update_gauge_hint(hwnd: HWND) {
+    let Some(panel) = panel_mut(hwnd) else {
+        return;
+    };
+    if unsafe { HIDDEN_BY_USER } || unsafe { IsWindowVisible(hwnd) } == 0 {
+        hint::hide();
+        return;
+    }
+
+    let Some(zone) = panel.gauge_hot_rect() else {
+        hint::hide();
+        return;
+    };
+
+    let cursor = hint::cursor();
+    let inside = cursor.x >= zone.left
+        && cursor.x < zone.right
+        && cursor.y >= zone.top
+        && cursor.y < zone.bottom;
+    if !inside {
+        hint::hide();
+        return;
+    }
+
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetWindowRect(hwnd, &mut frame) };
+    let text = panel.gauge_hint();
+    unsafe { hint::show(frame, &text) };
+}
+
 fn show_menu(hwnd: HWND) {
+    hint::hide();
     let Some(panel) = panel_mut(hwnd) else {
         return;
     };
 
     let view = panel.view().to_string();
     let gauge = panel.gauge_source().to_string();
+    let ai = panel.settings.ai_enabled;
 
-    let rows = vec![
+    let mut rows = vec![
         menu::Entry::header("面板显示"),
         menu::Entry::checked(ID_SPEED, "网速", view == "speed"),
         menu::Entry::checked(ID_MEMORY, "内存", view == "memory"),
         menu::Entry::checked(ID_TEMPERATURE, "温度", view == "temperature"),
-        menu::Entry::checked(ID_AI, "AI 速度", view == "ai"),
-        menu::Entry::separator(),
-        menu::Entry::header("底部指示条"),
-        menu::Entry::indented(ID_GAUGE_VIEW, "跟随当前视图", gauge == "view"),
-        menu::Entry::indented(ID_GAUGE_SPEED, "网速", gauge == "speed"),
-        menu::Entry::indented(ID_GAUGE_MEMORY, "内存占用", gauge == "mem"),
-        menu::Entry::indented(ID_GAUGE_CPU, "CPU 温度", gauge == "cpu"),
-        menu::Entry::indented(ID_GAUGE_AI, "AI 速度", gauge == "ai"),
-        menu::Entry::indented(ID_GAUGE_NONE, "关闭", gauge == "none"),
-        menu::Entry::separator(),
-        menu::Entry::item(ID_HISTORY, "Token 用量历史…"),
-        menu::Entry::item(ID_SETTINGS, "设置…"),
-        menu::Entry::separator(),
-        menu::Entry::hotkey(ID_SHOT, "截图…", "Ctrl+Shift+A"),
-        menu::Entry::hotkey(ID_OCR, "取字…", "Ctrl+Shift+O"),
-        menu::Entry::separator(),
-        menu::Entry::item(ID_PANEL_HIDE, "隐藏面板"),
-        menu::Entry::item(ID_QUIT, "退出"),
     ];
+    if ai {
+        rows.push(menu::Entry::checked(ID_AI, "AI 速度", view == "ai"));
+    }
+    rows.push(menu::Entry::separator());
+    rows.push(menu::Entry::header("底部指示条"));
+    rows.push(menu::Entry::radio(ID_GAUGE_MEMORY, "内存占用", gauge == "mem"));
+    if ai {
+        rows.push(menu::Entry::radio(ID_GAUGE_AI, "Token 速度", gauge == "ai"));
+    }
+    rows.push(menu::Entry::radio(ID_GAUGE_NONE, "关闭", gauge == "none"));
+    rows.push(menu::Entry::separator());
+    rows.push(menu::Entry::item(ID_HISTORY, "Token 用量历史…"));
+    rows.push(menu::Entry::item(ID_SETTINGS, "设置…"));
+    rows.push(menu::Entry::separator());
+    rows.push(menu::Entry::hotkey(ID_SHOT, "截图…", "Ctrl+Shift+A"));
+    rows.push(menu::Entry::hotkey(ID_OCR, "取字…", "Ctrl+Shift+O"));
+    rows.push(menu::Entry::separator());
+    rows.push(menu::Entry::item(ID_PANEL_SNAP, "吸附到任务栏"));
+    rows.push(menu::Entry::item(ID_PANEL_HIDE, "隐藏面板"));
+    rows.push(menu::Entry::item(ID_QUIT, "退出"));
 
     unsafe {
         menu::open(hwnd, rows);
@@ -702,27 +808,27 @@ fn handle_command(hwnd: HWND, command: usize) {
             ID_MEMORY => panel.set_view("memory"),
             ID_TEMPERATURE => panel.set_view("temperature"),
             ID_AI => panel.set_view("ai"),
-            ID_GAUGE_VIEW => panel.set_gauge("view"),
-            ID_GAUGE_SPEED => panel.set_gauge("speed"),
             ID_GAUGE_MEMORY => panel.set_gauge("mem"),
-            ID_GAUGE_CPU => panel.set_gauge("cpu"),
             ID_GAUGE_AI => panel.set_gauge("ai"),
             ID_GAUGE_NONE => panel.set_gauge("none"),
             ID_HISTORY => {
                 history_ui::open(hwnd);
             }
             ID_SETTINGS => {
-                let width = panel.settings.panel_width;
-                let gauge = panel.settings.gauge_source.clone();
-                let interface = panel.settings.network_interface.clone();
-                let refresh_ms = panel.settings.refresh_ms;
-                settings_ui::open(hwnd, width, &gauge, &interface, refresh_ms);
+                let settings = panel.settings.clone();
+                settings_ui::open(hwnd, &settings);
             }
             ID_SHOT => {
                 shot::request(hwnd);
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);
+            }
+            ID_PANEL_SNAP => {
+                panel.reset_anchor();
+                let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+                position_panel(hwnd, taskbar, panel.desired_width(), panel.height());
+                keep_on_top(hwnd);
             }
             ID_PANEL_HIDE => {
                 HIDDEN_BY_USER = true;
@@ -800,6 +906,15 @@ pub(crate) fn apply_panel_width(parent: HWND, width: i32) {
     }
 }
 
+/// 设置里改字号：重建面板字体，并按新宽度重新贴任务栏。
+pub(crate) fn apply_font_scale(parent: HWND, percent: i32) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.set_font_scale(percent);
+        let taskbar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        position_panel(parent, taskbar, panel.desired_width(), panel.height());
+    }
+}
+
 pub(crate) fn apply_network_interface(parent: HWND, interface: &str) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_network_interface(interface);
@@ -816,6 +931,20 @@ pub(crate) fn apply_refresh_ms(parent: HWND, ms: i32) {
 pub(crate) fn apply_gauge(parent: HWND, source: &str) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_gauge(source);
+    }
+}
+
+/// 设置里打开/关闭 AI 统计：开了常驻采集，关了立刻停线程。
+pub(crate) fn apply_ai_enabled(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.set_ai_enabled(enabled);
+    }
+}
+
+/// 设置里勾选的 AI 来源（OpenCode / dsh / WorkBuddy / WorkBuddy AI）。
+pub(crate) fn apply_ai_sources(parent: HWND, flags: [bool; 4]) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.set_ai_sources(flags);
     }
 }
 

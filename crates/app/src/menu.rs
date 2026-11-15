@@ -1,7 +1,7 @@
 //! 自绘右键菜单（替换系统 TrackPopupMenu）。
 //!
-//! 一行一个条目，支持：分组标题、分隔线、缩进、勾选、右侧快捷键；
-//! 悬停高亮、↑↓ 移动、Enter 选中、Esc / 点外面关闭。
+//! 一行一个条目：分组标题 / 分隔线 / 勾选 / 单选圆点 / 右侧快捷键。
+//! 悬停高亮、↑↓ 移动、Enter 选中、Esc 或点外面关闭。
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -12,11 +12,21 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
-use crate::ui::{self, font, Painter, ACCENT, BORDER, CHIP, DT_LEFT, DT_RIGHT, SURFACE, TEXT, TEXT2, TEXT3};
+use crate::ui::{
+    self, font, mix_white, Painter, ACCENT, BORDER, CHIP, DT_LEFT, DT_RIGHT, SURFACE, TEXT, TEXT3,
+};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Menu";
 
 pub const WM_APP_MENU_PICK: u32 = WM_APP + 0x41;
+
+/// 左侧标记列画什么
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    None,
+    Check,
+    Radio,
+}
 
 pub enum Kind {
     Separator,
@@ -25,8 +35,9 @@ pub enum Kind {
         id: usize,
         label: &'static str,
         shortcut: &'static str,
-        checked: bool,
-        indent: bool,
+        mark: Mark,
+        /// 勾上 / 选中
+        on: bool,
     },
 }
 
@@ -41,32 +52,33 @@ impl Entry {
                 id,
                 label,
                 shortcut: "",
-                checked: false,
-                indent: false,
+                mark: Mark::None,
+                on: false,
             },
         }
     }
 
-    pub fn checked(id: usize, label: &'static str, checked: bool) -> Self {
+    pub fn checked(id: usize, label: &'static str, on: bool) -> Self {
         Self {
             kind: Kind::Item {
                 id,
                 label,
                 shortcut: "",
-                checked,
-                indent: false,
+                mark: Mark::Check,
+                on,
             },
         }
     }
 
-    pub fn indented(id: usize, label: &'static str, checked: bool) -> Self {
+    /// 单选（底部指示条那种「多选一」）
+    pub fn radio(id: usize, label: &'static str, on: bool) -> Self {
         Self {
             kind: Kind::Item {
                 id,
                 label,
                 shortcut: "",
-                checked,
-                indent: true,
+                mark: Mark::Radio,
+                on,
             },
         }
     }
@@ -77,8 +89,8 @@ impl Entry {
                 id,
                 label,
                 shortcut,
-                checked: false,
-                indent: false,
+                mark: Mark::None,
+                on: false,
             },
         }
     }
@@ -100,18 +112,18 @@ struct State {
     owner: HWND,
     rows: Vec<Entry>,
     hover: Option<usize>,
-    width: i32,
-    height: i32,
     scale: f32,
-    /// 每个可点条目的矩形（index 是 rows 下标）
     hit: Vec<(usize, RECT)>,
 }
 
-const ITEM_H: f32 = 32.0;
-const HEADER_H: f32 = 28.0;
+// 排版：行更高一点会显得空，30 刚好；标题和分隔线都比条目矮
+const ITEM_H: f32 = 30.0;
+const HEADER_H: f32 = 26.0;
 const SEP_H: f32 = 9.0;
 const PAD: f32 = 6.0;
-const CHECK_COL: f32 = 20.0;
+/// 左侧标记列宽（勾 / 圆点）
+const MARK_COL: f32 = 20.0;
+const TEXT_GAP: f32 = 8.0;
 
 fn state_of(hwnd: HWND) -> *mut State {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State }
@@ -136,7 +148,9 @@ unsafe fn measure(rows: &[Entry], scale: f32) -> (i32, i32, Vec<(usize, RECT)>) 
     let mut header_w = 0;
     for entry in rows {
         match &entry.kind {
-            Kind::Item { label, shortcut, .. } => {
+            Kind::Item {
+                label, shortcut, ..
+            } => {
                 label_w = label_w.max(p.text_width(label, label_font));
                 if !shortcut.is_empty() {
                     shortcut_w = shortcut_w.max(p.text_width(shortcut, shortcut_font));
@@ -148,15 +162,15 @@ unsafe fn measure(rows: &[Entry], scale: f32) -> (i32, i32, Vec<(usize, RECT)>) 
     }
     ReleaseDC(std::ptr::null_mut(), screen);
 
-    let check_w = ui::s(CHECK_COL + 6.0, scale);
+    let mark_w = ui::s(MARK_COL + TEXT_GAP, scale);
     let side = ui::s(14.0, scale);
     let gap = if shortcut_w > 0 {
-        ui::s(28.0, scale)
+        ui::s(26.0, scale)
     } else {
         0
     };
-    let width = (check_w + label_w.max(header_w) + shortcut_w + gap + side * 2)
-        .max(ui::s(196.0, scale));
+    let width = (mark_w + label_w.max(header_w) + shortcut_w + gap + side * 2)
+        .max(ui::s(188.0, scale));
 
     let mut y = ui::s(PAD, scale);
     let mut hit = Vec::new();
@@ -217,6 +231,11 @@ unsafe fn paint(hwnd: HWND) {
     let header_font = font(9.0, 600, state.scale);
     let shortcut_font = font(9.0, 400, state.scale);
 
+    // 所有条目的文字都从这一列开始（不再因为缩进对不齐）
+    let mark_x = p.s(PAD + 8.0);
+    let mark_w = p.s(MARK_COL);
+    let label_left = mark_x + mark_w + p.s(TEXT_GAP);
+
     let mut y = p.s(PAD);
     for (index, entry) in state.rows.iter().enumerate() {
         match &entry.kind {
@@ -227,7 +246,7 @@ unsafe fn paint(hwnd: HWND) {
                     mid,
                     client.right - p.s(10.0),
                     mid + 1,
-                    ui::mix_white(BORDER, 0.25),
+                    mix_white(BORDER, 0.25),
                 );
                 y += p.s(SEP_H);
             }
@@ -236,7 +255,7 @@ unsafe fn paint(hwnd: HWND) {
                     text,
                     header_font,
                     TEXT3,
-                    p.s(14.0),
+                    mark_x,
                     y,
                     client.right - p.s(12.0),
                     y + p.s(HEADER_H),
@@ -247,12 +266,13 @@ unsafe fn paint(hwnd: HWND) {
             Kind::Item {
                 label,
                 shortcut,
-                checked,
-                indent,
+                mark,
+                on,
                 ..
             } => {
                 let top = y + p.s(1.0);
                 let bottom = y + p.s(ITEM_H) - p.s(1.0);
+                let mid_y = (top + bottom) / 2;
 
                 if state.hover == Some(index) {
                     p.round(
@@ -266,27 +286,36 @@ unsafe fn paint(hwnd: HWND) {
                     );
                 }
 
-                if *checked {
-                    let ax = p.s(16.0);
-                    let ay = (top + bottom) / 2;
-                    p.line(ax, ay, ax + p.s(4.0), ay + p.s(4.0), ACCENT, p.s(1.8));
-                    p.line(
-                        ax + p.s(4.0),
-                        ay + p.s(4.0),
-                        ax + p.s(11.0),
-                        ay - p.s(5.0),
-                        ACCENT,
-                        p.s(1.8),
-                    );
+                match mark {
+                    Mark::Check if *on => {
+                        let ax = mark_x + p.s(2.0);
+                        p.line(ax, mid_y, ax + p.s(4.0), mid_y + p.s(4.0), ACCENT, p.s(1.8));
+                        p.line(
+                            ax + p.s(4.0),
+                            mid_y + p.s(4.0),
+                            ax + p.s(11.0),
+                            mid_y - p.s(5.0),
+                            ACCENT,
+                            p.s(1.8),
+                        );
+                    }
+                    Mark::Radio => {
+                        let cx = mark_x + mark_w / 2;
+                        if *on {
+                            p.circle(cx, mid_y, p.s(5.0), SURFACE, ACCENT);
+                            p.circle(cx, mid_y, p.s(2.5), ACCENT, ACCENT);
+                        } else {
+                            p.circle(cx, mid_y, p.s(5.0), SURFACE, mix_white(TEXT3, 0.25));
+                        }
+                    }
+                    _ => {}
                 }
 
-                let text_left = if *indent { p.s(16.0) } else { 0 };
-                let left = p.s(32.0) + text_left;
                 p.text(
                     label,
                     label_font,
                     TEXT,
-                    left,
+                    label_left,
                     top,
                     client.right - p.s(12.0),
                     bottom,
@@ -315,7 +344,6 @@ unsafe fn paint(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     BitBlt(hdc, 0, 0, client.right, client.bottom, dib.dc, 0, 0, SRCCOPY);
     EndPaint(hwnd, &mut ps);
-
 }
 
 unsafe extern "system" fn menu_proc(
@@ -365,7 +393,6 @@ unsafe extern "system" fn menu_proc(
                     x: (lparam as i32) & 0xFFFF,
                     y: ((lparam as i32) >> 16) & 0xFFFF,
                 };
-                let mut inside = false;
                 let mut picked = None;
                 for (index, rect) in &state.hit {
                     if point.x >= rect.left
@@ -373,12 +400,10 @@ unsafe extern "system" fn menu_proc(
                         && point.y >= rect.top
                         && point.y < rect.bottom
                     {
-                        inside = true;
                         picked = item_id(&state.rows[*index]);
                         break;
                     }
                 }
-                let _ = inside;
                 if let Some(id) = picked {
                     PostMessageW(state.owner, WM_APP_MENU_PICK, id, 0);
                 }
@@ -441,9 +466,6 @@ unsafe extern "system" fn menu_proc(
             let state = state_of(hwnd);
             if !state.is_null() {
                 let state = Box::from_raw(state);
-                if state.owner.is_null() {
-                    // 没有 owner 就没什么要通知的
-                }
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(state);
             }
@@ -500,8 +522,6 @@ pub unsafe fn open(owner: HWND, rows: Vec<Entry>) {
         owner,
         rows,
         hover: None,
-        width,
-        height,
         scale,
         hit,
     }));
@@ -535,48 +555,8 @@ pub unsafe fn open(owner: HWND, rows: Vec<Entry>) {
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
-pub fn is_open() -> bool {
-    unsafe {
-        let mut found: HWND = std::ptr::null_mut();
-        // 遍历当前线程的窗口找菜单
-        EnumThreadWindows(
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-            Some(enum_menu),
-            &mut found as *mut HWND as isize,
-        );
-        !found.is_null()
-    }
-}
-
-unsafe extern "system" fn enum_menu(hwnd: HWND, lparam: LPARAM) -> i32 {
-    let mut class = [0u16; 128];
-    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
-    if length > 0 && String::from_utf16_lossy(&class[..length as usize]) == CLASS_NAME {
-        *(lparam as *mut HWND) = hwnd;
-        return 0;
-    }
-    1
-}
-
-/// 关闭当前菜单（窗口失活、按 Esc 之类）
-pub fn close_all() {
-    unsafe {
-        let mut found: HWND = std::ptr::null_mut();
-        EnumThreadWindows(
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-            Some(enum_menu),
-            &mut found as *mut HWND as isize,
-        );
-        if !found.is_null() {
-            ReleaseCapture();
-            DestroyWindow(found);
-        }
-    }
-}
-
 pub fn release() {
     unsafe {
         ReleaseCapture();
     }
 }
-

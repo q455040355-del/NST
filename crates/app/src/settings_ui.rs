@@ -22,6 +22,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
+use netspeed_core::settings::Settings;
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Settings";
 const POPUP_CLASS: &str = "NetSpeedTaskbarRs.Settings.Popup";
@@ -38,6 +39,7 @@ const SURFACE: u32 = 0x00FF_FFFF;
 const BORDER: u32 = 0x00EF_EAE8; // #E8EAEF
 const TEXT: u32 = 0x001A_1614; // #14161A
 const TEXT2: u32 = 0x0080_726B; // #6B7280
+const TEXT3: u32 = 0x00AF_A39A; // #9AA3AF
 const CHIP: u32 = 0x00F3_F1EF;
 const CHIP_HOVER: u32 = 0x00FE_F7F2; // 悬停时略暖一点
 const ACCENT: u32 = 0x00E4_6F_2F; // #2F6FE4 蓝（COLORREF 倒序）
@@ -47,23 +49,32 @@ const ID_WIDTH_LABEL: usize = 2001;
 const ID_GAUGE_LABEL: usize = 2004;
 const ID_INTERFACE_LABEL: usize = 2007;
 const ID_REFRESH_LABEL: usize = 2009;
+const ID_FONT_LABEL: usize = 2011;
 
-const GAUGE_OPTIONS: [(&str, &str); 6] = [
-    ("跟随当前视图", "view"),
-    ("网速", "speed"),
+/// 面板字号（显示文案, 百分比）
+const FONT_OPTIONS: [(&str, i32); 4] = [("小", 90), ("标准", 100), ("大", 110), ("特大", 125)];
+
+const GAUGE_OPTIONS: [(&str, &str); 3] = [
     ("内存占用", "mem"),
-    ("CPU 温度", "cpu"),
-    ("AI 速度", "ai"),
+    ("Token 速度", "ai"),
     ("关闭", "none"),
 ];
 
 /// 面板刷新间隔（显示文案, 毫秒）
 const REFRESH_OPTIONS: [(&str, i32); 3] = [("0.5 秒", 500), ("1 秒", 1000), ("2 秒", 2000)];
 
-const ROW_COUNT: usize = 4;
+const ROW_COUNT: usize = 5;
 const ROW_FIRST: f32 = 84.0;
 const ROW_STEP: f32 = 62.0;
 const CONTROL_X: f32 = 178.0;
+
+// AI 区块（在 5 个基础行下面）
+const AI_HEAD_TOP: f32 = 396.0; // 分隔线
+const AI_TITLE_TOP: f32 = 402.0; // 「AI 统计」小标题
+const AI_TOGGLE_TOP: f32 = 428.0; // 总开关行
+const AI_SOURCES_TOP: f32 = 470.0; // 四个来源行起点
+const AI_ROW_H: f32 = 42.0;
+const AI_SOURCE_LABELS: [&str; 4] = ["OpenCode", "dsh", "WorkBuddy", "WorkBuddy AI"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
@@ -71,6 +82,8 @@ enum Hit {
     Done,
     Slider,
     Select(usize),
+    AiToggle,
+    AiSource(usize),
 }
 
 struct Fonts {
@@ -298,6 +311,9 @@ struct State {
     gauge: usize,
     interface: usize,
     refresh: usize,
+    font: usize,
+    ai_enabled: bool,
+    ai_sources: [bool; 4],
     fonts: Fonts,
     scale: f32,
     hover: Option<Hit>,
@@ -310,7 +326,10 @@ struct Layout {
     done: RECT,
     /// 滑杆的点击区域（比视觉上的轨道高，好点）
     slider: RECT,
-    selects: [RECT; 3],
+    /// 四个下拉：0 = 字号、1 = 指示条、2 = 网卡、3 = 刷新（行号 = 下标 + 1）
+    selects: [RECT; 4],
+    ai_toggle: RECT,
+    ai_sources: [RECT; 4],
 }
 
 fn layout(state: &State, client: RECT) -> Layout {
@@ -340,11 +359,12 @@ fn layout(state: &State, client: RECT) -> Layout {
         s(ROW_FIRST + ROW_STEP * index as f32, scale) + s(ROW_STEP * 0.5 - 6.0, scale)
     };
 
+    // 第 0 行是字号（下拉），滑杆停在原来的位置（第 1 行）
     let slider = RECT {
         left: control_left,
-        top: row_center(0) - s(14.0, scale),
+        top: row_center(1) - s(14.0, scale),
         right: right - s(96.0, scale),
-        bottom: row_center(0) + s(14.0, scale),
+        bottom: row_center(1) + s(14.0, scale),
     };
 
     let mut selects = [RECT {
@@ -352,10 +372,12 @@ fn layout(state: &State, client: RECT) -> Layout {
         top: 0,
         right: 0,
         bottom: 0,
-    }; 3];
+    }; 4];
+    // 字号占第 0 行，其余三个接着往下摆（跳过滑杆那一行）
+    let rows = [0usize, 2, 3, 4];
     let height = s(32.0, scale);
-    for (index, slot) in selects.iter_mut().enumerate() {
-        let center = row_center(index + 1);
+    for (slot, row) in selects.iter_mut().zip(rows) {
+        let center = row_center(row);
         *slot = RECT {
             left: control_left,
             top: center - height / 2,
@@ -369,7 +391,33 @@ fn layout(state: &State, client: RECT) -> Layout {
         done,
         slider,
         selects,
+        ai_toggle: RECT {
+            left: s(12.0, scale),
+            top: s(AI_TOGGLE_TOP, scale),
+            right,
+            bottom: s(AI_TOGGLE_TOP + AI_ROW_H, scale),
+        },
+        ai_sources: ai_source_rects(scale, right),
     }
+}
+
+fn ai_source_rects(scale: f32, right: i32) -> [RECT; 4] {
+    let mut rects = [RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    }; 4];
+    for (index, slot) in rects.iter_mut().enumerate() {
+        let top = s(AI_SOURCES_TOP + AI_ROW_H * index as f32, scale);
+        *slot = RECT {
+            left: s(12.0, scale),
+            top,
+            right,
+            bottom: top + s(AI_ROW_H, scale),
+        };
+    }
+    rects
 }
 
 fn contains(rect: &RECT, point: POINT) -> bool {
@@ -382,13 +430,17 @@ fn state_of(hwnd: HWND) -> *mut State {
 
 fn text_of_row(state: &State, row: usize) -> String {
     match row {
-        0 => format!("{} px", state.width),
-        1 => GAUGE_OPTIONS
+        1 => FONT_OPTIONS
+            .get(state.font)
+            .map(|(label, _)| *label)
+            .unwrap_or("标准")
+            .to_string(),
+        2 => GAUGE_OPTIONS
             .get(state.gauge)
             .map(|(label, _)| *label)
-            .unwrap_or("跟随当前视图")
+            .unwrap_or("内存占用")
             .to_string(),
-        2 => {
+        3 => {
             if state.interface == 0 {
                 "自动（全部合计）".to_string()
             } else {
@@ -409,6 +461,7 @@ fn text_of_row(state: &State, row: usize) -> String {
 
 fn row_label(row: usize) -> &'static str {
     match row {
+        ID_FONT_LABEL => "字号",
         ID_WIDTH_LABEL => "面板宽度",
         ID_GAUGE_LABEL => "底部指示条",
         ID_INTERFACE_LABEL => "网卡",
@@ -504,9 +557,10 @@ unsafe fn paint(hwnd: HWND) {
         let center = (top + bottom) / 2 - p.s(6.0);
 
         let label = match row {
-            0 => row_label(ID_WIDTH_LABEL),
-            1 => row_label(ID_GAUGE_LABEL),
-            2 => row_label(ID_INTERFACE_LABEL),
+            0 => row_label(ID_FONT_LABEL),
+            1 => row_label(ID_WIDTH_LABEL),
+            2 => row_label(ID_GAUGE_LABEL),
+            3 => row_label(ID_INTERFACE_LABEL),
             _ => row_label(ID_REFRESH_LABEL),
         };
         p.text(
@@ -584,9 +638,10 @@ unsafe fn paint(hwnd: HWND) {
         );
     }
 
-    // 三个下拉
-    for row in 1..ROW_COUNT {
-        let rect = l.selects[row - 1];
+    // 四个下拉（字号 / 指示条 / 网卡 / 刷新）
+    for (index, slot) in l.selects.iter().enumerate() {
+        let rect = *slot;
+        let row = index + 1;
         let hovered = state.hover == Some(Hit::Select(row));
         let open = state.popup != std::ptr::null_mut();
         let fill = if hovered || open {
@@ -623,9 +678,155 @@ unsafe fn paint(hwnd: HWND) {
         p.line(ax + step, ay + step, ax + step * 2, ay, TEXT2, p.s(1.4));
     }
 
+    // ---------------------------------------------------------------- AI 统计
+    p.fill(
+        0,
+        p.s(AI_HEAD_TOP),
+        client.right,
+        p.s(AI_HEAD_TOP) + 1,
+        BORDER,
+    );
+    p.text(
+        "AI 统计",
+        state.fonts.small,
+        TEXT3,
+        pad + p.s(4.0),
+        p.s(AI_TITLE_TOP),
+        content_right,
+        p.s(AI_TITLE_TOP + 20.0),
+        DT_LEFT,
+    );
+
+    let toggle = l.ai_toggle;
+    let mid = (toggle.top + toggle.bottom) / 2;
+    if state.hover == Some(Hit::AiToggle) {
+        p.round(
+            toggle.left,
+            toggle.top + p.s(1.0),
+            content_right,
+            toggle.bottom - p.s(1.0),
+            p.s(8.0),
+            CHIP,
+            CHIP,
+        );
+    }
+    p.text(
+        "启用 AI 统计",
+        state.fonts.label,
+        TEXT,
+        pad + p.s(4.0),
+        toggle.top,
+        toggle.right - p.s(70.0),
+        toggle.top + p.s(22.0),
+        DT_LEFT,
+    );
+    p.text(
+        if state.ai_enabled {
+            "常驻采集：停在别的视图也在累计"
+        } else {
+            "关闭时不起线程、不读任何会话文件"
+        },
+        state.fonts.small,
+        TEXT3,
+        pad + p.s(4.0),
+        mid,
+        toggle.right - p.s(70.0),
+        toggle.bottom,
+        DT_LEFT,
+    );
+
+    // 开关本体
+    let sw_w = p.s(40.0);
+    let sw_h = p.s(22.0);
+    let sx = content_right - sw_w;
+    let sy = mid - sw_h / 2;
+    if state.ai_enabled {
+        p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, ACCENT, ACCENT);
+        p.circle(
+            sx + sw_w - sw_h / 2,
+            mid,
+            sw_h / 2 - p.s(3.0),
+            SURFACE,
+            SURFACE,
+        );
+    } else {
+        p.round(
+            sx,
+            sy,
+            sx + sw_w,
+            sy + sw_h,
+            sw_h,
+            CHIP,
+            mix_white(BORDER, 0.05),
+        );
+        p.circle(
+            sx + sw_h / 2,
+            mid,
+            sw_h / 2 - p.s(3.0),
+            SURFACE,
+            mix_white(BORDER, 0.05),
+        );
+    }
+
+    // 四个来源
+    for (index, slot) in l.ai_sources.iter().enumerate() {
+        let rect = *slot;
+        let on = state.ai_sources[index];
+        if state.ai_enabled && state.hover == Some(Hit::AiSource(index)) {
+            p.round(
+                rect.left,
+                rect.top + p.s(1.0),
+                content_right,
+                rect.bottom - p.s(1.0),
+                p.s(7.0),
+                CHIP,
+                CHIP,
+            );
+        }
+        p.text(
+            AI_SOURCE_LABELS[index],
+            state.fonts.value,
+            if state.ai_enabled { TEXT } else { TEXT3 },
+            pad + p.s(16.0),
+            rect.top,
+            rect.right - p.s(44.0),
+            rect.bottom,
+            DT_LEFT,
+        );
+
+        let size = p.s(16.0);
+        let bx = content_right - size;
+        let by = (rect.top + rect.bottom) / 2 - size / 2;
+        let (fill, border) = if !state.ai_enabled {
+            (SURFACE, mix_white(BORDER, 0.25))
+        } else if on {
+            (ACCENT, ACCENT)
+        } else {
+            (SURFACE, mix_white(BORDER, 0.05))
+        };
+        p.round(bx, by, bx + size, by + size, p.s(4.0), fill, border);
+        if on && state.ai_enabled {
+            p.line(
+                bx + p.s(4.0),
+                by + p.s(8.0),
+                bx + p.s(7.0),
+                by + p.s(11.0),
+                SURFACE,
+                p.s(1.6),
+            );
+            p.line(
+                bx + p.s(7.0),
+                by + p.s(11.0),
+                bx + p.s(12.0),
+                by + p.s(5.0),
+                SURFACE,
+                p.s(1.6),
+            );
+        }
+    }
+
     // 底部分割线
-    let foot_top = client.bottom - p.s(64.0);
-    p.fill(0, foot_top, client.right, foot_top + 1, BORDER);
+    let foot_top = client.bottom - p.s(64.0);    p.fill(0, foot_top, client.right, foot_top + 1, BORDER);
 
     let done_hover = state.hover == Some(Hit::Done);
     let done_fill = if done_hover {
@@ -917,8 +1118,9 @@ unsafe fn open_popup(settings: HWND, row: usize) {
     let anchor = l.selects[row - 1];
 
     let items: Vec<String> = match row {
-        1 => GAUGE_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
-        2 => {
+        1 => FONT_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
+        2 => GAUGE_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
+        3 => {
             let mut list = vec!["自动（全部合计）".to_string()];
             list.extend(state.interfaces.iter().cloned());
             list
@@ -926,8 +1128,9 @@ unsafe fn open_popup(settings: HWND, row: usize) {
         _ => REFRESH_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
     };
     let selected = match row {
-        1 => state.gauge,
-        2 => state.interface,
+        1 => state.font,
+        2 => state.gauge,
+        3 => state.interface,
         _ => state.refresh,
     };
 
@@ -1016,7 +1219,7 @@ unsafe fn open_popup(settings: HWND, row: usize) {
 
 // ---------------------------------------------------------------- 主窗口
 
-pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str, refresh_ms: i32) {
+pub fn open(parent: HWND, settings: &Settings) {
     unsafe {
         // 已经开着就提到前面（同一时间只允许一个）
         let mut found: HWND = std::ptr::null_mut();
@@ -1049,7 +1252,7 @@ pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str, refresh_ms: 
 
         let scale = crate::screen_scale();
         let width_px = s(440.0, scale);
-        let height_px = s(396.0, scale);
+        let height_px = s(710.0, scale);
 
         let mut screen = RECT {
             left: 0,
@@ -1068,29 +1271,43 @@ pub fn open(parent: HWND, width: i32, gauge: &str, interface: &str, refresh_ms: 
 
         let gauge = GAUGE_OPTIONS
             .iter()
-            .position(|(_, value)| value.eq_ignore_ascii_case(gauge))
+            .position(|(_, value)| value.eq_ignore_ascii_case(&settings.gauge_source))
             .unwrap_or(0);
-        let interface = if interface.trim().is_empty() || interface.eq_ignore_ascii_case("auto") {
+        let interface = if settings.network_interface.trim().is_empty()
+            || settings.network_interface.eq_ignore_ascii_case("auto")
+        {
             0
         } else {
             interfaces
                 .iter()
-                .position(|alias| alias.eq_ignore_ascii_case(interface))
+                .position(|alias| alias.eq_ignore_ascii_case(&settings.network_interface))
                 .map(|index| index + 1)
                 .unwrap_or(0)
         };
         let refresh = REFRESH_OPTIONS
             .iter()
-            .position(|(_, ms)| *ms == refresh_ms)
+            .position(|(_, ms)| *ms == settings.refresh_ms)
             .unwrap_or(0);
+        let font = FONT_OPTIONS
+            .iter()
+            .position(|(_, percent)| *percent == settings.font_scale)
+            .unwrap_or(1);
 
         let state = Box::into_raw(Box::new(State {
             parent,
             interfaces,
-            width: width.clamp(72, 360),
+            width: settings.panel_width.clamp(72, 360),
             gauge,
             interface,
             refresh,
+            font,
+            ai_enabled: settings.ai_enabled,
+            ai_sources: [
+                settings.ai_opencode,
+                settings.ai_dsh,
+                settings.ai_workbuddy,
+                settings.ai_workbuddy_ai,
+            ],
             fonts: Fonts::create(scale),
             scale,
             hover: None,
@@ -1168,6 +1385,14 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     for (index, rect) in l.selects.iter().enumerate() {
         if contains(rect, point) {
             return Some(Hit::Select(index + 1));
+        }
+    }
+    if contains(&l.ai_toggle, point) {
+        return Some(Hit::AiToggle);
+    }
+    for (index, rect) in l.ai_sources.iter().enumerate() {
+        if contains(rect, point) {
+            return Some(Hit::AiSource(index));
         }
     }
     None
@@ -1285,6 +1510,24 @@ unsafe extern "system" fn dialog_proc(
                 Some(Hit::Select(row)) => {
                     open_popup(hwnd, row);
                 }
+                Some(Hit::AiToggle) => {
+                    let mut enabled = !state.ai_enabled;
+                    // 打开总开关时如果四个来源全关着，默认全开，否则什么也采不到
+                    if enabled && !state.ai_sources.iter().any(|flag| *flag) {
+                        state.ai_sources = [true; 4];
+                        crate::apply_ai_sources(state.parent, state.ai_sources);
+                    }
+                    state.ai_enabled = enabled;
+                    crate::apply_ai_enabled(state.parent, enabled);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::AiSource(index)) => {
+                    if state.ai_enabled {
+                        state.ai_sources[index] = !state.ai_sources[index];
+                        crate::apply_ai_sources(state.parent, state.ai_sources);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
                 None => {}
             }
             0
@@ -1309,12 +1552,18 @@ unsafe extern "system" fn dialog_proc(
 
             match row {
                 1 => {
+                    if let Some((_, percent)) = FONT_OPTIONS.get(index) {
+                        state.font = index;
+                        crate::apply_font_scale(state.parent, *percent);
+                    }
+                }
+                2 => {
                     if let Some((_, value)) = GAUGE_OPTIONS.get(index) {
                         state.gauge = index;
                         crate::apply_gauge(state.parent, value);
                     }
                 }
-                2 => {
+                3 => {
                     state.interface = index;
                     let alias = if index == 0 {
                         "auto".to_string()

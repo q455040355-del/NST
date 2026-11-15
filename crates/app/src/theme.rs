@@ -75,14 +75,16 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn create(dpi: u32) -> Self {
+    /// `percent`：字号百分比（90 / 100 / 110 / 125），五个字号等比缩放
+    pub fn create(dpi: u32, percent: i32) -> Self {
+        let k = percent.clamp(50, 200) as f32 / 100.0;
         Self {
-            label: create_font(dpi, 9.5, FW_BOLD, "Microsoft YaHei UI"),
-            label_small: create_font(dpi, 8.5, FW_BOLD, "Microsoft YaHei UI"),
+            label: create_font(dpi, 9.5 * k, FW_BOLD, "Microsoft YaHei UI"),
+            label_small: create_font(dpi, 8.5 * k, FW_BOLD, "Microsoft YaHei UI"),
             // 数字也走同一个字体（以前是 Consolas，和中文混排时字重/基线对不上）
-            value: create_font(dpi, 11.0, FW_NORMAL, "Microsoft YaHei UI"),
-            value_mid: create_font(dpi, 10.0, FW_NORMAL, "Microsoft YaHei UI"),
-            value_small: create_font(dpi, 9.0, FW_NORMAL, "Microsoft YaHei UI"),
+            value: create_font(dpi, 11.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
+            value_mid: create_font(dpi, 10.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
+            value_small: create_font(dpi, 9.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
         }
     }
 }

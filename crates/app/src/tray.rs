@@ -1,18 +1,155 @@
-//! 托盘图标：用 GDI 现画一个 32×32 图标（深蓝底 + 白色 ↕）。
+//! 托盘/窗口图标：程序自己算像素画一个 32×32 的 logo。
+//!
+//! 设计：圆角深蓝底 + 一上一下两个箭头（绿色 ↑ 上行、蓝色 ↓ 下行），
+//! 也就是面板上和指示条上用的那两套颜色 —— 一眼能看出是「实时网速」。
+//!
+//! 没用 GDI 画形状：GDI 没有抗锯齿，缩到 16px 时箭头会毛边。
+//! 这里按 8×8 超采样算覆盖率，直接写 32bpp BGRA，圆角外的像素透明度 0，
+//! 再用单色 mask 把透明处抠掉。
 
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
-    DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, HGDIOBJ,
+    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    BITMAPINFO, BITMAPINFOHEADER,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, HICON, ICONINFO,
 };
 
-use crate::theme::wide;
+const SIZE: i32 = 32;
+/// 每个像素 8×8 超采样（抗锯齿够用，启动时只算一次）
+const SS: i32 = 8;
 
-const ICON_SIZE: i32 = 32;
+// ---------------------------------------------------------------- 设计参数（0..1）
+/// 圆角方块离画布边缘的留白
+const INSET: f64 = 0.045;
+const RADIUS: f64 = 0.235;
+/// 箭头的线宽
+const STROKE: f64 = 0.105;
+
+const UP: [(f64, f64); 3] = [(0.305, 0.415), (0.50, 0.225), (0.695, 0.415)];
+const DOWN: [(f64, f64); 3] = [(0.305, 0.585), (0.50, 0.775), (0.695, 0.585)];
+
+/// #2B394F → #121A28
+const BG_TOP: (f64, f64, f64) = (0x2B as f64, 0x39 as f64, 0x4F as f64);
+const BG_BOT: (f64, f64, f64) = (0x12 as f64, 0x1A as f64, 0x28 as f64);
+/// #54DA98 上行绿
+const UP_COLOR: (f64, f64, f64) = (0x54 as f64, 0xDA as f64, 0x98 as f64);
+/// #5AB2FF 下行蓝
+const DOWN_COLOR: (f64, f64, f64) = (0x5A as f64, 0xB2 as f64, 0xFF as f64);
+
+fn seg_dist(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let mut t = 0.0;
+    if len2 > 0.0 {
+        t = ((px - a.0) * dx + (py - a.1) * dy) / len2;
+        t = t.clamp(0.0, 1.0);
+    }
+    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+    ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt()
+}
+
+fn chevron_dist(px: f64, py: f64, points: [(f64, f64); 3]) -> f64 {
+    seg_dist(px, py, points[0], points[1]).min(seg_dist(px, py, points[1], points[2]))
+}
+
+fn in_badge(px: f64, py: f64) -> bool {
+    let (left, top, right, bottom) = (INSET, INSET, 1.0 - INSET, 1.0 - INSET);
+    if px < left || px > right || py < top || py > bottom {
+        return false;
+    }
+    // 只有落进四个角的圆弧内才需要用半径判断
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    if px < left + RADIUS {
+        dx = left + RADIUS - px;
+    } else if px > right - RADIUS {
+        dx = px - (right - RADIUS);
+    }
+    if py < top + RADIUS {
+        dy = top + RADIUS - py;
+    } else if py > bottom - RADIUS {
+        dy = py - (bottom - RADIUS);
+    }
+    if dx == 0.0 || dy == 0.0 {
+        return true;
+    }
+    (dx * dx + dy * dy).sqrt() <= RADIUS
+}
+
+/// 算出一整张 32bpp BGRA（自上而下）像素表
+fn render() -> Vec<u8> {
+    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let samples = (SS * SS) as f64;
+    let half_stroke = STROKE / 2.0;
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let mut r = 0.0;
+            let mut g = 0.0;
+            let mut b = 0.0;
+            let mut cover = 0.0;
+
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = (x as f64 + (sx as f64 + 0.5) / SS as f64) / SIZE as f64;
+                    let py = (y as f64 + (sy as f64 + 0.5) / SS as f64) / SIZE as f64;
+                    if !in_badge(px, py) {
+                        continue;
+                    }
+
+                    // 竖直渐变底色
+                    let t = ((py - INSET) / (1.0 - 2.0 * INSET)).clamp(0.0, 1.0);
+                    let mut cr = BG_TOP.0 + (BG_BOT.0 - BG_TOP.0) * t;
+                    let mut cg = BG_TOP.1 + (BG_BOT.1 - BG_TOP.1) * t;
+                    let mut cb = BG_TOP.2 + (BG_BOT.2 - BG_TOP.2) * t;
+
+                    if chevron_dist(px, py, UP) <= half_stroke {
+                        cr = UP_COLOR.0;
+                        cg = UP_COLOR.1;
+                        cb = UP_COLOR.2;
+                    } else if chevron_dist(px, py, DOWN) <= half_stroke {
+                        cr = DOWN_COLOR.0;
+                        cg = DOWN_COLOR.1;
+                        cb = DOWN_COLOR.2;
+                    }
+
+                    r += cr;
+                    g += cg;
+                    b += cb;
+                    cover += 1.0;
+                }
+            }
+
+            let index = ((y * SIZE + x) * 4) as usize;
+            if cover == 0.0 {
+                continue;
+            }
+            pixels[index] = (b / cover).round() as u8;
+            pixels[index + 1] = (g / cover).round() as u8;
+            pixels[index + 2] = (r / cover).round() as u8;
+            pixels[index + 3] = (cover / samples * 255.0).round() as u8;
+        }
+    }
+
+    pixels
+}
+
+/// 单色 mask：透明处为 1（bit 顺序和 GDI 一致，每行按字节对齐）
+fn render_mask(pixels: &[u8]) -> Vec<u8> {
+    let stride = ((SIZE + 7) / 8) as usize;
+    let mut mask = vec![0u8; stride * SIZE as usize];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let alpha = pixels[((y * SIZE + x) * 4 + 3) as usize];
+            if alpha == 0 {
+                let byte = (y as usize) * stride + (x as usize) / 8;
+                mask[byte] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    mask
+}
 
 pub fn create_icon() -> HICON {
     unsafe {
@@ -25,64 +162,35 @@ pub fn create_icon() -> HICON {
 
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = ICON_SIZE;
-        info.bmiHeader.biHeight = -ICON_SIZE;
+        info.bmiHeader.biWidth = SIZE;
+        info.bmiHeader.biHeight = -SIZE; // top-down
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = 0;
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
         let color = CreateDIBSection(screen, &info, 0, &mut bits, std::ptr::null_mut(), 0);
-        let previous = SelectObject(dc, color as HGDIOBJ);
+        if color.is_null() || bits.is_null() {
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return std::ptr::null_mut();
+        }
 
-        // 背景：任务栏绿蓝色（COLORREF = 0x00BBGGRR）
-        let background = CreateSolidBrush(0x00D8_8A_10);
-        let mut rect = windows_sys::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: ICON_SIZE,
-            bottom: ICON_SIZE,
-        };
-        FillRect(dc, &rect, background);
-        DeleteObject(background as *mut _);
-
-        // 白色 ↕
-        let font = CreateFontW(
-            -24,
-            0,
-            0,
-            0,
-            700,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide("Segoe UI Symbol").as_ptr(),
+        let pixels = render();
+        std::ptr::copy_nonoverlapping(
+            pixels.as_ptr(),
+            bits as *mut u8,
+            pixels.len(),
         );
-        let previous_font = SelectObject(dc, font as HGDIOBJ);
-        SetBkMode(dc, 1);
-        SetTextColor(dc, 0x00FF_FFFF);
-        let text = wide("\u{2195}");
-        let mut text_rect = rect;
-        DrawTextW(
-            dc,
-            text.as_ptr(),
-            (text.len() - 1) as i32,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        SelectObject(dc, previous_font);
-        DeleteObject(font as *mut _);
-        SelectObject(dc, previous);
-        DeleteDC(dc);
-        ReleaseDC(std::ptr::null_mut(), screen);
 
-        // 掩码全 0 = 整块不透明
-        let mask = CreateBitmap(ICON_SIZE, ICON_SIZE, 1, 1, std::ptr::null());
+        let mask_bits = render_mask(&pixels);
+        let mask = CreateBitmap(
+            SIZE,
+            SIZE,
+            1,
+            1,
+            mask_bits.as_ptr() as *const std::ffi::c_void,
+        );
 
         let icon_info = ICONINFO {
             fIcon: 1,
@@ -93,8 +201,12 @@ pub fn create_icon() -> HICON {
         };
         let icon = CreateIconIndirect(&icon_info);
 
-        DeleteObject(mask as *mut _);
+        if !mask.is_null() {
+            DeleteObject(mask as *mut _);
+        }
         DeleteObject(color as *mut _);
+        DeleteDC(dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
 
         icon
     }

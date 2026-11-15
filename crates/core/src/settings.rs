@@ -7,10 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-pub const GAUGE_VIEW: &str = "view";
-pub const GAUGE_SPEED: &str = "speed";
 pub const GAUGE_MEMORY: &str = "mem";
-pub const GAUGE_CPU: &str = "cpu";
 pub const GAUGE_AI: &str = "ai";
 pub const GAUGE_NONE: &str = "none";
 
@@ -23,8 +20,12 @@ pub struct Settings {
     pub gauge_source: String,
     /// 面板刷新间隔（毫秒）：500 / 1000 / 2000
     pub refresh_ms: i32,
+    /// 面板字号百分比：90 / 100 / 110 / 125
+    pub font_scale: i32,
     /// 当前视图：speed / memory / temperature / ai
     pub view: String,
+    /// AI 统计总开关：关着就完全不碰 AI（不起线程、不读文件/数据库）
+    pub ai_enabled: bool,
     pub ai_opencode: bool,
     pub ai_claude: bool,
     pub ai_codex: bool,
@@ -42,9 +43,11 @@ impl Default for Settings {
             panel_x: -1,
             panel_y: -1,
             network_interface: "auto".to_string(),
-            gauge_source: GAUGE_VIEW.to_string(),
+            gauge_source: GAUGE_MEMORY.to_string(),
             refresh_ms: 500,
+            font_scale: 100,
             view: "speed".to_string(),
+            ai_enabled: false,
             ai_opencode: true,
             ai_claude: false,
             ai_codex: false,
@@ -89,7 +92,11 @@ impl Settings {
                 "NetworkInterface" => settings.network_interface = value.to_string(),
                 "GaugeSource" => settings.gauge_source = normalize_gauge(value),
                 "RefreshMs" => settings.refresh_ms = normalize_refresh(value.parse().unwrap_or(500)),
+                "FontScale" => {
+                    settings.font_scale = normalize_font_scale(value.parse().unwrap_or(100))
+                }
                 "View" => settings.view = value.to_string(),
+                "AiEnabled" => settings.ai_enabled = parse_bool(value),
                 "AiOpenCode" => settings.ai_opencode = parse_bool(value),
                 "AiClaude" => settings.ai_claude = parse_bool(value),
                 "AiCodex" => settings.ai_codex = parse_bool(value),
@@ -104,6 +111,17 @@ impl Settings {
 
         settings.panel_width = settings.panel_width.clamp(72, 360);
         settings.refresh_ms = normalize_refresh(settings.refresh_ms);
+        settings.font_scale = normalize_font_scale(settings.font_scale);
+
+        // AI 关掉时不能停在 AI 视图 / AI 指示条上，否则面板会显示一个永远不变的空值
+        if !settings.ai_enabled {
+            if settings.view == "ai" {
+                settings.view = "speed".to_string();
+            }
+            if settings.gauge_source == GAUGE_AI {
+                settings.gauge_source = GAUGE_MEMORY.to_string();
+            }
+        }
         settings
     }
 
@@ -122,7 +140,9 @@ impl Settings {
         out.push_str("DisplayMode=embedded\n");
         out.push_str(&format!("GaugeSource={}\n", self.gauge_source));
         out.push_str(&format!("RefreshMs={}\n", self.refresh_ms));
+        out.push_str(&format!("FontScale={}\n", self.font_scale));
         out.push_str(&format!("View={}\n", self.view));
+        out.push_str(&format!("AiEnabled={}\n", self.ai_enabled));
         out.push_str(&format!("AiOpenCode={}\n", self.ai_opencode));
         out.push_str(&format!("AiClaude={}\n", self.ai_claude));
         out.push_str(&format!("AiCodex={}\n", self.ai_codex));
@@ -141,7 +161,10 @@ impl Settings {
                     | "NetworkInterface"
                     | "DisplayMode"
                     | "GaugeSource"
+                    | "RefreshMs"
+                    | "FontScale"
                     | "View"
+                    | "AiEnabled"
                     | "AiOpenCode"
                     | "AiClaude"
                     | "AiCodex"
@@ -179,14 +202,13 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+/// 指示条只允许两种指标：内存占用百分比 / Token 速度（外加关闭）。
+/// 老配置里的 view / speed / cpu 一律落到内存占用。
 fn normalize_gauge(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
-        "speed" => GAUGE_SPEED,
-        "mem" | "memory" => GAUGE_MEMORY,
-        "cpu" | "temperature" | "temp" => GAUGE_CPU,
-        "ai" => GAUGE_AI,
+        "ai" | "token" | "tokens" => GAUGE_AI,
         "none" | "off" => GAUGE_NONE,
-        _ => GAUGE_VIEW,
+        _ => GAUGE_MEMORY,
     }
     .to_string()
 }
@@ -200,6 +222,16 @@ pub fn normalize_refresh(value: i32) -> i32 {
     }
 }
 
+/// 字号只允许 90 / 100 / 110 / 125 %，其它值就近吸附。
+pub fn normalize_font_scale(value: i32) -> i32 {
+    match value {
+        v if v <= 95 => 90,
+        v if v <= 105 => 100,
+        v if v <= 117 => 110,
+        _ => 125,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +240,27 @@ mod tests {
     fn gauge_normalization() {
         assert_eq!(normalize_gauge("MEM"), "mem");
         assert_eq!(normalize_gauge("off"), "none");
-        assert_eq!(normalize_gauge("whatever"), "view");
+        assert_eq!(normalize_gauge("token"), "ai");
+        // 老配置里的「跟随视图 / 网速 / CPU 温度」都收敛到内存占用
+        assert_eq!(normalize_gauge("view"), "mem");
+        assert_eq!(normalize_gauge("speed"), "mem");
+        assert_eq!(normalize_gauge("cpu"), "mem");
+        assert_eq!(normalize_gauge("whatever"), "mem");
+    }
+
+    #[test]
+    fn refresh_normalization() {
+        assert_eq!(normalize_refresh(300), 500);
+        assert_eq!(normalize_refresh(1400), 1000);
+        assert_eq!(normalize_refresh(9000), 2000);
+    }
+
+    #[test]
+    fn font_scale_normalization() {
+        assert_eq!(normalize_font_scale(80), 90);
+        assert_eq!(normalize_font_scale(100), 100);
+        assert_eq!(normalize_font_scale(112), 110);
+        assert_eq!(normalize_font_scale(200), 125);
     }
 
     #[test]
