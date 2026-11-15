@@ -43,9 +43,11 @@ const ACCENT_GREEN: u32 = 0x008C_A92F;
 const ACCENT_PURPLE: u32 = 0x00FF_617B;
 const ACCENT_ORANGE: u32 = 0x0032_8AE0;
 
-/// 图表的阻尼弹簧：response = 一个来回的周期，damping 越小回弹越明显。
-const SPRING_RESPONSE: f64 = 0.34;
-const SPRING_DAMPING: f64 = 0.76;
+/// 图表的阻尼弹簧：response = 一个来回的周期（秒），damping = 阻尼比（1 = 临界阻尼）。
+/// 这两个值沿用 AgentSpeed / C# 版 `DampedSpring(0.30s / 0.86)` 的参数：
+/// 0.30s 的周期够快、0.86 的阻尼几乎不过冲，收得干净。
+const SPRING_RESPONSE: f64 = 0.30;
+const SPRING_DAMPING: f64 = 0.86;
 
 /// 动画投递线程的代（每次重启动画就 +1，旧线程看到代变了就退出）
 static ANIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -516,6 +518,7 @@ fn recalc(state: &mut State) {
 
     state.spring = Spring::new(SPRING_RESPONSE, SPRING_DAMPING);
     state.animating = true;
+
     state.last_tick = std::time::Instant::now();
 }
 
@@ -547,6 +550,7 @@ unsafe extern "system" fn canvas_proc(
                 if state.spring.settled(1.0) {
                     state.now_heights = state.to_heights.clone();
                     state.max_now = state.max_to;
+
                     state.animating = false;
                     // 让投递线程自然退出
                     ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
