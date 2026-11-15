@@ -8,6 +8,7 @@ use netspeed_core::history::{
 };
 use std::sync::mpsc::{channel, Receiver};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, LineTo, MoveToEx, InvalidateRect, ReleaseDC,
@@ -55,7 +56,12 @@ fn start_animator(canvas: HWND) {
     let generation = ANIM_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let handle = canvas as usize;
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        // 对齐桌面合成的下一帧（≈垂直同步）。AgentSpeed 用 WPF 的
+        // CompositionTarget.Rendering 做同样的事：节奏跟着合成器走，不会和
+        // DWM 的呈现节拍错开（固定 sleep 16ms 会慢慢漂移，表现为偶发掉帧）。
+        if unsafe { DwmFlush() } != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
         if ANIM_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation {
             break;
         }
