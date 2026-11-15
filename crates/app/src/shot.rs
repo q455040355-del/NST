@@ -56,13 +56,32 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// 选区确认后做什么：进编辑窗，还是直接取字
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Edit,
+    Ocr,
+}
+
+static mut MODE: Mode = Mode::Edit;
+
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
+    start(panel, Mode::Edit);
+}
+
+/// 截图后直接取字（PaddleOCR）
+pub fn request_ocr(panel: HWND) {
+    start(panel, Mode::Ocr);
+}
+
+fn start(panel: HWND, mode: Mode) {
     if ACTIVE.swap(true, Ordering::SeqCst) {
         return;
     }
 
     unsafe {
+        MODE = mode;
         PANEL = panel;
         RESTORE_PANEL = IsWindowVisible(panel) != 0;
         if RESTORE_PANEL {
@@ -80,6 +99,15 @@ pub fn request(panel: HWND) {
         }
     });
 }
+/// 选区确认：按模式进编辑窗或直接取字
+unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
+    if MODE == Mode::Ocr {
+        crate::ocr::recognize_async(panel, bitmap);
+    } else {
+        open_editor(panel, bitmap);
+    }
+}
+
 unsafe fn finish_capture() {
     ACTIVE.store(false, Ordering::SeqCst);
     if RESTORE_PANEL && !PANEL.is_null() && IsWindow(PANEL) != 0 {
@@ -407,7 +435,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     );
                     let panel = PANEL;
                     DestroyWindow(hwnd);
-                    open_editor(panel, cropped);
+                    deliver(panel, cropped);
                 }
             }
             0
@@ -440,7 +468,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             );
                             let panel = PANEL;
                             DestroyWindow(hwnd);
-                            open_editor(panel, cropped);
+                            deliver(panel, cropped);
                         }
                     }
                 }
@@ -559,6 +587,7 @@ enum Action {
     Undo,
     Copy,
     Save,
+    Ocr,
     Pin,
     Close,
 }
@@ -604,6 +633,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Undo => "撤销",
         Action::Copy => "复制",
         Action::Save => "保存",
+        Action::Ocr => "取字",
         Action::Pin => "贴图",
         Action::Close => "关闭",
     }
@@ -831,7 +861,7 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     for action in actions {
         let label = text_of_action(action);
-        let width_px = wide_width(dc, label) + s(22.0);
+        let width_px = wide_width(dc, label) + s(16.0);
         let rect = RECT {
             left: x,
             top: s(9.0),
@@ -852,7 +882,7 @@ unsafe fn editor_paint(hwnd: HWND) {
         );
 
         editor.buttons.push((rect, action));
-        x = rect.right + s(6.0);
+        x = rect.right + s(5.0);
     }
 
     x += s(10.0);
@@ -860,12 +890,13 @@ unsafe fn editor_paint(hwnd: HWND) {
         Action::Undo,
         Action::Copy,
         Action::Save,
+        Action::Ocr,
         Action::Pin,
         Action::Close,
     ];
     for action in tail {
         let label = text_of_action(action);
-        let width_px = wide_width(dc, label) + s(22.0);
+        let width_px = wide_width(dc, label) + s(16.0);
         let rect = RECT {
             left: x,
             top: s(9.0),
@@ -884,7 +915,7 @@ unsafe fn editor_paint(hwnd: HWND) {
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
         );
         editor.buttons.push((rect, action));
-        x = rect.right + s(6.0);
+        x = rect.right + s(5.0);
     }
 
     SelectObject(dc, old_font);
@@ -1368,6 +1399,14 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
                 SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
             }
         }
+        Action::Ocr => {
+            commit_text(hwnd);
+            let editor = &*editor;
+            let bitmap = composite(editor);
+            // 结果窗挂到任务栏面板窗口上（WM_APP_OCR_READY 在那边处理）
+            let target = if PANEL.is_null() { hwnd } else { PANEL };
+            crate::ocr::recognize_async(target, bitmap);
+        }
         Action::Pin => {
             commit_text(hwnd);
             let editor = &*editor;
@@ -1586,7 +1625,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
 
     let toolbar = s(44.0);
     let hint = s(24.0);
-    let client_w = image_w.max(s(560.0));
+    let client_w = image_w.max(s(600.0));
     let client_h = toolbar + image_h + hint;
 
     let mut rect = RECT {

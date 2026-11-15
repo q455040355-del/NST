@@ -18,6 +18,10 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 .\target\release\netspeed.exe
 ```
 
+工具链由 `rust-toolchain.toml` 锁定 **nightly-2026-09-08**（OCR 引擎 `simd-paddle-ocr-rs` 用了 `portable_simd`，stable 编不过）。
+
+`models\` 里是 PaddleOCR 的 det/cls/rec 模型 + 字典（共 7 MB）；程序按 `exe 同级 models\` → `仓库根 models\` → `当前目录 models\` 的顺序查找，取字功能才可用。
+
 `cargo test -p netspeed-core` 跑核心逻辑单测（换算、设置规范化、区间聚合等，14 个）。
 
 单实例：互斥体 `Local\NetSpeedTaskbar.Rust`。配置：`%LOCALAPPDATA%\NetSpeedTaskbar\settings.ini`。
@@ -54,12 +58,24 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 
 - **选区**：全屏冻结 + 压暗遮罩，拖拽选区，实时显示 `宽 × 高`；`Esc` / 右键取消，`Enter` 确认；
 - **编辑**：箭头 / 矩形 / 画笔 / 文字 / 马赛克（马赛克按块取平均色），撤销；
+- **取字**：`Ctrl+Shift+O` 直接对选区做 OCR；编辑窗里也有「取字」按钮（对当前成品图识别）。结果窗多行可编辑、自动进剪贴板，`Ctrl+A/Ctrl+C` 直接复制；
 - **输出**：`Ctrl+C` 复制到剪贴板（CF_DIB）、`Ctrl+S` 另存为 PNG（标准另存为对话框）、`Ctrl+Z` 撤销、`Esc` 关闭；
 - **贴图**：一键把结果钉在最上层，拖动移动，右键 / 双击 / Esc 关闭。
 
 实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一画在「图片坐标系」里，靠 `SetViewportOrgEx` 平移到显示位置，导出时把原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
 
 > 交互参考 [Snow Shot](https://github.com/mg-chao/snow-shot)（GPL-3.0），但**没有复用其任何代码**，全部是这里的 Win32/GDI 实现。
+
+### 取字（OCR）的实现
+
+用 [`simd-paddle-ocr-rs`](https://github.com/mg-chao/simd-paddle-ocr-rs)（**Apache-2.0**，纯 Rust 的 PaddleOCR 推理，不依赖 ONNX Runtime）：
+
+- 引擎在后台线程现建现用：模型加载 ~17 ms、720×220 识别 ~37 ms，不阻塞 UI；
+- 模型用 PaddleOCR v6 **tiny** 中文模型（det 1.78 MB + cls 1.02 MB + rec 4.46 MB + 字典），识别完把 `\n` 统一成 `\r\n` 再喂给 EDIT / 剪贴板；
+- 结果通过 `PostMessage(WM_APP_OCR_READY)` 回 UI 线程开窗，`Box<OcrOutcome>` 指针走 `wparam`，窗口里 `Box::from_raw` 收回。
+
+> ⚠️ Snow Shot 自己的 `snow-ocr-process` 那层包装是 GPL-3.0，**没有用**；只用 Apache-2.0 的引擎 crate，不传染授权。
+
 ## 用量历史窗口
 
 `netspeed.exe --history`（或右键菜单「Token 用量历史…」）：

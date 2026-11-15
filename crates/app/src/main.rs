@@ -5,6 +5,8 @@
 #![windows_subsystem = "windows"]
 
 mod history_ui;
+mod ocr;
+mod ocr_ui;
 mod panel;
 mod settings_ui;
 mod shot;
@@ -36,7 +38,9 @@ const WM_APP_TICK: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
+const WM_APP_OCR_READY: u32 = WM_APP + 5;
 const HOTKEY_SHOT: i32 = 1;
+const HOTKEY_OCR: i32 = 2;
 const TRAY_ID: u32 = 1;
 
 thread_local! {
@@ -74,6 +78,7 @@ const ID_HISTORY: usize = 1300;
 const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
 const ID_SHOT: usize = 1302;
+const ID_OCR: usize = 1303;
 const ID_QUIT: usize = 1099;
 
 fn main() {
@@ -187,6 +192,7 @@ fn main() {
 
         // Ctrl+Shift+A 截图
         RegisterHotKey(hwnd, HOTKEY_SHOT, MOD_CONTROL | MOD_SHIFT, 0x41);
+        RegisterHotKey(hwnd, HOTKEY_OCR, MOD_CONTROL | MOD_SHIFT, 0x4F);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
@@ -496,8 +502,18 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_HOTKEY => {
-            if wparam as i32 == HOTKEY_SHOT {
-                shot::request(hwnd);
+            match wparam as i32 {
+                HOTKEY_SHOT => shot::request(hwnd),
+                HOTKEY_OCR => shot::request_ocr(hwnd),
+                _ => {}
+            }
+            0
+        }
+        WM_APP_OCR_READY => {
+            let pointer = wparam as *mut ocr::OcrOutcome;
+            if !pointer.is_null() {
+                let outcome = Box::from_raw(pointer);
+                ocr_ui::open(hwnd, &outcome.text, outcome.error.as_deref());
             }
             0
         }
@@ -556,6 +572,7 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_STRING, ID_HISTORY, wide("Token 用量历史…").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("设置…").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_SHOT, wide("截图…\tCtrl+Shift+A").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_OCR, wide("取字（OCR）…\tCtrl+Shift+O").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_PANEL_HIDE, wide("隐藏面板（双击托盘恢复）").as_ptr());
         AppendMenuW(
             menu,
@@ -612,6 +629,9 @@ fn show_menu(hwnd: HWND) {
             }
             ID_SHOT => {
                 shot::request(hwnd);
+            }
+            ID_OCR => {
+                shot::request_ocr(hwnd);
             }
             ID_PANEL_HIDE => {
                 HIDDEN_BY_USER = true;
