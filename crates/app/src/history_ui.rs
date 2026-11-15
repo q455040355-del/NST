@@ -164,6 +164,8 @@ struct State {
     chart_rect: RECT,
     /// 数据或尺寸变了，下一帧必须整页重画
     full_dirty: bool,
+    /// 当前是否「按小时」视图（今天 / 昨天）
+    hourly: bool,
 }
 
 pub fn open(_parent: HWND) {
@@ -258,6 +260,7 @@ pub fn open(_parent: HWND) {
                 right: 0,
                 bottom: 0,
             },
+            hourly: false,
             full_dirty: true,
         }));
 
@@ -495,28 +498,62 @@ fn recalc(state: &mut State) {
     state.from_day = from;
     state.to_day = to;
 
-    state.days = history::summarize_filtered(&state.records, from, to, filter);
-    // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
-    // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
-    let mut rows = history::daily_by_source(&state.records, from, to, &all_sources());
-    // 只看单一来源时把其他来源的列清零：这样图例、堆叠柱都只剩选中的那一路
-    if state.source != 0 {
-        for row in rows.iter_mut() {
-            for (slot, value) in row.iter_mut().enumerate() {
-                if slot + 1 != state.source {
-                    *value = 0;
+    // 「今天 / 昨天」按小时看：横轴是 0-23 点
+    let hourly = state.range <= 1;
+    state.hourly = hourly;
+
+    if hourly {
+        let day = from;
+        let hours = history::summarize_hours(&state.records, day, filter);
+        state.days = hours
+            .iter()
+            .map(|row| DailyRow {
+                day: row.hour as i64,
+                output: row.output,
+                input: row.input,
+                requests: row.requests,
+                measured_output: row.measured_output,
+                measured_ms: row.measured_ms,
+                peak_speed: row.peak_speed,
+                main_model: row.main_model.clone(),
+            })
+            .collect();
+
+        let mut rows = history::hourly_by_source(&state.records, day, &all_sources());
+        if state.source != 0 {
+            for row in rows.iter_mut() {
+                for (slot, value) in row.iter_mut().enumerate() {
+                    if slot + 1 != state.source {
+                        *value = 0;
+                    }
                 }
             }
         }
+        state.stack = rows;
+    } else {
+        state.days = history::summarize_filtered(&state.records, from, to, filter);
+        // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
+        // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
+        let mut rows = history::daily_by_source(&state.records, from, to, &all_sources());
+        // 只看单一来源时把其他来源的列清零：这样图例、堆叠柱都只剩选中的那一路
+        if state.source != 0 {
+            for row in rows.iter_mut() {
+                for (slot, value) in row.iter_mut().enumerate() {
+                    if slot + 1 != state.source {
+                        *value = 0;
+                    }
+                }
+            }
+        }
+        state.stack = state
+            .days
+            .iter()
+            .map(|day| {
+                let index = (day.day - from).max(0) as usize;
+                rows.get(index).cloned().unwrap_or_default()
+            })
+            .collect();
     }
-    state.stack = state
-        .days
-        .iter()
-        .map(|day| {
-            let index = (day.day - from).max(0) as usize;
-            rows.get(index).cloned().unwrap_or_default()
-        })
-        .collect();
 
     let target: Vec<f32> = state
         .days
@@ -526,14 +563,23 @@ fn recalc(state: &mut State) {
 
     // 过渡起点：按「同一天」从上一帧取值（AgentSpeed 的 HistoryBars.Blend 就是这么做的）。
     // 换区间时同一根柱子保持高度、只是重新排布，而不是全体从 0 长出来。
+    // 小时的键用 day*24+hour，日视图用 day*24，两种模式不会互相污染。
+    let slot_key = |index: usize, value: i64| -> i64 {
+        if hourly {
+            from * 24 + index as i64
+        } else {
+            value * 24
+        }
+    };
     let source_count = all_sources().len();
     state.from_stack = state
         .days
         .iter()
-        .map(|day| {
+        .enumerate()
+        .map(|(index, day)| {
             state
                 .previous
-                .get(&day.day)
+                .get(&slot_key(index, day.day))
                 .cloned()
                 .unwrap_or_else(|| vec![0.0; source_count])
         })
@@ -547,8 +593,9 @@ fn recalc(state: &mut State) {
     state.previous = state
         .days
         .iter()
+        .enumerate()
         .zip(state.to_stack.iter())
-        .map(|(day, row)| (day.day, row.clone()))
+        .map(|((index, day), row)| (slot_key(index, day.day), row.clone()))
         .collect();
 
     state.from_heights = state.now_stack.iter().map(|row| row.iter().sum()).collect();
@@ -1105,12 +1152,16 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
                     .count() as i64,
             )
         };
-        format!(
-            "{} – {}   ·   {} 条记录",
-            format_day(state.from_day),
-            format_day(state.to_day),
-            count
-        )
+        if state.from_day == state.to_day {
+            format!("{}   ·   {} 条记录", format_day(state.from_day), count)
+        } else {
+            format!(
+                "{} – {}   ·   {} 条记录",
+                format_day(state.from_day),
+                format_day(state.to_day),
+                count
+            )
+        }
     };
     p.text(
         &subtitle,
@@ -1222,11 +1273,12 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
     };
     let days_count = state.days.len().max(1) as i64;
 
+    let per = if state.hourly { "时均" } else { "日均" };
     let cards: [(&str, String, String, u32); 4] = [
         (
             "输出 tokens",
             history::format_tokens(total_output),
-            format!("日均 {}", history::format_tokens(total_output / days_count)),
+            format!("{per} {}", history::format_tokens(total_output / days_count)),
             series_color("opencode"),
         ),
         (
@@ -1242,7 +1294,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         (
             "请求数",
             thousands(total_requests),
-            format!("日均 {}", thousands(total_requests / days_count)),
+            format!("{per} {}", thousands(total_requests / days_count)),
             series_color("dsh"),
         ),
         (
@@ -1331,7 +1383,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     );
 
     p.text(
-        "每日输出",
+        if state.hourly { "每小时输出" } else { "每日输出" },
         9.5,
         600,
         TEXT,
@@ -1343,7 +1395,8 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     );
 
     // 图例
-    let mut legend_x = l.pad + p.s(18.0) + p.text_width("每日输出", 9.5, 600) + p.s(18.0);
+    let chart_title = if state.hourly { "每小时输出" } else { "每日输出" };
+    let mut legend_x = l.pad + p.s(18.0) + p.text_width(chart_title, 9.5, 600) + p.s(18.0);
     let sources = all_sources();
     for source in sources {
         let index = sources.iter().position(|item| *item == source).unwrap_or(0);
@@ -1470,7 +1523,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
         }
         let x = plot_left as f32 + slot * index as f32;
         p.text(
-            &day_label(day.day),
+            &if state.hourly { format!("{:02}", day.day) } else { day_label(day.day) },
             7.5,
             400,
             TEXT3,
@@ -1505,7 +1558,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
 
     let header_top = l.table_top + p.s(10.0);
     let header_bottom = header_top + p.s(22.0);
-    let headers = ["日期", "请求", "输出", "输入", "速度", "峰值", "主要模型"];
+    let headers = [if state.hourly { "小时" } else { "日期" }, "请求", "输出", "输入", "速度", "峰值", "主要模型"];
     for (index, header) in headers.iter().enumerate() {
         let align = if index == 0 || index == 6 { DT_LEFT } else { DT_RIGHT };
         let right = if index == 6 {
@@ -1562,7 +1615,7 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
 
         let text_bottom = y + row_height;
         p.text(
-            &day_full_label(day.day),
+            &if state.hourly { format!("{:02}:00", day.day) } else { day_full_label(day.day) },
             8.5,
             500,
             TEXT,

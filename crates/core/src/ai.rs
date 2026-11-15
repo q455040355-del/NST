@@ -722,6 +722,11 @@ pub fn local_offset_ms() -> i64 {
 pub fn day_index(ms: i64) -> i64 {
     (ms + local_offset_ms()).div_euclid(86_400_000)
 }
+
+/// 本地小时（0-23），用于「今天/昨天」按小时看消耗。
+pub fn local_hour(ms: i64) -> u8 {
+    (((ms + local_offset_ms()).div_euclid(3_600_000)) % 24) as u8
+}
 pub fn format_tokens(value: i64) -> String {
     let value = value.max(0);
     if value < 1_000 {

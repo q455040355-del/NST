@@ -20,6 +20,8 @@ pub use super::ai::format_tokens;
 
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
+    /// 本地小时（0-23）：单日视图按小时聚合用
+    pub hour: u8,
     /// 本地日期序号（now_ms / DAY_MS 的整数部分，按本地时区偏移修正过）
     pub day: i64,
     pub source: &'static str,
@@ -174,6 +176,7 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
 
         records.push(UsageRecord {
             day: super::ai::day_index(created),
+            hour: super::ai::local_hour(created),
             source: SOURCE_OPENCODE,
             model,
             output,
@@ -302,6 +305,7 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
 
         records.push(UsageRecord {
             day: super::ai::day_index(time),
+            hour: super::ai::local_hour(time),
             source,
             model,
             output,
@@ -357,6 +361,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
 
         let entry = map.entry(message_id.to_string()).or_insert_with(|| UsageRecord {
             day: super::ai::day_index(timestamp),
+            hour: super::ai::local_hour(timestamp),
             source,
             model: model.clone(),
             output: 0,
@@ -378,6 +383,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
 
         if timestamp > 0 {
             entry.day = super::ai::day_index(timestamp);
+            entry.hour = super::ai::local_hour(timestamp);
             if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 180_000 {
                 entry.duration_ms = timestamp - last_ts;
             }
@@ -473,6 +479,107 @@ pub fn summarize_filtered(
         .collect()
 }
 
+/// 单日按小时的汇总行（固定 24 格，没数据的小时是 0）
+#[derive(Debug, Clone, Default)]
+pub struct HourRow {
+    pub hour: u8,
+    pub output: i64,
+    pub input: i64,
+    pub requests: i64,
+    pub measured_output: i64,
+    pub measured_ms: i64,
+    pub peak_speed: f64,
+    pub main_model: String,
+}
+
+impl HourRow {
+    pub fn speed(&self) -> f64 {
+        if self.measured_ms > 0 {
+            self.measured_output as f64 * 1000.0 / self.measured_ms as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// 单日按小时汇总（今天/昨天视图用）
+pub fn summarize_hours(
+    records: &[UsageRecord],
+    day: i64,
+    source: Option<&str>,
+) -> Vec<HourRow> {
+    let mut rows: Vec<HourRow> = (0..24)
+        .map(|hour| HourRow {
+            hour: hour as u8,
+            ..Default::default()
+        })
+        .collect();
+    let mut models: Vec<HashMap<String, i64>> = vec![HashMap::new(); 24];
+
+    for record in records {
+        if record.day != day {
+            continue;
+        }
+        if let Some(wanted) = source {
+            if record.source != wanted {
+                continue;
+            }
+        }
+
+        let index = (record.hour as usize).min(23);
+        let row = &mut rows[index];
+        row.output += record.output;
+        row.input += record.input;
+        row.requests += 1;
+
+        if record.duration_ms > 0 {
+            row.measured_output += record.output;
+            row.measured_ms += record.duration_ms;
+            if record.duration_ms >= 200 {
+                let speed = record.output as f64 * 1000.0 / record.duration_ms as f64;
+                if speed > row.peak_speed {
+                    row.peak_speed = speed;
+                }
+            }
+        }
+
+        if record.output > 0 {
+            *models[index].entry(record.model.clone()).or_insert(0) += record.output;
+        }
+    }
+
+    for (index, per_model) in models.into_iter().enumerate() {
+        let mut best = 0;
+        let mut name = String::new();
+        for (model, output) in per_model {
+            if output > best {
+                best = output;
+                name = model;
+            }
+        }
+        rows[index].main_model = name;
+    }
+
+    rows
+}
+
+/// 单日按「小时 × 来源」的堆叠值（24 行）
+pub fn hourly_by_source(
+    records: &[UsageRecord],
+    day: i64,
+    sources: &[&'static str],
+) -> Vec<Vec<i64>> {
+    let mut rows = vec![vec![0_i64; sources.len()]; 24];
+    for record in records {
+        if record.day != day {
+            continue;
+        }
+        if let Some(slot) = sources.iter().position(|item| *item == record.source) {
+            rows[(record.hour as usize).min(23)][slot] += record.output;
+        }
+    }
+    rows
+}
 pub fn by_source(records: &[UsageRecord], from_day: i64, to_day: i64) -> Vec<SourceRow> {
     let mut map: HashMap<&'static str, SourceRow> = HashMap::new();
 
@@ -554,6 +661,7 @@ mod tests {
     fn record(day: i64, source: &'static str, model: &str, output: i64) -> UsageRecord {
         UsageRecord {
             day,
+            hour: 12,
             source,
             model: model.to_string(),
             output,
