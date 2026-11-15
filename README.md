@@ -48,6 +48,18 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   文件按「路径 + mtime」缓存只重解析变过的；采集在后台线程，懒启动（AI 视图 / AI 指示条才启用）。
 - **全屏避让**：前台窗口铺满整块显示器（且不是任务栏/桌面/弹窗）时自动隐藏面板，退出全屏自动回来；手动「隐藏面板」后不再自动显示，只有双击托盘恢复。
 
+## 截图 + 标注
+
+`Ctrl+Shift+A`（或右键菜单「截图…」）：
+
+- **选区**：全屏冻结 + 压暗遮罩，拖拽选区，实时显示 `宽 × 高`；`Esc` / 右键取消，`Enter` 确认；
+- **编辑**：箭头 / 矩形 / 画笔 / 文字 / 马赛克（马赛克按块取平均色），撤销；
+- **输出**：`Ctrl+C` 复制到剪贴板（CF_DIB）、`Ctrl+S` 另存为 PNG（标准另存为对话框）、`Ctrl+Z` 撤销、`Esc` 关闭；
+- **贴图**：一键把结果钉在最上层，拖动移动，右键 / 双击 / Esc 关闭。
+
+实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一画在「图片坐标系」里，靠 `SetViewportOrgEx` 平移到显示位置，导出时把原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
+
+> 交互参考 [Snow Shot](https://github.com/mg-chao/snow-shot)（GPL-3.0），但**没有复用其任何代码**，全部是这里的 Win32/GDI 实现。
 ## 用量历史窗口
 
 `netspeed.exe --history`（或右键菜单「Token 用量历史…」）：

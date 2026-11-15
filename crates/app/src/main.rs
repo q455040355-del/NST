@@ -7,6 +7,7 @@
 mod history_ui;
 mod panel;
 mod settings_ui;
+mod shot;
 mod theme;
 mod tray;
 
@@ -27,12 +28,15 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_CONTROL, MOD_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use theme::wide;
 
 const WM_APP_TICK: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
+pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
+const HOTKEY_SHOT: i32 = 1;
 const TRAY_ID: u32 = 1;
 
 thread_local! {
@@ -69,6 +73,7 @@ const ID_GAUGE_NONE: usize = 1106;
 const ID_HISTORY: usize = 1300;
 const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
+const ID_SHOT: usize = 1302;
 const ID_QUIT: usize = 1099;
 
 fn main() {
@@ -77,6 +82,12 @@ fn main() {
         // 系统会把坐标和尺寸按 150% 缩放虚拟化（面板位置/大小全错）
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+
+        // 通用对话框（另存为）需要 COM 单元，不开的话 GetSaveFileNameW 会直接失败
+        windows_sys::Win32::System::Com::CoInitializeEx(
+            std::ptr::null(),
+            windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
         );
 
         let mutex_name = wide("Local\\NetSpeedTaskbar.Rust");
@@ -173,6 +184,9 @@ fn main() {
         // 注意：本进程里的 SetTimer / WM_TIMER 完全不可靠（实测 set 成功但永不触发，
         // 回调形式也一样），所以周期刷新用一个后台线程投递消息，保证一定能到。
         start_ticker(hwnd);
+
+        // Ctrl+Shift+A 截图
+        RegisterHotKey(hwnd, HOTKEY_SHOT, MOD_CONTROL | MOD_SHIFT, 0x41);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
@@ -403,10 +417,12 @@ unsafe extern "system" fn wnd_proc(
             // 全屏程序（游戏/视频）在前台时把自己藏起来，否则一个 TOPMOST 面板会糊在画面上
             let fullscreen = fullscreen_foreground();
             let visible = IsWindowVisible(hwnd) != 0;
+            // 截图/编辑过程中不要把自己弹出来盖住遮罩
+            if !shot::active() && !fullscreen && !visible && !HIDDEN_BY_USER {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
             if fullscreen && visible {
                 ShowWindow(hwnd, SW_HIDE);
-            } else if !fullscreen && !visible && !HIDDEN_BY_USER {
-                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
             if fullscreen {
                 return 0;
@@ -475,6 +491,16 @@ unsafe extern "system" fn wnd_proc(
             show_menu(hwnd);
             0
         }
+        WM_APP_SHOT_FIRE => {
+            shot::begin(hwnd);
+            0
+        }
+        WM_HOTKEY => {
+            if wparam as i32 == HOTKEY_SHOT {
+                shot::request(hwnd);
+            }
+            0
+        }
         WM_DESTROY => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Panel;
             if !ptr.is_null() {
@@ -529,6 +555,7 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(menu, MF_STRING, ID_HISTORY, wide("Token 用量历史…").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("设置…").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_SHOT, wide("截图…\tCtrl+Shift+A").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_PANEL_HIDE, wide("隐藏面板（双击托盘恢复）").as_ptr());
         AppendMenuW(
             menu,
@@ -582,6 +609,9 @@ fn show_menu(hwnd: HWND) {
                 let width = panel.settings.panel_width;
                 let gauge = panel.settings.gauge_source.clone();
                 settings_ui::open(hwnd, width, &gauge);
+            }
+            ID_SHOT => {
+                shot::request(hwnd);
             }
             ID_PANEL_HIDE => {
                 HIDDEN_BY_USER = true;
