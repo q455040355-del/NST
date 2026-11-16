@@ -1823,7 +1823,8 @@ unsafe fn apply_width(hwnd: HWND, state: *mut State, x: i32, client: RECT) {
         return;
     }
     state.width = width;
-    crate::apply_panel_width(state.parent, width);
+    // 拖动过程中只预览，松手（WM_LBUTTONUP）再落盘
+    crate::preview_panel_width(state.parent, width);
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -1977,6 +1978,10 @@ unsafe extern "system" fn dialog_proc(
             ReleaseCapture();
             let state = state_of(hwnd);
             if !state.is_null() {
+                // 拖完滑杆才落盘（拖动过程中只改面板宽度）
+                if (*state).slider_drag {
+                    crate::commit_panel_width((*state).parent);
+                }
                 (*state).slider_drag = false;
                 (*state).scroll_drag = false;
                 InvalidateRect(hwnd, std::ptr::null(), 0);

@@ -91,6 +91,10 @@ fn start(panel: HWND, mode: Mode) {
         if RESTORE_PANEL {
             ShowWindow(panel, SW_HIDE);
         }
+        // 用户从哪块屏开始截图，整套窗口（遮罩/编辑器/贴图）就按那块屏的缩放
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        use_scale_at(cursor);
     }
 
     // 让 DWM 先完成「面板消失」的合成，再抓屏，否则截图里会残留半个面板
@@ -239,12 +243,32 @@ unsafe fn blit_bitmap(dc: HDC, bitmap: &Bitmap, left: i32, top: i32, width: i32,
     DeleteDC(mem_dc);
 }
 
+/// 这套窗口（截图遮罩 / 编辑器 / 贴图）所在屏的缩放，打开时定下来
+static UI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn ui_scale() -> f32 {
+    let bits = UI_SCALE.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        crate::screen_scale()
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// 按某个屏幕坐标所在显示器定缩放（多屏缩放不同时，窗口开在哪就按哪算）
+fn use_scale_at(point: POINT) {
+    UI_SCALE.store(
+        crate::scale_at(point).to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn s(value: f32) -> i32 {
-    (value * crate::screen_scale()).round() as i32
+    (value * ui_scale()).round() as i32
 }
 
 fn make_font(points: f32, weight: i32) -> HFONT {
-    let height = -((points * crate::screen_scale() * 96.0 / 72.0).round() as i32);
+    let height = -((points * ui_scale() * 96.0 / 72.0).round() as i32);
     unsafe {
         CreateFontW(
             height,
@@ -1466,12 +1490,14 @@ fn open_pin(bitmap: Bitmap) {
         };
         RegisterClassW(&wc);
 
-        let scale = crate::screen_scale();
-        let width = ((bitmap.width as f32) / scale) as i32;
-        let height = ((bitmap.height as f32) / scale) as i32;
-
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
+
+        // 贴图开在鼠标那块屏：按那块屏的缩放算尺寸，不然换屏后大小会差一截
+        use_scale_at(cursor);
+        let scale = ui_scale();
+        let width = ((bitmap.width as f32) / scale) as i32;
+        let height = ((bitmap.height as f32) / scale) as i32;
 
         let state = Box::into_raw(Box::new(bitmap));
         let hwnd = CreateWindowExW(
@@ -1982,14 +2008,11 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     };
     RegisterClassW(&wc);
 
-    // 显示尺寸：不超过工作区的 85%
-    let mut work = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+    // 显示尺寸：不超过「截图所在那块屏」工作区的 85%
+    let mut cursor = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut cursor);
+    use_scale_at(cursor);
+    let work = crate::work_area_at(cursor);
     let max_w = ((work.right - work.left) as f32 * 0.85) as i32;
     let max_h = ((work.bottom - work.top) as f32 * 0.8) as i32;
 

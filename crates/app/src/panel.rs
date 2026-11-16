@@ -315,9 +315,14 @@ impl Panel {
     }
 
     /// 改面板宽度：更新设置、保存、立刻改窗口尺寸并重绘。
-    pub fn set_panel_width(&mut self, width: i32) {
-        self.settings.panel_width = width.clamp(72, 360);
-        self.settings.save();
+    /// 拖动滑杆时用：只改内存里的宽度 + 重排窗口，不落盘。
+    /// 一次拖动会经过几十个 4px 档位，每档都写一遍 ini 没必要。
+    pub fn preview_panel_width(&mut self, width: i32) {
+        let width = width.clamp(72, 360);
+        if self.settings.panel_width == width {
+            return;
+        }
+        self.settings.panel_width = width;
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -330,6 +335,11 @@ impl Panel {
             );
             InvalidateRect(self.hwnd, std::ptr::null(), 0);
         }
+    }
+
+    /// 拖动结束：把当前宽度落一次盘
+    pub fn commit_panel_width(&mut self) {
+        self.settings.save();
     }
 
     /// 托盘悬浮提示：和面板上看到的内容一致（太长会被系统截断）。

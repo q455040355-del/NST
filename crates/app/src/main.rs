@@ -1290,11 +1290,25 @@ fn remove_tray(hwnd: HWND) {
 }
 // ---------------------------------------------------------------- 设置窗口回调
 
+/// 设置面板宽度并落盘（键盘左右键、离散操作走这里）
 pub(crate) fn apply_panel_width(parent: HWND, width: i32) {
+    preview_panel_width(parent, width);
+    commit_panel_width(parent);
+}
+
+/// 拖动滑杆时：只改宽度和位置，不写 ini（一次拖动几十档，落盘没必要）
+pub(crate) fn preview_panel_width(parent: HWND, width: i32) {
     if let Some(panel) = panel_mut(parent) {
-        panel.set_panel_width(width);
-        let taskbar = unsafe { FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null()) };
+        panel.preview_panel_width(width);
+        let taskbar = taskbar_for(parent);
         position_panel(parent, taskbar, panel.desired_width(), panel.height());
+    }
+}
+
+/// 松开滑杆：把最终宽度写进 ini
+pub(crate) fn commit_panel_width(parent: HWND) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.commit_panel_width();
     }
 }
 
