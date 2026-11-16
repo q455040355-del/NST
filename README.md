@@ -1,4 +1,4 @@
-﻿# NetSpeedTaskbar (Rust)
+# NetSpeedTaskbar (Rust)
 
 任务栏网速/内存/温度/AI 监控面板，纯 Win32 + GDI 原生实现。
 **C# 版已放弃**，这里是唯一在维护的实现。
@@ -18,11 +18,16 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 .\target\release\netspeed.exe
 ```
 
+日常跑的那份（`D:\OneDrive\桌面\NST\netspeed.exe`）用脚本一条命令部署：
+`powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1` —— 停掉正在跑的面板 → `cargo build --release`
+（进程停了才不会占用 exe）→ 旧 exe 备份到 `%TEMP%\netspeed-before-deploy.exe` → 覆盖 → 校验 md5
+（不一致自动还原）→ 原来跑着就重新拉起。改路径用 `-Deploy`，只拷不启动用 `-NoRestart`。
+
 工具链由 `rust-toolchain.toml` 锁定 **nightly-2026-09-08**（OCR 引擎 `simd-paddle-ocr-rs` 用了 `portable_simd`，stable 编不过）。
 
 `models\` 里是 PaddleOCR 的 det/cls/rec 模型 + 字典（共 7 MB）；程序按 `exe 同级 models\` → `仓库根 models\` → `当前目录 models\` 的顺序查找，取字功能才可用。
 
-`cargo test -p netspeed-core` 跑核心逻辑单测（换算、设置规范化、区间聚合等，14 个）。
+`cargo test -p netspeed-core` 跑核心逻辑单测（换算、设置规范化、区间聚合、多帧 zstd、跨文件去重等，41 个）。
 
 单实例：互斥体 `Local\NetSpeedTaskbar.Rust`。配置：`%LOCALAPPDATA%\NetSpeedTaskbar\settings.ini`。
 
@@ -90,15 +95,20 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **AI 采集（六源，需手动开启）**：设置里「AI 统计」总开关，默认**关**——关着时不建采集线程、
   不打开任何会话文件/数据库，菜单里也不会出现 AI 视图和 Token 指示条。打开后常驻采集（停在别的视图也在累计），
   并可按来源勾选（两列三行）：
-  OpenCode（rusqlite 只读 + WAL 短路）、DSH（`ruzstd` 流式解压）、
+  OpenCode（rusqlite 只读 + WAL 短路）、DSH（`session.v4.jsonl.zstd` 是**边聊边追加的多帧**压缩，按帧循环解压——
+  `StreamingDecoder` 只解第一帧，之前整个 DSH 来源读出来只有一行 session 头，数字永远是 0）、
   WorkBuddy / WorkBuddy AI（`.jsonl` 扫 `rawUsage`）、
   Claude Code（`~/.claude/projects/**/*.jsonl` 的 `message.usage`，同一条消息流式重复上报按 id 合并取大）、
   Codex（`~/.codex/sessions/**/rollout-*.jsonl` 的 `token_count` 事件，取 `last_token_usage` 增量）。
   没装过的工具目录不存在就直接跳过，不会报错也不会建目录。
   文件按「路径 + mtime + 长度」缓存；jsonl 是**流式逐行**读（峰值只跟最长一行有关，不再整文件进内存），
   且只解析**新增的字节**（记录上次偏移，文件被重写时用头部指纹识别后重来）。坏字节只丢一行，不会废掉整个文件。
-  > 面板的「今日」是**输入 + 输出**的合计（口径同历史窗口），且只统计**勾选**的来源（没全开时悬浮说明会标 `n / 6 来源`），
-  > 历史窗口统计**全部**来源，两个数字对不上时先看这里；都勾上就一致了。
+  响应按「来源 + 会话文件指纹 + messageId / seq」做 key：DSH 每个会话的 `seq` 都从 1 开始，
+  不带文件指纹就会互相覆盖；WorkBuddy 的同一个 messageId 会被写进多个会话文件（分叉 / 续写 / 子代理），
+  同一个 key 覆盖一次，不重复累加。
+  > 面板的「今日」是**输入 + 输出**的合计（口径同历史窗口，也按 messageId 去重后相加），
+  > 区别只在**来源**：面板只统计设置里**勾选**的来源（没全开时悬浮说明会标 `n / 6 来源`），
+  > 历史窗口用它自己的来源筛选（默认全选）。两边数字对不上时先比对来源勾选。
 - **全屏避让**：前台窗口铺满**面板所在那块屏**时才自动隐藏（主屏打游戏不会把副屏的面板藏掉），
   退出全屏自动回来；手动「隐藏面板」后不再自动显示，左键点托盘恢复。
 
@@ -153,6 +163,7 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   卡片、柱子、表格、副标题都按选中的来源一起过滤；
 - **四张卡片**：输出 / 输入 / 请求（小字带**缓存命中率**）/ 平均速度，带日均、输入输出倍数等小字；
 - **堆叠柱状图**：按来源分层 + 图例 + Y 轴（六个来源放不下时自动截断图例），切区间时柱高按 `DampedSpring(0.30s / 0.86)` 过渡；
+  鼠标停在柱子上弹提示卡：日期（按小时看时是 `HH:00`）/ **输出 · 输入** / 请求数；
 - **每日明细表**：日期 / 请求 / 输出 / 输入 / 平均速度 / 峰值 / 主要模型，滚轮翻页；
 - **两阶段加载**：先读 OpenCode（毫秒级）出数，再后台扫文件来源（DSH / WorkBuddy / Claude Code / Codex）并追加。
 - **窗口按钮**：右上角和普通窗口一样有「最小化 / 关闭」两个符号，点任务栏按钮也能最小化/还原。
@@ -160,6 +171,7 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   `%LOCALAPPDATA%\NetSpeedTaskbar\index\usage-YYYYMMDD.bin`，每片头部带内容指纹——
   今天聊了几句只有今天那片会重写（几百 KB），历史那些天原封不动。冷启约 3~5 秒（旧版 20~30 秒），
   之后热启 130~350 ms。老的单文件 `usage-index.bin` 会在首次运行时自动迁移并删除。
+  索引版本比当前旧（`INDEX_VERSION`）时整片直接删掉重新解析，免得旧口径（比如没存 messageId）的记录继续算。
 
 日期分桶统一按**本地日**（`ai::day_index`），不再混用 UTC 天数，否则「今天」会差 8 小时。
 

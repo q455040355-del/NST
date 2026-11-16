@@ -241,8 +241,8 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
     }
 
     // 3) 先把索引写回去（下次打开就只剩目录扫描），再按天数过滤出结果
-    //    有文件变动、或者片上还是旧格式，都要重写一遍
-    if dirty || !index.upgrade.is_empty() {
+    //    有文件变动才值得重写索引
+    if dirty {
         index.save(&entries, from_ms);
     }
 
@@ -257,20 +257,36 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
     dedupe_records(out)
 }
 
-/// 同一个消息 id 出现在多个文件里（会话续写/分叉）时只留一份。
+/// 同一个消息 id 出现在多个文件里（会话续写/分叉/子代理转录）时只留一份。
 ///
-/// 引擎侧本来就按 id 覆盖，历史这边是「按文件」累加的，不去重会多算。
-/// 只对带 id 的记录（Claude）生效，其它来源 id 恒为 0。
+/// 引擎侧本来就按 id 覆盖，历史这边是「按文件」累加的，不去重会多算 ——
+/// WorkBuddy（AI）尤其明显：一次会话会被复制进好几个 `*.jsonl`，
+/// 整份 2.4B 的输入里有 1.7B 是同一批消息的第二、第三份。
+/// 只对带 id 的记录生效（WorkBuddy 用 messageId 的哈希，其它来源 id 恒为 0）。
 fn dedupe_records(records: Vec<UsageRecord>) -> Vec<UsageRecord> {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
-    let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
-    let mut out = Vec::with_capacity(records.len());
+    let mut index: HashMap<(u64, &'static str), usize> = HashMap::new();
+    let mut out: Vec<UsageRecord> = Vec::with_capacity(records.len());
     for record in records {
-        if record.id != 0 && !seen.insert((record.id, record.source)) {
+        if record.id == 0 {
+            out.push(record);
             continue;
         }
-        out.push(record);
+
+        match index.get(&(record.id, record.source)) {
+            // 重复的那一份不一定更完整：留「用量更大」的那条
+            Some(&slot) => {
+                let kept = &mut out[slot];
+                if record.output + record.input > kept.output + kept.input {
+                    *kept = record;
+                }
+            }
+            None => {
+                index.insert((record.id, record.source), out.len());
+                out.push(record);
+            }
+        }
     }
     out
 }
@@ -287,7 +303,7 @@ fn hash_id(text: &str) -> u64 {
 
 // ------------------------------------------------------------ 磁盘索引
 
-const INDEX_VERSION: u32 = 3;
+const INDEX_VERSION: u32 = 4;
 const INDEX_MAGIC: &[u8; 4] = b"NSUI";
 
 struct IndexEntry {
@@ -307,8 +323,6 @@ struct Index {
     shards: HashMap<i64, u64>,
     /// 数据是从老的单文件索引读出来的：下次保存时顺手迁移
     legacy: bool,
-    /// 还是旧格式（< v3）的分片：保存时强制重写一遍，把消息 id 补进去
-    upgrade: std::collections::HashSet<i64>,
 }
 
 impl Index {
@@ -330,7 +344,6 @@ impl Index {
     fn load() -> Self {
         let mut entries = HashMap::new();
         let mut shards = HashMap::new();
-        let mut upgrade = std::collections::HashSet::new();
 
         if let Some(dir) = Self::dir() {
             if let Ok(list) = std::fs::read_dir(&dir) {
@@ -341,7 +354,11 @@ impl Index {
                     };
                     if let Ok((version, hash, loaded)) = read_index(&path) {
                         if version < INDEX_VERSION {
-                            upgrade.insert(day);
+                            // 旧口径的记录不能继续用（比如 WorkBuddy 的记录还没带
+                            // messageId，跨文件去重做不了）：整片删掉，
+                            // 这些文件下次被扫到时重新解析一遍
+                            let _ = std::fs::remove_file(&path);
+                            continue;
                         }
                         shards.insert(day, hash);
                         entries.extend(loaded);
@@ -350,13 +367,18 @@ impl Index {
             }
         }
 
-        // 没有分片就找老索引：读完在下次保存时迁到分片目录
+        // 没有分片就找老索引：读完在下次保存时迁到分片目录。
+        // 老格式（没带 messageId）里可能已经有重复记录，只删不迁，让它重新扫一遍
         let mut legacy = false;
         if entries.is_empty() {
             if let Some(path) = Self::legacy_path() {
-                if let Ok((_, _, loaded)) = read_index(&path) {
-                    legacy = !loaded.is_empty();
-                    entries = loaded;
+                if let Ok((version, _, loaded)) = read_index(&path) {
+                    if version >= INDEX_VERSION && !loaded.is_empty() {
+                        legacy = true;
+                        entries = loaded;
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
                 }
             }
         }
@@ -365,7 +387,6 @@ impl Index {
             entries,
             shards,
             legacy,
-            upgrade,
         }
     }
 
@@ -399,8 +420,7 @@ impl Index {
         let mut written: HashMap<i64, u64> = HashMap::new();
         for (day, picks) in &groups {
             let hash = fingerprint(entries, picks);
-            // 旧格式的分片即使内容没变也要重写（补消息 id 等新字段）
-            if !self.upgrade.contains(day) && self.shards.get(day) == Some(&hash) {
+            if self.shards.get(day) == Some(&hash) {
                 written.insert(*day, hash);
                 continue;
             }
@@ -451,7 +471,6 @@ impl Index {
         }
 
         self.shards = written;
-        self.upgrade.clear();
     }
 }
 
@@ -485,6 +504,7 @@ fn fingerprint(
             record.input.hash(&mut hasher);
             record.cache_read.hash(&mut hasher);
             record.duration_ms.hash(&mut hasher);
+            record.id.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -724,18 +744,14 @@ fn collect_stamped(root: &Path, suffix: &str, modified_after_ms: i64) -> Vec<(Pa
 }
 
 fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-
-    let Ok(decoder) = ruzstd::decoding::StreamingDecoder::new(file) else {
+    let Ok(reader) = super::ai::ZstdFrames::open(path) else {
         return Vec::new();
     };
 
     let mut records = Vec::new();
     let mut pending_start = 0_i64;
 
-    for_each_line(BufReader::new(decoder), |line| {
+    for_each_line(BufReader::new(reader), |line| {
         if line.contains("\"step/start\"") {
             if let Ok(value) = serde_json::from_str::<Value>(line) {
                 pending_start = value["time"].as_i64().unwrap_or(0);
@@ -839,7 +855,9 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             input: 0,
             cache_read: 0,
             duration_ms: 0,
-            id: 0,
+            // 带 id：同一个 messageId 会被 WorkBuddy 写进多个会话文件
+            // （分叉 / 续写 / 子代理），跨文件去重全靠它
+            id: hash_id(message_id),
         });
 
         if output > entry.output {
@@ -1384,8 +1402,69 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_message_ids_are_merged() {
-        let mut first = record(5, SOURCE_CLAUDE, "claude-x", 100);
+    fn dsh_reads_every_appended_frame() {
+        let dir = std::env::temp_dir().join("nst-dsh-frames");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("session.v4.jsonl.zstd");
+        let frame = |line: &str| {
+            ruzstd::encoding::compress_to_vec(
+                format!("{line}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Uncompressed,
+            )
+        };
+        let message = |seq: i64, time: i64, output: i64| {
+            format!(
+                r#"{{"type":"assistant/message","seq":{seq},"time":{time},"data":{{"usage":{{"inputTokens":10,"outputTokens":{output}}},"message":{{"source":{{"model":"m"}}}}}}}}"#
+            )
+        };
+        let mut bytes = frame(&message(1, 1_000, 10));
+        bytes.extend(frame(&message(2, 2_000, 20)));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let records = parse_dsh(&path, SOURCE_DSH);
+        assert_eq!(records.len(), 2, "追加的第二帧也要读到");
+        assert_eq!(records[0].output, 10);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workbuddy_message_ids_dedupe_across_files() {
+        let dir = std::env::temp_dir().join("nst-wb-dedupe");
+        let _ = std::fs::create_dir_all(&dir);
+        let line = |id: &str, input: i64, output: i64| {
+            serde_json::json!({
+                "providerData": {
+                    "messageId": id,
+                    "model": "m",
+                    "rawUsage": {"prompt_tokens": input, "completion_tokens": output}
+                },
+                "timestamp": 1_763_000_000_000_i64
+            })
+            .to_string()
+        };
+        let first = dir.join("a.jsonl");
+        let second = dir.join("b.jsonl");
+        // 会话分叉 / 续写时，同一批 messageId 会被写进多个文件
+        std::fs::write(&first, format!("{}\n{}\n", line("m1", 100, 10), line("m2", 200, 20)))
+            .unwrap();
+        std::fs::write(&second, format!("{}\n", line("m1", 100, 10))).unwrap();
+
+        let mut records = parse_workbuddy(&first, SOURCE_WORKBUDDY_AI);
+        records.extend(parse_workbuddy(&second, SOURCE_WORKBUDDY_AI));
+        assert!(
+            records.iter().all(|record| record.id != 0),
+            "WorkBuddy 记录要带 messageId，否则跨文件没法去重"
+        );
+
+        let merged = dedupe_records(records);
+        assert_eq!(merged.len(), 2, "跨文件重复的消息只算一次");
+        assert_eq!(merged.iter().map(|record| record.input).sum::<i64>(), 300);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn duplicate_message_ids_are_merged() {        let mut first = record(5, SOURCE_CLAUDE, "claude-x", 100);
         first.id = 42;
         let mut same = first.clone();
         same.output = 120;
@@ -1393,7 +1472,8 @@ mod tests {
 
         let out = dedupe_records(vec![first, same, unique]);
         assert_eq!(out.len(), 2, "同 id 只留一条，不同 id 都保留");
-        assert_eq!(out[0].output, 100);
+        // 重复的那一份可能是流式写到一半的旧值，留用量更大的那条
+        assert_eq!(out[0].output, 120);
         assert_eq!(out[1].output, 7);
     }
 

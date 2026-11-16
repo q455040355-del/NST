@@ -8,6 +8,7 @@
 //! 所有文件来源都按「路径 + 修改时间」缓存，只有变过的文件才重新解析。
 
 use rusqlite::{Connection, OpenFlags};
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -897,15 +898,107 @@ fn head_hash(path: &Path) -> u64 {
     hash
 }
 
+/// 多帧 zstd 读取器。
+///
+/// DSH 的 `session.v4.jsonl.zstd` 是边聊边追加的：每批事件压成一个**独立帧**。
+/// `ruzstd::decoding::StreamingDecoder` 只解第一帧就 EOF，所以整份会话只剩开头那行
+/// session 头 —— 以前 DSH 来源永远是 0 就是这个原因。这里按帧循环解压，
+/// 把每一帧的内容接成同一条字节流。
+pub(crate) struct ZstdFrames {
+    source: File,
+    decoder: FrameDecoder,
+    /// 已经解出来、还没被读走的字节
+    pending: Vec<u8>,
+    /// 当前帧的起始偏移
+    offset: u64,
+    done: bool,
+}
+
+impl ZstdFrames {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let mut source = File::open(path)?;
+        let mut decoder = FrameDecoder::new();
+        // 不是 zstd（或空文件）：当作空流，别让调用方报错
+        let done = decoder.reset(&mut source).is_err();
+        Ok(Self {
+            source,
+            decoder,
+            pending: Vec::new(),
+            offset: 0,
+            done,
+        })
+    }
+
+    /// 切到下一帧：从上一帧结束的位置重新初始化解码器
+    fn next_frame(&mut self) -> bool {
+        let length = self.source.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if self.offset >= length {
+            return false;
+        }
+        if self.source.seek(SeekFrom::Start(self.offset)).is_err() {
+            return false;
+        }
+        self.decoder.reset(&mut self.source).is_ok()
+    }
+}
+
+impl Read for ZstdFrames {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if !self.pending.is_empty() {
+                let take = out.len().min(self.pending.len());
+                out[..take].copy_from_slice(&self.pending[..take]);
+                self.pending.drain(..take);
+                return Ok(take);
+            }
+
+            if self.done {
+                return Ok(0);
+            }
+
+            if let Some(chunk) = self.decoder.collect() {
+                if !chunk.is_empty() {
+                    self.pending = chunk;
+                    continue;
+                }
+            }
+
+            if !self.decoder.is_finished() {
+                if self
+                    .decoder
+                    .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(4))
+                    .is_err()
+                {
+                    self.done = true;
+                    return Ok(0);
+                }
+                continue;
+            }
+
+            // 当前帧解完：用这一帧实际吃掉的字节数推进到下一帧
+            self.offset += self.decoder.bytes_read_from_source();
+            if !self.next_frame() {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+    }
+}
+
 fn parse_dsh(path: &Path, prefix: &'static str) -> std::io::Result<FileRows> {
-    let file = File::open(path)?;
-    let decoder = ruzstd::decoding::StreamingDecoder::new(file)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let reader = ZstdFrames::open(path)?;
     // 逐行读：解压结果不再整段进内存，峰值只跟最长一行有关
-    let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
     let mut buf = Vec::new();
     let mut rows = HashMap::new();
     let mut pending_start = 0_i64;
+    // 每个会话文件里的 seq 都从 0/1 重新数，不带文件指纹的话不同会话会互相覆盖
+    let salt = path_salt(path);
+    let mut ordinal = 0_usize;
 
     loop {
         buf.clear();
@@ -945,7 +1038,12 @@ fn parse_dsh(path: &Path, prefix: &'static str) -> std::io::Result<FileRows> {
 
         let time = value["time"].as_i64().unwrap_or(0);
         let seq = value["seq"].as_i64().unwrap_or(0);
-        let key = format!("{prefix}:{seq}");
+        let key = if seq > 0 {
+            format!("{prefix}:{salt:x}:{seq}")
+        } else {
+            format!("{prefix}:{salt:x}:#{ordinal}")
+        };
+        ordinal += 1;
 
         let start = if pending_start > 0 && time > pending_start && time - pending_start < 600_000 {
             pending_start
@@ -1728,6 +1826,56 @@ mod tests {
 
     fn workbuddy_entry() -> FileEntry {
         FileEntry::new(FileKind::WorkBuddy, "wb")
+    }
+
+    /// 一个 zstd 帧：DSH 每追加一批事件就压一帧
+    fn dsh_frame(lines: &[String]) -> Vec<u8> {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Uncompressed,
+        )
+    }
+
+    fn dsh_message(seq: i64, time: i64, input: i64, output: i64) -> String {
+        format!(
+            r#"{{"type":"assistant/message","seq":{seq},"time":{time},"data":{{"usage":{{"inputTokens":{input},"outputTokens":{output},"cacheReadTokens":0,"cacheWriteTokens":0}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn dsh_reads_every_appended_frame() {
+        // DSH 的会话文件是「一帧一批」追加写的，只解第一帧就只剩 session 头
+        let path = temp_path("dsh-multiframe.zstd");
+        let mut bytes = dsh_frame(&[dsh_message(1, 1_000, 100, 10)]);
+        bytes.extend(dsh_frame(&[dsh_message(2, 2_000, 200, 20)]));
+        bytes.extend(dsh_frame(&[dsh_message(3, 3_000, 300, 30)]));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let rows = parse_dsh(&path, "dsh").unwrap();
+        assert_eq!(rows.len(), 3, "三帧里的消息都要读到");
+        let total: i64 = rows.values().map(|row| row.input + row.output).sum();
+        assert_eq!(total, 660);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dsh_keys_do_not_collide_across_sessions() {
+        let first = temp_path("dsh-session-a.zstd");
+        let second = temp_path("dsh-session-b.zstd");
+        std::fs::write(&first, dsh_frame(&[dsh_message(1, 1_000, 100, 10)])).unwrap();
+        std::fs::write(&second, dsh_frame(&[dsh_message(1, 1_000, 200, 20)])).unwrap();
+
+        let a = parse_dsh(&first, "dsh").unwrap();
+        let b = parse_dsh(&second, "dsh").unwrap();
+        // 两个会话的 seq 都从 1 开始：key 必须带文件指纹，否则后解析的会顶掉前一个
+        assert!(a.keys().all(|key| !b.contains_key(key)));
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     fn parse_file(entry: &mut FileEntry, path: &Path) -> Delta {

@@ -2097,7 +2097,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
         }
     }
 
-    // 悬停提示卡：日期/小时 + 输出与请求
+    // 悬停提示卡：日期/小时 + 输出 / 输入 / 请求
     if let Some(index) = state.hover {
         if let Some(day) = state.days.get(index) {
             let title = if state.hourly {
@@ -2105,18 +2105,20 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             } else {
                 day_full_label(day.day)
             };
-            let line = format!(
-                "输出 {} · 请求 {}",
+            let tokens = format!(
+                "输出 {} · 输入 {}",
                 history::format_tokens(day.output),
-                thousands(day.requests)
+                history::format_tokens(day.input)
             );
+            let requests = format!("请求 {}", thousands(day.requests));
             let padding = p.s(12.0);
             let width = (p
                 .text_width(&title, 8.5, 600)
-                .max(p.text_width(&line, 8.0, 400))
+                .max(p.text_width(&tokens, 8.0, 400))
+                .max(p.text_width(&requests, 8.0, 400))
                 + padding * 2)
                 .max(p.s(150.0));
-            let height = p.s(52.0);
+            let height = p.s(72.0);
 
             let total = *state.now_heights.get(index).unwrap_or(&0.0);
             let bar_top = if total > 0.0 {
@@ -2156,7 +2158,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 DT_LEFT,
             );
             p.text(
-                &line,
+                &tokens,
                 8.0,
                 400,
                 p.ui.text2,
@@ -2164,6 +2166,17 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
                 top + p.s(24.0),
                 left + width - padding,
                 top + p.s(46.0),
+                DT_LEFT,
+            );
+            p.text(
+                &requests,
+                8.0,
+                400,
+                p.ui.text2,
+                left + padding,
+                top + p.s(44.0),
+                left + width - padding,
+                top + p.s(66.0),
                 DT_LEFT,
             );
         }
