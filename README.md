@@ -174,9 +174,12 @@ CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --work
 ## 发布
 
 打一个 `v*` 的 tag（例如 `v0.2.0`）就会触发 `.github/workflows/release.yml`：
-在 `windows-latest` 上构建 release，把 `netspeed.exe` + `README.md` + `LICENSE` 打成
-`netspeed-<tag>-win64.zip`，挂到对应的 GitHub Release 上（Release notes 自动生成）。
-程序本身是单文件绿色版，解压就能跑，配置在 `%LOCALAPPDATA%\NetSpeedTaskbar\`。
+在 `windows-latest` 上构建 release，把 `netspeed.exe` + **`models/`**（取字模型，约 7 MB）
++ `README.md` + `LICENSE` 打成 `netspeed-<tag>-win64.zip`，挂到对应的 GitHub Release 上
+（Release notes 自动生成）。`models/` 不在包里的话「取字」会提示找不到模型，
+所以流水线里加了检查，缺了就直接让构建失败。
+
+绿色版：解压后 `netspeed.exe` 旁边必须有 `models\`，配置在 `%LOCALAPPDATA%\NetSpeedTaskbar\`。
 
 崩溃会在 `%TEMP%\netspeed-rs.log` 留一条 `PANIC 文件:行: 消息`（日志超过 1 MB 自动重建）。
 

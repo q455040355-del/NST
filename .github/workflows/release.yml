@@ -1,6 +1,6 @@
 name: Release
 
-# 打 tag（v1.2.3）时出 Windows 包：单 exe + README + LICENSE，打成 zip 挂到 Release
+# 打 tag（v1.2.3）时出 Windows 包：exe + models/（取字模型）+ README + LICENSE，打成 zip 挂到 Release
 on:
   push:
     tags: ["v*"]
@@ -32,8 +32,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Copy-Item target/release/netspeed.exe $dir
           Copy-Item README.md, LICENSE $dir
+
+          # 取字（OCR）要用 models/det.onnx 等，仓库里已经带了，必须一起打包，
+          # 否则解压出来点「取字」只会提示找不到 models 目录
+          if (-not (Test-Path models)) {
+            throw "models/ 不存在，打出来的包取字功能不可用"
+          }
+          Copy-Item -Recurse models $dir
+
           Compress-Archive -Path $dir -DestinationPath "netspeed-$tag-win64.zip" -Force
-          Get-ChildItem netspeed-*.zip | Select-Object Name, Length
+          Get-ChildItem "netspeed-$tag-win64.zip" | Select-Object Name, Length
 
       - name: Upload
         uses: softprops/action-gh-release@v2
