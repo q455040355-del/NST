@@ -18,6 +18,9 @@ const CLASS_NAME: &str = "NetSpeedTaskbarRs.Menu";
 
 pub const WM_APP_MENU_PICK: u32 = WM_APP + 0x41;
 
+/// 当前开着的菜单窗口（再开一个之前先关掉它）
+static mut CURRENT: HWND = std::ptr::null_mut();
+
 /// 左侧标记列画什么
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
@@ -467,6 +470,7 @@ unsafe extern "system" fn menu_proc(
             0
         }
         WM_DESTROY => {
+            CURRENT = std::ptr::null_mut();
             let state = state_of(hwnd);
             if !state.is_null() {
                 let state = Box::from_raw(state);
@@ -483,6 +487,12 @@ unsafe extern "system" fn menu_proc(
 pub unsafe fn open(owner: HWND, rows: Vec<Entry>) {
     if rows.is_empty() {
         return;
+    }
+
+    // 已经开着一个就先关掉：快速右键两次不会叠出两个菜单
+    if !CURRENT.is_null() && IsWindow(CURRENT) != 0 {
+        DestroyWindow(CURRENT);
+        CURRENT = std::ptr::null_mut();
     }
 
     let instance = GetModuleHandleW(std::ptr::null());
@@ -544,6 +554,7 @@ pub unsafe fn open(owner: HWND, rows: Vec<Entry>) {
         let _ = Box::from_raw(state);
         return;
     }
+    CURRENT = hwnd;
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
     ui::round_corners(hwnd);

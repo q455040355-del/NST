@@ -1726,6 +1726,15 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let bitmap = composite(editor);
             if save_bitmap(&bitmap, hwnd) {
                 SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
+            } else {
+                // 以前失败是完全静默的：磁盘满/没权限时用户以为存上了
+                MessageBoxW(
+                    hwnd,
+                    wide("保存失败：磁盘空间不足、没有写入权限，或路径无效。")
+                        .as_ptr(),
+                    wide("保存截图").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
             }
         }
         Action::Ocr => {
