@@ -368,6 +368,8 @@ struct Overlay {
     canvas: Option<(HDC, HBITMAP, *mut u8)>,
     /// 上一帧的选区（用来把那些行恢复成压暗版本）
     last_rect: Option<RECT>,
+    /// 上一帧「宽 × 高」标签胶囊的区域（同样要恢复，不然会叠字/留残影）
+    last_label: Option<RECT>,
 }
 
 /// 把整屏画布上某块矩形恢复成「压暗版」像素。
@@ -386,6 +388,16 @@ unsafe fn restore_rows(bits: *mut u8, dimmed: &[u8], width: i32, height: i32, re
         if offset + len <= dimmed.len() {
             std::ptr::copy_nonoverlapping(dimmed.as_ptr().add(offset), bits.add(offset), len);
         }
+    }
+}
+
+/// 把矩形往外扩 `pad` 像素（还原上一帧时把描边/文字的抗锯齿边一起抹掉）。
+fn inflate(rect: RECT, pad: i32, width: i32, height: i32) -> RECT {
+    RECT {
+        left: (rect.left - pad).max(0),
+        top: (rect.top - pad).max(0),
+        right: (rect.right + pad).min(width),
+        bottom: (rect.bottom + pad).min(height),
     }
 }
 
@@ -571,9 +583,14 @@ unsafe fn overlay_paint(hwnd: HWND) {
     let _ = dib;
 
     if !bits.is_null() {
-        // 先把上一帧的选区恢复成压暗版，再把这一帧的选区还原成原始像素
+        // 先把上一帧的选区 + 尺寸标签恢复成压暗版，再把这一帧的选区还原成原始像素。
+        // 标签画在选区外面，如果不单独还原，每次重绘都会把字叠一遍——看起来又粗又糊，
+        // 换窗口时还会留下上一个尺寸的残影。
         if let Some(rect) = state.last_rect {
-            restore_rows(bits, &state.dimmed, width, height, rect);
+            restore_rows(bits, &state.dimmed, width, height, inflate(rect, s(2.0), width, height));
+        }
+        if let Some(rect) = state.last_label {
+            restore_rows(bits, &state.dimmed, width, height, inflate(rect, s(2.0), width, height));
         }
 
         let current = selection(state);
@@ -606,14 +623,43 @@ unsafe fn overlay_paint(hwnd: HWND) {
         let label = format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top);
         let font = cached_font(9.0, 700);
         let old_font = SelectObject(dc, font as HGDIOBJ);
+        let text_w = wide_width(dc, &label);
+        let pad_x = s(7.0);
+        let pill = RECT {
+            left: rect.left.max(0),
+            top: (rect.top - s(24.0)).max(0),
+            right: rect.left.max(0) + (text_w + pad_x * 2).max(s(40.0)),
+            bottom: (rect.top - s(24.0)).max(0) + s(20.0),
+        };
+
+        // 深色胶囊打底：白字直接画在花花绿绿的壁纸/窗口上会发虚，也容易糊成一片
+        let fill = 0x0018_1818;
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(0, 1, fill);
+        let old_brush = SelectObject(dc, brush as HGDIOBJ);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        windows_sys::Win32::Graphics::Gdi::RoundRect(
+            dc,
+            pill.left,
+            pill.top,
+            pill.right,
+            pill.bottom,
+            s(5.0),
+            s(5.0),
+        );
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+        DeleteObject(brush as *mut _);
+        DeleteObject(pen as *mut _);
+
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, 0x00FF_FFFF);
 
         let mut label_rect = RECT {
-            left: rect.left,
-            top: (rect.top - s(24.0)).max(0),
-            right: rect.right,
-            bottom: (rect.top - s(24.0)).max(0) + s(20.0),
+            left: pill.left + pad_x,
+            top: pill.top,
+            right: pill.right - pad_x,
+            bottom: pill.bottom,
         };
         DrawTextW(
             dc,
@@ -624,6 +670,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
         );
 
         SelectObject(dc, old_font);
+        state.last_label = Some(pill);
     }
 
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -823,6 +870,7 @@ pub unsafe fn begin(panel: HWND) {
         hover,
         canvas: None,
         last_rect: None,
+        last_label: None,
     }));
 
     let hwnd = CreateWindowExW(
