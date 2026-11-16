@@ -86,13 +86,17 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   窄面板 + 大字号时会按剩余宽度继续缩字，保证不被 `DrawText` 裁掉。
 - **温度**：CPU 走 WMI `Win32_PerfFormattedData_Counters_ThermalZoneInformation`（0.1K → °C，取最高热区），
   GPU 走常驻 `nvidia-smi --loop=1`；后台线程分别 2s / 1s 刷新，15 秒没更新显示 `--`，首次进温度视图才启动。
-- **AI 采集（四源，需手动开启）**：设置里「AI 统计」总开关，默认**关**——关着时不建采集线程、
+- **AI 采集（六源，需手动开启）**：设置里「AI 统计」总开关，默认**关**——关着时不建采集线程、
   不打开任何会话文件/数据库，菜单里也不会出现 AI 视图和 Token 指示条。打开后常驻采集（停在别的视图也在累计），
-  并可按来源勾选：OpenCode（rusqlite 只读 + WAL 短路）、DSH（`ruzstd` 流式解压）、
-  WorkBuddy / WorkBuddy AI（`.jsonl` 扫 `rawUsage`）。
+  并可按来源勾选（两列三行）：
+  OpenCode（rusqlite 只读 + WAL 短路）、DSH（`ruzstd` 流式解压）、
+  WorkBuddy / WorkBuddy AI（`.jsonl` 扫 `rawUsage`）、
+  Claude Code（`~/.claude/projects/**/*.jsonl` 的 `message.usage`，同一条消息流式重复上报按 id 合并取大）、
+  Codex（`~/.codex/sessions/**/rollout-*.jsonl` 的 `token_count` 事件，取 `last_token_usage` 增量）。
+  没装过的工具目录不存在就直接跳过，不会报错也不会建目录。
   文件按「路径 + mtime + 长度」缓存；jsonl 是**流式逐行**读（峰值只跟最长一行有关，不再整文件进内存），
   且只解析**新增的字节**（记录上次偏移，文件被重写时用头部指纹识别后重来）。坏字节只丢一行，不会废掉整个文件。
-  > 面板的「今日」只统计**勾选**的来源（没全开时悬浮说明会标 `n / 4 来源`），历史窗口统计**全部**来源，
+  > 面板的「今日」只统计**勾选**的来源（没全开时悬浮说明会标 `n / 6 来源`），历史窗口统计**全部**来源，
   > 两个数字对不上时先看这里；都勾上就一致了。
 - **全屏避让**：前台窗口铺满**面板所在那块屏**时才自动隐藏（主屏打游戏不会把副屏的面板藏掉），
   退出全屏自动回来；手动「隐藏面板」后不再自动显示，左键点托盘恢复。
@@ -141,9 +145,9 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   没选中的来源文字变灰、圆点变淡，图例和柱子跟着消失。全关会退回全选（不留空视图）。
   卡片、柱子、表格、副标题都按选中的来源一起过滤；
 - **四张卡片**：输出 / 输入 / 请求（小字带**缓存命中率**）/ 平均速度，带日均、输入输出倍数等小字；
-- **堆叠柱状图**：按来源分层 + 图例 + Y 轴，切区间时柱高按 `DampedSpring(0.30s / 0.86)` 过渡；
+- **堆叠柱状图**：按来源分层 + 图例 + Y 轴（六个来源放不下时自动截断图例），切区间时柱高按 `DampedSpring(0.30s / 0.86)` 过渡；
 - **每日明细表**：日期 / 请求 / 输出 / 输入 / 平均速度 / 峰值 / 主要模型，滚轮翻页；
-- **两阶段加载**：先读 OpenCode（毫秒级）出数，再后台扫 DSH / WorkBuddy 文件并追加。
+- **两阶段加载**：先读 OpenCode（毫秒级）出数，再后台扫文件来源（DSH / WorkBuddy / Claude Code / Codex）并追加。
 - **磁盘索引（分片）**：解析结果按「文件 mtime 那天」分片存在
   `%LOCALAPPDATA%\NetSpeedTaskbar\index\usage-YYYYMMDD.bin`，每片头部带内容指纹——
   今天聊了几句只有今天那片会重写（几百 KB），历史那些天原封不动。冷启约 3~5 秒（旧版 20~30 秒），
@@ -167,8 +171,15 @@ powershell -File scripts\smoke.ps1 -Dark
 CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --workspace` 和
 `cargo check --workspace --all-targets`；界面相关的验证只能本地跑 smoke。
 
+## 发布
+
+打一个 `v*` 的 tag（例如 `v0.2.0`）就会触发 `.github/workflows/release.yml`：
+在 `windows-latest` 上构建 release，把 `netspeed.exe` + `README.md` + `LICENSE` 打成
+`netspeed-<tag>-win64.zip`，挂到对应的 GitHub Release 上（Release notes 自动生成）。
+程序本身是单文件绿色版，解压就能跑，配置在 `%LOCALAPPDATA%\NetSpeedTaskbar\`。
+
 崩溃会在 `%TEMP%\netspeed-rs.log` 留一条 `PANIC 文件:行: 消息`（日志超过 1 MB 自动重建）。
 
 ## 待办
 
-1. AI 来源补齐：Claude Code / Codex。
+- 历史窗口来源支持多选（现在是单选，选项本身已会记住）。

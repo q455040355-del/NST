@@ -61,14 +61,23 @@ const CONTROL_X: f32 = 178.0;
 const AI_HEAD_TOP: f32 = 396.0; // 分隔线
 const AI_TITLE_TOP: f32 = 402.0; // 「AI 统计」小标题
 const AI_TOGGLE_TOP: f32 = 428.0; // 总开关行
-const AI_SOURCES_TOP: f32 = 470.0; // 四个来源行起点
+const AI_SOURCES_TOP: f32 = 470.0; // 来源格子起点（两列三行）
 const AI_ROW_H: f32 = 42.0;
-const AI_SOURCE_LABELS: [&str; 4] = ["OpenCode", "dsh", "WorkBuddy", "WorkBuddy AI"];
+/// 来源格子的行高（两列三行，比整行矮一点，正好铺满）
+const AI_SOURCE_ROW_H: f32 = 36.0;
+const AI_SOURCE_LABELS: [&str; 6] = [
+    "OpenCode",
+    "dsh",
+    "WorkBuddy",
+    "WorkBuddy AI",
+    "Claude Code",
+    "Codex",
+];
 
 /// 可滚动内容区：分隔线往下到页脚分割线往上
 const CONTENT_TOP: f32 = 65.0;
 /// 内容总高度（最后一个来源行 + 一点留白）；窗口比这个矮就出现滚动
-const CONTENT_BOTTOM: f32 = 646.0;
+const CONTENT_BOTTOM: f32 = 582.0;
 /// 页脚（分割线 + 完成按钮）高度
 const FOOTER_H: f32 = 64.0;
 
@@ -316,7 +325,7 @@ struct State {
     refresh: usize,
     font: usize,
     ai_enabled: bool,
-    ai_sources: [bool; 4],
+    ai_sources: [bool; 6],
     auto_start: bool,
     fonts: Fonts,
     scale: f32,
@@ -341,7 +350,7 @@ struct Layout {
     /// 四个下拉：0 = 字号、1 = 指示条、2 = 网卡、3 = 刷新（行号 = 下标 + 1）
     selects: [RECT; 4],
     ai_toggle: RECT,
-    ai_sources: [RECT; 4],
+    ai_sources: [RECT; 6],
     /// 页脚左边的「开机自启」整行热区
     auto_start: RECT,
 }
@@ -422,20 +431,30 @@ fn layout(state: &State, client: RECT) -> Layout {
     }
 }
 
-fn ai_source_rects(scale: f32, right: i32) -> [RECT; 4] {
+fn ai_source_rects(scale: f32, right: i32) -> [RECT; 6] {
+    // 两列三行：一列六行会把窗口顶出滚动条
+    let left = s(12.0, scale);
+    let gutter = s(12.0, scale);
+    let column = (right - left - gutter) / 2;
+    let top0 = s(AI_SOURCES_TOP, scale);
+    let row_h = s(AI_SOURCE_ROW_H, scale);
+
     let mut rects = [RECT {
         left: 0,
         top: 0,
         right: 0,
         bottom: 0,
-    }; 4];
+    }; 6];
     for (index, slot) in rects.iter_mut().enumerate() {
-        let top = s(AI_SOURCES_TOP + AI_ROW_H * index as f32, scale);
+        let column_index = (index / 3) as i32;
+        let row = (index % 3) as i32;
+        let left = left + column_index * (column + gutter);
+        let top = top0 + row * row_h;
         *slot = RECT {
-            left: s(12.0, scale),
+            left,
             top,
-            right,
-            bottom: top + s(AI_ROW_H, scale),
+            right: left + column,
+            bottom: top + row_h,
         };
     }
     rects
@@ -893,15 +912,16 @@ unsafe fn paint(hwnd: HWND) {
         );
     }
 
-    // 四个来源
+    // 六个来源：排成两列三行（一列六行会顶出窗口）
     for (index, slot) in l.ai_sources.iter().enumerate() {
         let rect = *slot;
+        let right = rect.right;
         let on = state.ai_sources[index];
         if state.ai_enabled && state.hover == Some(Hit::AiSource(index)) {
             p.round(
                 rect.left,
                 rect.top + p.s(1.0),
-                content_right,
+                right,
                 rect.bottom - p.s(1.0),
                 p.s(7.0),
                 c.chip,
@@ -912,15 +932,15 @@ unsafe fn paint(hwnd: HWND) {
             AI_SOURCE_LABELS[index],
             state.fonts.value,
             if state.ai_enabled { c.text } else { c.text3 },
-            pad + p.s(16.0),
+            rect.left + p.s(16.0),
             rect.top,
-            rect.right - p.s(44.0),
+            right - p.s(30.0),
             rect.bottom,
             DT_LEFT,
         );
 
         let size = p.s(16.0);
-        let bx = content_right - size;
+        let bx = right - size - p.s(6.0);
         let by = (rect.top + rect.bottom) / 2 - size / 2;
         let (fill, border) = if !state.ai_enabled {
             (c.surface, mix_white(c.border, 0.25))
@@ -1546,6 +1566,8 @@ pub fn open(parent: HWND, settings: &Settings) {
                 settings.ai_dsh,
                 settings.ai_workbuddy,
                 settings.ai_workbuddy_ai,
+                settings.ai_claude,
+                settings.ai_codex,
             ],
             auto_start: settings.auto_start,
             fonts: Fonts::create(scale),
@@ -1751,9 +1773,9 @@ fn shift_choice(state: &mut State, row: usize, delta: i32) {
 
 fn toggle_ai(state: &mut State) {
     let enabled = !state.ai_enabled;
-    // 打开总开关时如果四个来源全关着，默认全开，否则什么也采不到
+    // 打开总开关时如果来源全关着，默认全开，否则什么也采不到
     if enabled && !state.ai_sources.iter().any(|flag| *flag) {
-        state.ai_sources = [true; 4];
+        state.ai_sources = [true; 6];
         crate::apply_ai_sources(state.parent, state.ai_sources);
     }
     state.ai_enabled = enabled;

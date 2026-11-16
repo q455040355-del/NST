@@ -50,6 +50,8 @@ pub struct Sources {
     pub dsh: bool,
     pub workbuddy: bool,
     pub workbuddy_ai: bool,
+    pub claude: bool,
+    pub codex: bool,
 }
 
 impl Sources {
@@ -59,11 +61,18 @@ impl Sources {
             dsh: true,
             workbuddy: true,
             workbuddy_ai: true,
+            claude: true,
+            codex: true,
         }
     }
 
     pub fn any(&self) -> bool {
-        self.opencode || self.dsh || self.workbuddy || self.workbuddy_ai
+        self.opencode
+            || self.dsh
+            || self.workbuddy
+            || self.workbuddy_ai
+            || self.claude
+            || self.codex
     }
 }
 
@@ -80,6 +89,8 @@ pub struct AiEngine {
     dsh: FileSource,
     workbuddy: FileSource,
     workbuddy_ai: FileSource,
+    claude: FileSource,
+    codex: FileSource,
     last_poll: i64,
     /// 最近是否在生成：决定采集间隔（在飞 700ms，空闲 1.5s）
     busy: bool,
@@ -88,7 +99,11 @@ pub struct AiEngine {
 
 impl AiEngine {
     pub fn new(sources: Sources) -> Self {
-        let home = home_dir();
+        Self::with_home(home_dir(), sources)
+    }
+
+    /// 指定 home 目录（测试用；正常调用走 `new`）
+    pub fn with_home(home: PathBuf, sources: Sources) -> Self {
         Self {
             responses: HashMap::new(),
             recent: Vec::new(),
@@ -115,6 +130,18 @@ impl AiEngine {
                 FileKind::WorkBuddy,
                 "workbuddyAi",
             ),
+            claude: FileSource::new(
+                home.join(".claude").join("projects"),
+                "jsonl",
+                FileKind::Claude,
+                "claude",
+            ),
+            codex: FileSource::new(
+                home.join(".codex").join("sessions"),
+                "jsonl",
+                FileKind::Codex,
+                "codex",
+            ),
             last_poll: 0,
             busy: false,
             last_error: None,
@@ -139,6 +166,8 @@ impl AiEngine {
             self.dsh.reset();
             self.workbuddy.reset();
             self.workbuddy_ai.reset();
+            self.claude.reset();
+            self.codex.reset();
         }
 
         // 在飞时 700ms 一轮（速度要跟手），空闲 1.5s（少唤醒几次 CPU）
@@ -175,6 +204,18 @@ impl AiEngine {
         }
         if self.sources.workbuddy_ai {
             match self.workbuddy_ai.poll(now_ms, midnight) {
+                Ok(delta) => merge_delta(&mut file_delta, delta),
+                Err(error) => self.last_error = Some(error),
+            }
+        }
+        if self.sources.claude {
+            match self.claude.poll(now_ms, midnight) {
+                Ok(delta) => merge_delta(&mut file_delta, delta),
+                Err(error) => self.last_error = Some(error),
+            }
+        }
+        if self.sources.codex {
+            match self.codex.poll(now_ms, midnight) {
                 Ok(delta) => merge_delta(&mut file_delta, delta),
                 Err(error) => self.last_error = Some(error),
             }
@@ -464,6 +505,8 @@ impl OpenCodeSource {
 enum FileKind {
     Dsh,
     WorkBuddy,
+    Claude,
+    Codex,
 }
 
 struct FileSource {
@@ -491,8 +534,8 @@ struct FileEntry {
     head: u64,
     /// 来源前缀（行 key 用）
     prefix: &'static str,
-    /// WorkBuddy 的跨行状态
-    workbuddy: Option<WorkBuddyState>,
+    /// 逐行追加解析的跨行状态（WorkBuddy / Claude / Codex）
+    stream: Option<StreamState>,
 }
 
 impl FileEntry {
@@ -503,8 +546,10 @@ impl FileEntry {
             rows: HashMap::new(),
             head: 0,
             prefix,
-            workbuddy: match kind {
-                FileKind::WorkBuddy => Some(WorkBuddyState::new(prefix)),
+            stream: match kind {
+                FileKind::WorkBuddy | FileKind::Claude | FileKind::Codex => {
+                    Some(StreamState::new(prefix))
+                }
                 FileKind::Dsh => None,
             },
         }
@@ -515,21 +560,24 @@ impl FileEntry {
     }
 }
 
-/// WorkBuddy jsonl 的跨行状态：文件追加时只解析新行，靠它把结果续上
-struct WorkBuddyState {
+/// 逐行追加解析的跨行状态：文件追加时只解析新行，靠它把结果续上
+struct StreamState {
     prefix: &'static str,
     /// 带前缀的 key → (合并中的响应, 插入时的上一行时间戳)
     merged: HashMap<String, (Response, i64)>,
     /// 上一行的 timestamp（推算 start 用）
     last_ts: i64,
+    /// Codex 的 token_count 事件没有稳定 id，用文件内序号当 key
+    seq: u64,
 }
 
-impl WorkBuddyState {
+impl StreamState {
     fn new(prefix: &'static str) -> Self {
         Self {
             prefix,
             merged: HashMap::new(),
             last_ts: 0,
+            seq: 0,
         }
     }
 }
@@ -772,7 +820,7 @@ fn parse_into(
             entry.rows = rows;
             entry.offset = 0;
         }
-        FileKind::WorkBuddy => {
+        FileKind::WorkBuddy | FileKind::Claude | FileKind::Codex => {
             let head = head_hash(path);
             let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
 
@@ -780,16 +828,22 @@ fn parse_into(
             if entry.offset > 0 && (head != entry.head || entry.offset > len) {
                 delta.removed.extend(entry.rows.keys().cloned());
                 entry.rows.clear();
-                entry.workbuddy = Some(WorkBuddyState::new(entry.prefix));
+                entry.stream = Some(StreamState::new(entry.prefix));
                 entry.offset = 0;
             }
 
             let prefix = entry.prefix;
             let state = entry
-                .workbuddy
-                .get_or_insert_with(|| WorkBuddyState::new(prefix));
-            entry.offset =
-                parse_workbuddy_into(path, state, &mut entry.rows, delta, entry.offset)?;
+                .stream
+                .get_or_insert_with(|| StreamState::new(prefix));
+            entry.offset = parse_stream_into(
+                kind,
+                path,
+                state,
+                &mut entry.rows,
+                delta,
+                entry.offset,
+            )?;
             entry.head = head;
         }
     }
@@ -890,9 +944,10 @@ fn parse_dsh(path: &Path, prefix: &'static str) -> std::io::Result<FileRows> {
 ///
 /// 最后一行没写完时先「试着解析」但不前移偏移，等它写完再整行重来 ——
 /// 同一个 messageId 覆盖，不会重复计数。文件重写/截断由 `parse_into` 提前识别。
-fn parse_workbuddy_into(
+fn parse_stream_into(
+    kind: FileKind,
     path: &Path,
-    state: &mut WorkBuddyState,
+    state: &mut StreamState,
     rows: &mut FileRows,
     delta: &mut Delta,
     offset: u64,
@@ -928,7 +983,7 @@ fn parse_workbuddy_into(
             continue;
         }
 
-        apply_workbuddy_line(&trim_line(&buf), state, rows, delta);
+        apply_stream_line(kind, &trim_line(&buf), state, rows, delta);
         if complete {
             consumed += read as u64;
         } else {
@@ -939,9 +994,24 @@ fn parse_workbuddy_into(
     Ok(consumed)
 }
 
+fn apply_stream_line(
+    kind: FileKind,
+    line: &str,
+    state: &mut StreamState,
+    rows: &mut FileRows,
+    delta: &mut Delta,
+) {
+    match kind {
+        FileKind::WorkBuddy => apply_workbuddy_line(line, state, rows, delta),
+        FileKind::Claude => apply_claude_line(line, state, rows, delta),
+        FileKind::Codex => apply_codex_line(line, state, rows, delta),
+        FileKind::Dsh => {}
+    }
+}
+
 fn apply_workbuddy_line(
     line: &str,
-    state: &mut WorkBuddyState,
+    state: &mut StreamState,
     rows: &mut FileRows,
     delta: &mut Delta,
 ) {
@@ -1000,6 +1070,190 @@ fn apply_workbuddy_line(
         rows.insert(key.clone(), response);
         delta.changed.push((key, response));
     }
+}
+
+
+// ---------------------------------------------------------------- Claude Code / Codex
+
+/// Claude Code 的会话转录：`~/.claude/projects/<项目>/<session>.jsonl`
+///
+/// 每个助手回合一行，带 `message.usage`。流式输出时同一个 `message.id` 会出现多次
+/// （用量逐步变大），这里按 id 合并取最大值，和各家统计工具的算法一致。
+fn apply_claude_line(line: &str, state: &mut StreamState, rows: &mut FileRows, delta: &mut Delta) {
+    // 先用字符串粗筛：整棵树里绝大多数行是用户消息/工具输出
+    if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
+        return;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if value["type"].as_str() != Some("assistant") {
+        return;
+    }
+
+    let usage = &value["message"]["usage"];
+    let output = usage["output_tokens"].as_i64().unwrap_or(0);
+    let input = usage["input_tokens"].as_i64().unwrap_or(0);
+    let cache_read = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+    if output <= 0 && input <= 0 {
+        return;
+    }
+
+    // 没有 id（极少数旧格式）就用 requestId / uuid 兜底
+    let id = value["message"]["id"]
+        .as_str()
+        .or_else(|| value["requestId"].as_str())
+        .or_else(|| value["uuid"].as_str())
+        .unwrap_or("");
+    if id.is_empty() {
+        return;
+    }
+
+    let Some(timestamp) = value["timestamp"].as_str().and_then(parse_iso_ms) else {
+        return;
+    };
+
+    let key = format!("{}:{}", state.prefix, id);
+    let last_ts = state.last_ts;
+    // 上一回合的结束时间 ≈ 这一回合的开始（间隔太远的当空闲，不参与速度）
+    let start = if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 120_000 {
+        last_ts
+    } else {
+        timestamp
+    };
+    let entry = state.merged.entry(key.clone()).or_insert_with(|| {
+        (
+            Response {
+                start,
+                end: timestamp,
+                output: 0,
+            },
+            last_ts,
+        )
+    });
+
+    // 流式重复上报：只取更大的用量
+    if output > entry.0.output {
+        entry.0.output = output;
+    }
+    let _ = (input, cache_read); // 暂不参与速度，聚合时由历史窗口自己算
+
+    if timestamp > entry.0.end {
+        if last_ts > 0 && timestamp - last_ts < 120_000 {
+            entry.0.start = last_ts;
+        }
+        entry.0.end = timestamp;
+    }
+
+    if timestamp > state.last_ts {
+        state.last_ts = timestamp;
+    }
+
+    let response = entry.0;
+    if rows.get(&key) != Some(&response) {
+        rows.insert(key.clone(), response);
+        delta.changed.push((key, response));
+    }
+}
+
+/// Codex 的会话转录：`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+///
+/// 每轮结束会写一条 `payload.type == "token_count"`，
+/// `payload.info.last_token_usage` 是**这一轮**的增量（total_token_usage 是累计值）。
+fn apply_codex_line(line: &str, state: &mut StreamState, rows: &mut FileRows, delta: &mut Delta) {
+    if !line.contains("\"token_count\"") {
+        return;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let payload = &value["payload"];
+    if payload["type"].as_str() != Some("token_count") {
+        return;
+    }
+
+    let usage = &payload["info"]["last_token_usage"];
+    let output = usage["output_tokens"].as_i64().unwrap_or(0);
+    let input = usage["input_tokens"].as_i64().unwrap_or(0);
+    if output <= 0 && input <= 0 {
+        return;
+    }
+
+    let Some(timestamp) = value["timestamp"].as_str().and_then(parse_iso_ms) else {
+        return;
+    };
+
+    // token_count 没有稳定 id：用文件内序号（只追加，所以序号稳定）
+    state.seq += 1;
+    let key = format!("{}:{}", state.prefix, state.seq);
+    let last_ts = state.last_ts;
+
+    let start = if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 300_000 {
+        last_ts
+    } else {
+        timestamp
+    };
+
+    let response = Response {
+        start,
+        end: timestamp,
+        output,
+    };
+    state.last_ts = timestamp;
+
+    rows.insert(key.clone(), response);
+    delta.changed.push((key, response));
+}
+
+/// ISO8601（`2026-11-15T21:03:12.345Z`）→ UTC 毫秒。只认带 Z 的写法。
+pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+
+    let number = |start: usize, len: usize| -> Option<i64> {
+        text.get(start..start + len)?.parse::<i64>().ok()
+    };
+
+    let year = number(0, 4)?;
+    let month = number(5, 2)?;
+    let day = number(8, 2)?;
+    let hour = number(11, 2)?;
+    let minute = number(14, 2)?;
+    let second = number(17, 2)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut millis = 0_i64;
+    if bytes.get(19) == Some(&b'.') {
+        let digits: String = text[20..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            let take = digits.len().min(3);
+            let frac = digits[..take].parse::<i64>().ok()?;
+            millis = frac * 10_i64.pow((3 - take) as u32);
+        }
+    }
+
+    let days = days_from_civil(year, month as u32, day as u32);
+    Some(days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis)
+}
+
+/// 公历年月日 → 1970-01-01 起的天数（Howard Hinnant 的算法）
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400; // [0, 399]
+    let mp = (month as i64 + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 
@@ -1117,6 +1371,192 @@ pub fn format_speed(speed: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_timestamps_parse_to_utc_ms() {
+        // 2026-11-15T21:03:12.345Z
+        let ms = parse_iso_ms("2026-11-15T21:03:12.345Z").unwrap();
+        assert_eq!(ms, 1_794_776_592_345);
+
+        // 没有毫秒、没有小数点的写法
+        let whole = parse_iso_ms("2026-11-15T21:03:12Z").unwrap();
+        assert_eq!(whole, 1_794_776_592_000);
+
+        // 两位数/一位数的时间字段不该误判
+        assert!(parse_iso_ms("2026-1-5T21:03:12Z").is_none());
+        assert!(parse_iso_ms("not a time").is_none());
+    }
+
+    #[test]
+    fn claude_lines_merge_streaming_usage() {
+        let mut state = StreamState::new("claude");
+        let mut rows = HashMap::new();
+        let mut delta = Delta::default();
+
+        // 同一条消息流式写了两遍，用量变大：只保留大的那份
+        apply_claude_line(
+            r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":10}},"timestamp":"2026-11-15T10:00:00.000Z"}"#,
+            &mut state,
+            &mut rows,
+            &mut delta,
+        );
+        apply_claude_line(
+            r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":42}},"timestamp":"2026-11-15T10:00:01.000Z"}"#,
+            &mut state,
+            &mut rows,
+            &mut delta,
+        );
+        // 另一条消息：start 用上一条的结束时间（间隔小于 120 秒）
+        apply_claude_line(
+            r#"{"type":"assistant","message":{"id":"msg_2","usage":{"input_tokens":10,"output_tokens":7}},"timestamp":"2026-11-15T10:00:09.000Z"}"#,
+            &mut state,
+            &mut rows,
+            &mut delta,
+        );
+        // 用户消息不算
+        apply_claude_line(
+            r#"{"type":"user","message":{"role":"user"},"timestamp":"2026-11-15T10:00:10.000Z"}"#,
+            &mut state,
+            &mut rows,
+            &mut delta,
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows["claude:msg_1"].output, 42);
+        assert_eq!(rows["claude:msg_2"].output, 7);
+        let first_end = parse_iso_ms("2026-11-15T10:00:01.000Z").unwrap();
+        assert_eq!(rows["claude:msg_2"].start, first_end);
+    }
+
+    #[test]
+    fn codex_token_counts_become_rows() {
+        let mut state = StreamState::new("codex");
+        let mut rows = HashMap::new();
+        let mut delta = Delta::default();
+
+        for (index, output) in [12_i64, 30, 5].iter().enumerate() {
+            let line = format!(
+                r#"{{"timestamp":"2026-11-15T10:00:0{index}.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":{output}}}}}}}}}"#
+            );
+            apply_codex_line(&line, &mut state, &mut rows, &mut delta);
+        }
+        // 累计值那条（total_token_usage）不该被当成增量重复计入
+        apply_codex_line(
+            r#"{"timestamp":"2026-11-15T10:00:09.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":999,"output_tokens":999}}}}"#,
+            &mut state,
+            &mut rows,
+            &mut delta,
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows["codex:1"].output, 12);
+        assert_eq!(rows["codex:3"].output, 5);
+        // 相邻事件间隔 1 秒：start 取上一条的时间
+        assert!(rows["codex:2"].end - rows["codex:2"].start <= 1000);
+    }
+
+    #[test]
+    fn engine_reads_claude_sessions_from_home() {
+        let home = std::env::temp_dir().join("nst-engine-claude");
+        let _ = std::fs::remove_dir_all(&home);
+        let session = home.join(".claude").join("projects").join("demo");
+        std::fs::create_dir_all(&session).unwrap();
+
+        // 用「现在」的时间戳，保证落在今天里
+        let now = now_ms();
+        let stamp = iso_from_ms(now - 5_000);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"id":"msg_x","model":"claude-x","usage":{{"input_tokens":10,"output_tokens":321}}}},"timestamp":"{stamp}"}}"#
+        );
+        std::fs::write(session.join("s.jsonl"), line + "\n").unwrap();
+
+        let mut engine = AiEngine::with_home(
+            home.clone(),
+            Sources {
+                opencode: false,
+                dsh: false,
+                workbuddy: false,
+                workbuddy_ai: false,
+                claude: true,
+                codex: false,
+            },
+        );
+        engine.poll(now);
+        let snapshot = engine.snapshot(now);
+        assert_eq!(snapshot.today_output, 321, "Claude 的用量要算进今日");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 测试用：epoch 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`
+    fn iso_from_ms(ms: i64) -> String {
+        let mut days = ms.div_euclid(86_400_000);
+        let mut rest = ms.rem_euclid(86_400_000);
+        // 从 1970-01-01 起逐日推算（跨闰年也够用）
+        let mut year = 1970_i64;
+        loop {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let days_in_year = if leap { 366 } else { 365 };
+            if days >= days_in_year {
+                days -= days_in_year;
+                year += 1;
+            } else {
+                break;
+            }
+        }
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let months = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut month = 0;
+        while month < 12 && days >= months[month] {
+            days -= months[month];
+            month += 1;
+        }
+        let hour = rest / 3_600_000;
+        rest %= 3_600_000;
+        let minute = rest / 60_000;
+        rest %= 60_000;
+        let second = rest / 1000;
+        let milli = rest % 1000;
+        format!(
+            "{year:04}-{:02}-{:02}T{hour:02}:{minute:02}:{second:02}.{milli:03}Z",
+            month + 1,
+            days + 1
+        )
+    }
+
+    #[test]
+    fn walk_files_finds_recent_jsonl() {
+        let dir = std::env::temp_dir().join("nst-walk-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nested = dir.join("project");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("session.jsonl");
+        std::fs::write(&file, "{\"a\":1}\n").unwrap();
+
+        let found = walk_files(&dir, "jsonl", now_ms() - 86_400_000);
+        assert_eq!(found.len(), 1, "要找得到刚写的 jsonl");
+        assert_eq!(found[0].0, file);
+
+        // 太老的文件要被 mtime 过滤掉
+        let old = walk_files(&dir, "jsonl", now_ms() + 86_400_000);
+        assert!(old.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn token_units() {
@@ -1265,6 +1705,8 @@ mod tests {
             dsh: false,
             workbuddy: false,
             workbuddy_ai: false,
+            claude: false,
+            codex: false,
         });
         let now = 10_000_000;
         engine.today_start = local_midnight_ms(now);

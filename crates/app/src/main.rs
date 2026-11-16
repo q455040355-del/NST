@@ -1312,7 +1312,7 @@ pub(crate) fn apply_auto_start(parent: HWND, enabled: bool) {
 }
 
 /// 设置里勾选的 AI 来源（OpenCode / dsh / WorkBuddy / WorkBuddy AI）。
-pub(crate) fn apply_ai_sources(parent: HWND, flags: [bool; 4]) {
+pub(crate) fn apply_ai_sources(parent: HWND, flags: [bool; 6]) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_ai_sources(flags);
     }

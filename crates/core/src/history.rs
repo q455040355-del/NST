@@ -14,6 +14,9 @@ pub const SOURCE_DSH: &str = "dsh";
 pub const SOURCE_WORKBUDDY: &str = "workbuddy";
 pub const SOURCE_WORKBUDDY_AI: &str = "workbuddyAi";
 
+pub const SOURCE_CLAUDE: &str = "claude";
+pub const SOURCE_CODEX: &str = "codex";
+
 pub const DAY_MS: i64 = 86_400_000;
 
 pub use super::ai::format_tokens;
@@ -79,6 +82,8 @@ pub fn source_name(source: &str) -> &'static str {
         SOURCE_DSH => "DSH",
         SOURCE_WORKBUDDY => "WorkBuddy",
         SOURCE_WORKBUDDY_AI => "WorkBuddy AI",
+        SOURCE_CLAUDE => "Claude Code",
+        SOURCE_CODEX => "Codex",
         _ => "OpenCode",
     }
 }
@@ -89,16 +94,20 @@ pub fn source_color(source: &str) -> u32 {
         SOURCE_DSH => 0x00FF_617B,
         SOURCE_WORKBUDDY => 0x008C_A92F,
         SOURCE_WORKBUDDY_AI => 0x0032_8AE0,
+        SOURCE_CLAUDE => 0x00B0_6A3C, // 暖橙棕
+        SOURCE_CODEX => 0x00C8_C8_C8, // 浅灰
         _ => 0x00D8_8440,
     }
 }
 
-pub fn all_sources() -> [&'static str; 4] {
+pub fn all_sources() -> [&'static str; 6] {
     [
         SOURCE_OPENCODE,
         SOURCE_DSH,
         SOURCE_WORKBUDDY,
         SOURCE_WORKBUDDY_AI,
+        SOURCE_CLAUDE,
+        SOURCE_CODEX,
     ]
 }
 
@@ -133,6 +142,8 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
         (home.join(".dsh").join("sessions"), "zstd", SOURCE_DSH),
         (home.join(".workbuddy").join("projects"), "jsonl", SOURCE_WORKBUDDY),
         (home.join(".workbuddy-ai").join("projects"), "jsonl", SOURCE_WORKBUDDY_AI),
+        (home.join(".claude").join("projects"), "jsonl", SOURCE_CLAUDE),
+        (home.join(".codex").join("sessions"), "jsonl", SOURCE_CODEX),
     ];
 
     // (路径, (mtime, 长度), 后缀, 来源)
@@ -198,11 +209,12 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
                     bucket
                         .iter()
                         .map(|&slot| {
-                            let (path, _, suffix, source) = &todo_ref[slot];
-                            let records = if *suffix == "zstd" {
-                                parse_dsh(path, source)
-                            } else {
-                                parse_workbuddy(path, source)
+                            let (path, _, _suffix, source) = &todo_ref[slot];
+                            let records = match *source {
+                                SOURCE_DSH => parse_dsh(path, source),
+                                SOURCE_CLAUDE => parse_claude(path, source),
+                                SOURCE_CODEX => parse_codex(path, source),
+                                _ => parse_workbuddy(path, source),
                             };
                             (slot, records)
                         })
@@ -796,6 +808,155 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
     map.into_values().collect()
 }
 
+/// Claude Code 的会话转录（`~/.claude/projects/**/*.jsonl`）。
+///
+/// 同一条消息流式写入多次（用量递增），按 `message.id` 合并取最大值。
+fn parse_claude(path: &Path, source: &'static str) -> Vec<UsageRecord> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+
+    let mut map: HashMap<String, UsageRecord> = HashMap::new();
+    let mut last_ts = 0_i64;
+
+    for_each_line(BufReader::new(file), |line| {
+        if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
+            return;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if value["type"].as_str() != Some("assistant") {
+            return;
+        }
+
+        let usage = &value["message"]["usage"];
+        let output = usage["output_tokens"].as_i64().unwrap_or(0);
+        let cache_read = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+        let input = usage["input_tokens"].as_i64().unwrap_or(0)
+            + cache_read
+            + usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+        if output <= 0 && input <= 0 {
+            return;
+        }
+
+        let Some(timestamp) = value["timestamp"].as_str().and_then(super::ai::parse_iso_ms) else {
+            return;
+        };
+
+        let id = value["message"]["id"]
+            .as_str()
+            .or_else(|| value["requestId"].as_str())
+            .unwrap_or("");
+        if id.is_empty() {
+            return;
+        }
+
+        let model = value["message"]["model"].as_str().unwrap_or("").to_string();
+        let entry = map.entry(id.to_string()).or_insert_with(|| UsageRecord {
+            day: super::ai::day_index(timestamp),
+            hour: super::ai::local_hour(timestamp),
+            source,
+            model: model.clone(),
+            output: 0,
+            input: 0,
+            cache_read: 0,
+            duration_ms: 0,
+        });
+
+        if output > entry.output {
+            entry.output = output;
+        }
+        if input > entry.input {
+            entry.input = input;
+        }
+        if cache_read > entry.cache_read {
+            entry.cache_read = cache_read;
+        }
+        if !model.is_empty() {
+            entry.model = model;
+        }
+
+        entry.day = super::ai::day_index(timestamp);
+        entry.hour = super::ai::local_hour(timestamp);
+        if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 120_000 {
+            entry.duration_ms = timestamp - last_ts;
+        }
+        if timestamp > last_ts {
+            last_ts = timestamp;
+        }
+    });
+
+    map.into_values().collect()
+}
+
+/// Codex 的会话转录（`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`）。
+///
+/// 每轮结束写一条 `token_count`，`info.last_token_usage` 是这一轮的增量。
+fn parse_codex(path: &Path, source: &'static str) -> Vec<UsageRecord> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    let mut last_ts = 0_i64;
+
+    for_each_line(BufReader::new(file), |line| {
+        if !line.contains("\"token_count\"") {
+            return;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let payload = &value["payload"];
+        if payload["type"].as_str() != Some("token_count") {
+            return;
+        }
+
+        let usage = &payload["info"]["last_token_usage"];
+        let output = usage["output_tokens"].as_i64().unwrap_or(0);
+        let cache_read = usage["cached_input_tokens"]
+            .as_i64()
+            .or_else(|| usage["cache_read_input_tokens"].as_i64())
+            .unwrap_or(0);
+        let input = usage["input_tokens"].as_i64().unwrap_or(0);
+        if output <= 0 && input <= 0 {
+            return;
+        }
+
+        let Some(timestamp) = value["timestamp"].as_str().and_then(super::ai::parse_iso_ms) else {
+            return;
+        };
+
+        let model = payload["info"]["model"]
+            .as_str()
+            .or_else(|| payload["model"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        records.push(UsageRecord {
+            day: super::ai::day_index(timestamp),
+            hour: super::ai::local_hour(timestamp),
+            source,
+            model,
+            output,
+            input,
+            cache_read,
+            duration_ms: if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 300_000 {
+                timestamp - last_ts
+            } else {
+                0
+            },
+        });
+
+        last_ts = timestamp;
+    });
+
+    records
+}
+
 /// 逐行读文件（流式）：每个文件最多只占「一行」的内存，坏字节只影响一行
 fn for_each_line<R: BufRead>(mut reader: R, mut visit: impl FnMut(&str)) {
     let mut buf = Vec::new();
@@ -1110,6 +1271,47 @@ mod tests {
         // 小时视图同一套语义
         let hours = summarize_hours(&records, 5, &only_ai);
         assert_eq!(hours[12].output, 50);
+    }
+
+    #[test]
+    fn claude_file_parses_into_records() {
+        let dir = std::env::temp_dir().join("nst-claude-parse");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("session.jsonl");
+        let body = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"cache_read_input_tokens\":40}},\"timestamp\":\"2026-11-15T10:00:00.000Z\"}\n",
+            "{\"type\":\"user\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":100,\"output_tokens\":55,\"cache_read_input_tokens\":40}},\"timestamp\":\"2026-11-15T10:00:03.000Z\"}\n"
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let records = parse_claude(&path, SOURCE_CLAUDE);
+        assert_eq!(records.len(), 1, "同一条消息合并成一条");
+        assert_eq!(records[0].output, 55);
+        assert_eq!(records[0].input, 140);
+        assert_eq!(records[0].cache_read, 40);
+        assert_eq!(records[0].model, "claude-x");
+        assert_eq!(records[0].duration_ms, 3000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_file_parses_into_records() {
+        let dir = std::env::temp_dir().join("nst-codex-parse");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("rollout.jsonl");
+        let body = concat!(
+            "{\"timestamp\":\"2026-11-15T10:00:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":200,\"cached_input_tokens\":50,\"output_tokens\":11}}}}\n",
+            "{\"timestamp\":\"2026-11-15T10:00:04.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"output_tokens\":7}}}}\n"
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let records = parse_codex(&path, SOURCE_CODEX);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].output, 11);
+        assert_eq!(records[0].cache_read, 50);
+        assert_eq!(records[1].duration_ms, 4000);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

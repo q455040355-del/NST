@@ -33,7 +33,15 @@ const WM_APP_HISTORY_READY: u32 = WM_APP + 30;
 const WM_APP_HISTORY_ANIM: u32 = WM_APP + 31;
 
 const RANGE_LABELS: [&str; 5] = ["今天", "昨天", "7 天", "30 天", "全部"];
-const SOURCE_LABELS: [&str; 5] = ["全部", "OpenCode", "DSH", "WorkBuddy", "WorkBuddy AI"];
+const SOURCE_LABELS: [&str; 7] = [
+    "全部",
+    "OpenCode",
+    "DSH",
+    "WorkBuddy",
+    "WorkBuddy AI",
+    "Claude Code",
+    "Codex",
+];
 
 /// 图表的阻尼弹簧：response = 一个来回的周期（秒），damping = 阻尼比（1 = 临界阻尼）。
 /// 这两个值沿用 AgentSpeed / C# 版 `DampedSpring(0.30s / 0.86)` 的参数：
@@ -159,7 +167,7 @@ struct State {
     canvas: HWND,
     pill_rects: Vec<RECT>,
     /// 哪几个来源参与统计（all_sources() 的顺序）；全 false 会当成全选
-    sources: [bool; 4],
+    sources: [bool; 6],
     source_rects: Vec<RECT>,
     /// 右上角的关闭按钮
     close_rect: RECT,
@@ -265,10 +273,12 @@ pub fn open(_parent: HWND) {
             canvas: std::ptr::null_mut(),
             pill_rects: Vec::new(),
             sources: [
-                saved_sources & 0b0001 != 0,
-                saved_sources & 0b0010 != 0,
-                saved_sources & 0b0100 != 0,
-                saved_sources & 0b1000 != 0,
+                saved_sources & 0b00_0001 != 0,
+                saved_sources & 0b00_0010 != 0,
+                saved_sources & 0b00_0100 != 0,
+                saved_sources & 0b00_1000 != 0,
+                saved_sources & 0b01_0000 != 0,
+                saved_sources & 0b10_0000 != 0,
             ],
             source_rects: Vec::new(),
             close_rect: RECT {
@@ -404,7 +414,7 @@ fn prefs() -> (usize, u8) {
     (range, sources)
 }
 
-fn save_prefs(range: usize, sources: [bool; 4]) {
+fn save_prefs(range: usize, sources: [bool; 6]) {
     let Some(path) = prefs_path() else {
         return;
     };
@@ -632,7 +642,7 @@ fn enabled_sources(state: &State) -> Vec<&'static str> {
 }
 
 /// 把没勾选的来源列清零（列顺序固定是 all_sources()，这样图例和配色不用动）
-fn zero_disabled_columns(rows: &mut [Vec<i64>], sources: [bool; 4]) {
+fn zero_disabled_columns(rows: &mut [Vec<i64>], sources: [bool; 6]) {
     if sources.iter().all(|on| *on) {
         return;
     }
@@ -879,10 +889,10 @@ unsafe extern "system" fn canvas_proc(
 
                 for (index, rect) in state.source_rects.iter().enumerate() {
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                        // 0 = 「全部」：一次全开；1..=4 = 单路开关（不允许全关）
+                        // 0 = 「全部」：一次全开；1..=6 = 单路开关（不允许全关）
                         if index == 0 {
                             if !state.sources.iter().all(|on| *on) {
-                                state.sources = [true; 4];
+                                state.sources = [true; 6];
                                 save_prefs(state.range, state.sources);
                                 recalc(state);
                                 start_animator(hwnd);
@@ -891,7 +901,7 @@ unsafe extern "system" fn canvas_proc(
                             let slot = index - 1;
                             state.sources[slot] = !state.sources[slot];
                             if !state.sources.iter().any(|on| *on) {
-                                state.sources = [true; 4];
+                                state.sources = [true; 6];
                             }
                             save_prefs(state.range, state.sources);
                             recalc(state);
@@ -1120,6 +1130,8 @@ fn series_color(source: &str) -> u32 {
         "opencode" => 0x00F6_823B,   // #3B82F6
         "dsh" => 0x00F6_5C8B,        // #8B5CF6
         "workbuddy" => 0x000B_9EF5,  // #F59E0B
+        "claude" => 0x004E_8CC4,     // #C48C4E（Claude 的暖橙棕）
+        "codex" => 0x00A0_A0A0,      // 灰
         _ => 0x0081_B910,            // #10B981
     };
     // 深色底上把系列色提亮一点，否则紫/蓝在 #1B1C1E 上发闷
@@ -1832,6 +1844,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     // 图例
     let chart_title = if state.hourly { "每小时输出" } else { "每日输出" };
     let mut legend_x = l.pad + p.s(18.0) + p.text_width(chart_title, 9.5, 600) + p.s(18.0);
+    let legend_limit = p.width - l.pad - p.s(18.0);
     let sources = all_sources();
     for source in sources {
         let index = sources.iter().position(|item| *item == source).unwrap_or(0);
@@ -1843,6 +1856,11 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             continue;
         }
         let name = source_name(source);
+        let item_width = p.text_width(name, 8.0, 400) + p.s(28.0);
+        // 来源变多后一行可能放不下：放不下就不再画，别糊到图表外面
+        if legend_x + item_width > legend_limit {
+            break;
+        }
         p.dot(
             legend_x + p.s(4.0),
             l.chart_top + p.s(21.0),

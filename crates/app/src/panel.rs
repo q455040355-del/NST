@@ -280,11 +280,13 @@ impl Panel {
     }
 
     /// 采集哪些来源（OpenCode / dsh / WorkBuddy / WorkBuddy AI）
-    pub fn set_ai_sources(&mut self, flags: [bool; 4]) {
+    pub fn set_ai_sources(&mut self, flags: [bool; 6]) {
         self.settings.ai_opencode = flags[0];
         self.settings.ai_dsh = flags[1];
         self.settings.ai_workbuddy = flags[2];
         self.settings.ai_workbuddy_ai = flags[3];
+        self.settings.ai_claude = flags[4];
+        self.settings.ai_codex = flags[5];
         self.ai.set_sources(sources_of(&self.settings));
         self.settings.save();
         self.refresh();
@@ -426,14 +428,16 @@ impl Panel {
                     self.settings.ai_dsh,
                     self.settings.ai_workbuddy,
                     self.settings.ai_workbuddy_ai,
+                    self.settings.ai_claude,
+                    self.settings.ai_codex,
                 ]
                 .iter()
                 .filter(|flag| **flag)
                 .count();
 
-                if enabled < 4 {
+                if enabled < 6 {
                     format!(
-                        "Token {} · 今日 {}（{enabled} / 4 来源）",
+                        "Token {} · 今日 {}（{enabled} / 6 来源）",
                         self.ai_speed_text, self.ai_today_text
                     )
                 } else {
@@ -899,6 +903,8 @@ fn sources_of(settings: &Settings) -> Sources {
         dsh: settings.ai_dsh,
         workbuddy: settings.ai_workbuddy,
         workbuddy_ai: settings.ai_workbuddy_ai,
+        claude: settings.ai_claude,
+        codex: settings.ai_codex,
     }
 }
 
