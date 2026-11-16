@@ -1225,10 +1225,12 @@ fn apply_codex_line(line: &str, state: &mut StreamState, rows: &mut FileRows, de
     delta.changed.push((key, response));
 }
 
-/// ISO8601（`2026-11-15T21:03:12.345Z`）→ UTC 毫秒。只认带 Z 的写法。
+/// ISO8601（`2026-11-15T21:03:12.345Z` / `…+08:00`）→ UTC 毫秒。
+///
+/// Claude / Codex 现在都写 `Z`，但有些工具写带偏移的本地时间，顺手支持上。
 pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
-    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;
     }
 
@@ -1246,9 +1248,13 @@ pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
         return None;
     }
 
+    // 小数秒（可选）
     let mut millis = 0_i64;
+    let mut index = 19;
     if bytes.get(19) == Some(&b'.') {
-        let digits: String = text[20..]
+        index = 20;
+        let digits: String = text
+            .get(20..)?
             .chars()
             .take_while(|ch| ch.is_ascii_digit())
             .collect();
@@ -1256,11 +1262,37 @@ pub(crate) fn parse_iso_ms(text: &str) -> Option<i64> {
             let take = digits.len().min(3);
             let frac = digits[..take].parse::<i64>().ok()?;
             millis = frac * 10_i64.pow((3 - take) as u32);
+            index = 20 + digits.len();
         }
     }
 
+    // 结尾：Z / +HH:MM / -HHMM / 什么都没有（按 UTC 算）
+    let offset_minutes = match bytes.get(index) {
+        Some(b'Z') | None => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            let sign = if *sign == b'-' { -1 } else { 1 };
+            let rest = text.get(index + 1..)?;
+            let digits: String = rest.chars().filter(|ch| ch.is_ascii_digit()).collect();
+            let (hours, minutes) = match digits.len() {
+                0 => (0, 0),
+                1 | 2 => (digits.parse::<i64>().ok()?, 0),
+                _ => (
+                    digits[..2].parse::<i64>().ok()?,
+                    digits[2..4].parse::<i64>().ok()?,
+                ),
+            };
+            sign * (hours * 60 + minutes)
+        }
+        _ => return None,
+    };
+
     let days = days_from_civil(year, month as u32, day as u32);
-    Some(days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis)
+    let local = days * 86_400_000
+        + hour * 3_600_000
+        + minute * 60_000
+        + second * 1000
+        + millis;
+    Some(local - offset_minutes * 60_000)
 }
 
 /// 公历年月日 → 1970-01-01 起的天数（Howard Hinnant 的算法）
@@ -1399,6 +1431,14 @@ mod tests {
         // 没有毫秒、没有小数点的写法
         let whole = parse_iso_ms("2026-11-15T21:03:12Z").unwrap();
         assert_eq!(whole, 1_794_776_592_000);
+
+        // 带时区偏移：+08:00 的同一时刻要换算回 UTC
+        let offset = parse_iso_ms("2026-11-16T05:03:12.345+08:00").unwrap();
+        assert_eq!(offset, 1_794_776_592_345);
+        let compact = parse_iso_ms("2026-11-16T05:03:12+0800").unwrap();
+        assert_eq!(compact, 1_794_776_592_000);
+        let west = parse_iso_ms("2026-11-15T13:03:12-08:00").unwrap();
+        assert_eq!(west, 1_794_776_592_000);
 
         // 两位数/一位数的时间字段不该误判
         assert!(parse_iso_ms("2026-1-5T21:03:12Z").is_none());

@@ -721,10 +721,23 @@ fn fullscreen_foreground(panel: HWND) -> bool {
     }
 }
 
+/// 采样节拍（毫秒）：跟着设置里的刷新间隔走，2 秒档就不用每 500ms 醒一次
+static TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(500);
+
+pub(crate) fn set_tick_interval(ms: i32) {
+    let ms = ms.clamp(50, 2000) as u64;
+    TICK_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+    // 从 2 秒调回 0.5 秒时，线程可能正睡 2 秒：叫醒它按新间隔重算
+    let (lock, wake) = tick_wake();
+    if let Ok(_guard) = lock.lock() {
+        wake.notify_all();
+    }
+}
+
 fn start_ticker(hwnd: HWND) {
     let handle = hwnd as usize;
     std::thread::spawn(move || {
-        // 采样还是 500ms 一次；指示条动画在跑的时候按 ~60fps 推帧。
+        // 采样节拍跟着 RefreshMs 走；指示条动画在跑时按 ~60fps 推帧。
         // （本进程 SetTimer/WM_TIMER 实测完全收不到，只能靠线程投递。）
         //
         // 空闲时直接等到下一个采样点（以前固定每 50ms 醒一次，
@@ -734,10 +747,13 @@ fn start_ticker(hwnd: HWND) {
         let mut last_tick = std::time::Instant::now();
         loop {
             let animating = ANIM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            let interval = std::time::Duration::from_millis(
+                TICK_MS.load(std::sync::atomic::Ordering::Relaxed).max(50),
+            );
             let timeout = if animating {
                 std::time::Duration::from_millis(16)
             } else {
-                std::time::Duration::from_millis(500)
+                interval
                     .saturating_sub(last_tick.elapsed())
                     .max(std::time::Duration::from_millis(20))
             };
@@ -755,7 +771,10 @@ fn start_ticker(hwnd: HWND) {
                 if animating && PostMessageW(target, WM_APP_ANIM, 0, 0) == 0 {
                     break;
                 }
-                if last_tick.elapsed().as_millis() >= 500 {
+                let interval = std::time::Duration::from_millis(
+                    TICK_MS.load(std::sync::atomic::Ordering::Relaxed).max(50),
+                );
+                if last_tick.elapsed() >= interval {
                     last_tick = std::time::Instant::now();
                     if PostMessageW(target, WM_APP_TICK, 0, 0) == 0 {
                         break;

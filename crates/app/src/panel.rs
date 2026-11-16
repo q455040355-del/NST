@@ -87,6 +87,8 @@ pub struct Panel {
 impl Panel {
     pub fn new(hwnd: HWND, settings: Settings) -> Self {
         let dpi = crate::dpi_for_window(hwnd);
+        // 采样节拍跟着设置走（0.5s / 1s / 2s）
+        crate::set_tick_interval(settings.refresh_ms);
         let light = taskbar_is_light();
         let colors = Colors::for_theme(light, 0x00F3F3F3);
 
@@ -198,6 +200,7 @@ impl Panel {
     pub fn set_refresh_ms(&mut self, ms: i32) {
         self.settings.refresh_ms = netspeed_core::settings::normalize_refresh(ms);
         self.settings.save();
+        crate::set_tick_interval(self.settings.refresh_ms);
         self.last_refresh = std::time::Instant::now() - std::time::Duration::from_secs(10);
         self.tick();
     }

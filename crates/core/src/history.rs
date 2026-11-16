@@ -34,6 +34,9 @@ pub struct UsageRecord {
     /// 其中来自缓存命中的输入 token（prompt cache）
     pub cache_read: i64,
     pub duration_ms: i64,
+    /// 消息 id 的哈希（0 = 没有）。只用来跨文件去重：
+    /// 会话被续写/分叉时同一条消息可能出现在两个转录文件里
+    pub id: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -250,12 +253,40 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
             }
         }
     }
+    dedupe_records(out)
+}
+
+/// 同一个消息 id 出现在多个文件里（会话续写/分叉）时只留一份。
+///
+/// 引擎侧本来就按 id 覆盖，历史这边是「按文件」累加的，不去重会多算。
+/// 只对带 id 的记录（Claude）生效，其它来源 id 恒为 0。
+fn dedupe_records(records: Vec<UsageRecord>) -> Vec<UsageRecord> {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        if record.id != 0 && !seen.insert((record.id, record.source)) {
+            continue;
+        }
+        out.push(record);
+    }
     out
+}
+
+/// 消息 id → u64（FNV-1a，0 保留给「没有 id」）
+fn hash_id(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
 }
 
 // ------------------------------------------------------------ 磁盘索引
 
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 const INDEX_MAGIC: &[u8; 4] = b"NSUI";
 
 struct IndexEntry {
@@ -483,6 +514,7 @@ fn write_index(
             put_i64(writer, record.input)?;
             put_i64(writer, record.cache_read)?;
             put_i64(writer, record.duration_ms)?;
+            put_u64(writer, record.id)?;
         }
     }
 
@@ -501,7 +533,7 @@ fn read_index(path: &Path) -> std::io::Result<(u64, HashMap<PathBuf, IndexEntry>
 
     // v1 是单文件、没有指纹；读出来照用，下次保存会迁成 v2 分片
     let version = get_u32(&mut reader)?;
-    if version != 1 && version != 2 {
+    if !(1..=INDEX_VERSION).contains(&version) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "version"));
     }
     let hash = if version >= 2 { get_u64(&mut reader)? } else { 0 };
@@ -516,15 +548,25 @@ fn read_index(path: &Path) -> std::io::Result<(u64, HashMap<PathBuf, IndexEntry>
 
         let mut records = Vec::with_capacity(record_count);
         for _ in 0..record_count {
+            let day = get_i64(&mut reader)?;
+            let hour = get_u8(&mut reader)?;
+            let model = get_str(&mut reader)?;
+            let output = get_i64(&mut reader)?;
+            let input = get_i64(&mut reader)?;
+            let cache_read = get_i64(&mut reader)?;
+            let duration_ms = get_i64(&mut reader)?;
+            // v3 起多了消息 id（跨文件去重用）；老分片按 0 读
+            let id = if version >= 3 { get_u64(&mut reader)? } else { 0 };
             records.push(UsageRecord {
-                day: get_i64(&mut reader)?,
-                hour: get_u8(&mut reader)?,
+                day,
+                hour,
                 source,
-                model: get_str(&mut reader)?,
-                output: get_i64(&mut reader)?,
-                input: get_i64(&mut reader)?,
-                cache_read: get_i64(&mut reader)?,
-                duration_ms: get_i64(&mut reader)?,
+                model,
+                output,
+                input,
+                cache_read,
+                duration_ms,
+                id,
             });
         }
 
@@ -649,6 +691,7 @@ fn load_opencode_into(records: &mut Vec<UsageRecord>, from_ms: i64) {
             input,
             cache_read,
             duration_ms: if streamed > created { streamed - created } else { 0 },
+            id: 0,
         });
     }
 }
@@ -716,6 +759,7 @@ fn parse_dsh(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             } else {
                 0
             },
+            id: 0,
         });
 
         pending_start = 0;
@@ -774,6 +818,7 @@ fn parse_workbuddy(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             input: 0,
             cache_read: 0,
             duration_ms: 0,
+            id: 0,
         });
 
         if output > entry.output {
@@ -863,6 +908,7 @@ fn parse_claude(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             input: 0,
             cache_read: 0,
             duration_ms: 0,
+            id: hash_id(id),
         });
 
         if output > entry.output {
@@ -949,6 +995,7 @@ fn parse_codex(path: &Path, source: &'static str) -> Vec<UsageRecord> {
             } else {
                 0
             },
+            id: 0,
         });
 
         last_ts = timestamp;
@@ -1245,6 +1292,7 @@ mod tests {
             input: output * 10,
             cache_read: 0,
             duration_ms: 1000,
+            id: 0,
         }
     }
 
@@ -1312,6 +1360,20 @@ mod tests {
         assert_eq!(records[0].cache_read, 50);
         assert_eq!(records[1].duration_ms, 4000);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicate_message_ids_are_merged() {
+        let mut first = record(5, SOURCE_CLAUDE, "claude-x", 100);
+        first.id = 42;
+        let mut same = first.clone();
+        same.output = 120;
+        let unique = record(5, SOURCE_CLAUDE, "claude-x", 7);
+
+        let out = dedupe_records(vec![first, same, unique]);
+        assert_eq!(out.len(), 2, "同 id 只留一条，不同 id 都保留");
+        assert_eq!(out[0].output, 100);
+        assert_eq!(out[1].output, 7);
     }
 
     #[test]

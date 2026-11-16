@@ -21,7 +21,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 const DT_NOPREFIX: u32 = 0x0800;
 const DT_CALCRECT: u32 = 0x0400;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
@@ -172,6 +172,10 @@ struct State {
     /// 右上角的关闭按钮
     close_rect: RECT,
     scroll: usize,
+    /// 明细表右侧滚动条（内容放得下时为 None）；绘制时更新，鼠标事件用它命中
+    table_bar: Option<TableBar>,
+    /// 正在拖表格滚动条
+    table_drag: bool,
     /// 图表卡片区域（动画期间只重画这块）
     chart_rect: RECT,
     /// 数据或尺寸变了，下一帧必须整页重画
@@ -288,6 +292,8 @@ pub fn open(_parent: HWND) {
                 bottom: 0,
             },
             scroll: 0,
+            table_bar: None,
+            table_drag: false,
             chart_rect: RECT {
                 left: 0,
                 top: 0,
@@ -893,6 +899,18 @@ unsafe extern "system" fn canvas_proc(
                     SendMessageW(parent, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
                     return 0;
                 }
+
+                // 明细表右侧滚动条：按下即跳，之后跟着拖
+                if let Some(bar) = state.table_bar {
+                    let hit = bar.hit(ui_scale());
+                    if x >= hit.left && x <= hit.right && y >= hit.top && y <= hit.bottom {
+                        state.table_drag = true;
+                        SetCapture(hwnd);
+                        state.scroll = bar.scroll_at(y);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
             }
             0
         }
@@ -903,6 +921,14 @@ unsafe extern "system" fn canvas_proc(
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
                 let state = &mut *state;
+
+                // 松开表格滚动条：结束拖动
+                if state.table_drag {
+                    state.table_drag = false;
+                    ReleaseCapture();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
 
                 for (index, rect) in state.source_rects.iter().enumerate() {
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
@@ -951,6 +977,19 @@ unsafe extern "system" fn canvas_proc(
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
                 let state = &mut *state;
+
+                // 正在拖表格滚动条：只更新滚动位置
+                if state.table_drag {
+                    if let Some(bar) = state.table_bar {
+                        let next = bar.scroll_at(y);
+                        if next != state.scroll {
+                            state.scroll = next;
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                        }
+                    }
+                    return 0;
+                }
+
                 let plot = state.plot;
                 let count = state.days.len();
                 let hover = if count > 0
@@ -2123,6 +2162,49 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     }
 }
 
+/// 明细表右侧的滚动条几何（绘制和拖动共用）
+#[derive(Clone, Copy)]
+struct TableBar {
+    x: i32,
+    track_w: i32,
+    top: i32,
+    bottom: i32,
+    thumb_h: i32,
+    travel: i32,
+    max_scroll: usize,
+}
+
+impl TableBar {
+    fn thumb_top(&self, scroll: usize) -> i32 {
+        if self.travel <= 0 || self.max_scroll == 0 {
+            return self.top;
+        }
+        let ratio = scroll.min(self.max_scroll) as f32 / self.max_scroll as f32;
+        self.top + (self.travel as f32 * ratio).round() as i32
+    }
+
+    /// 鼠标 y → 新的滚动行数（滑块中心跟鼠标）
+    fn scroll_at(&self, y: i32) -> usize {
+        if self.travel <= 0 || self.max_scroll == 0 {
+            return 0;
+        }
+        let offset = y - self.top - self.thumb_h / 2;
+        let ratio = (offset as f32 / self.travel as f32).clamp(0.0, 1.0);
+        (ratio * self.max_scroll as f32).round() as usize
+    }
+
+    /// 命中区比 4px 的轨道宽一点，好点
+    fn hit(&self, scale: f32) -> RECT {
+        let pad = crate::ui::s(6.0, scale);
+        RECT {
+            left: self.x - pad,
+            top: self.top,
+            right: self.x + self.track_w + pad,
+            bottom: self.bottom,
+        }
+    }
+}
+
 unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
     p.round(
         l.pad,
@@ -2188,6 +2270,55 @@ unsafe fn draw_table(p: &Painter, state: &mut State, l: &Layout) {
     }
 
     let rows: Vec<&DailyRow> = state.days.iter().rev().filter(|day| day.requests > 0).collect();
+
+    // 滚动条几何（内容放得下就不画）：明细表右侧，和设置窗一个手感
+    let track_top = list_top;
+    let track_bottom = (l.table_bottom - p.s(10.0)).max(track_top + 1);
+    let track_h = (track_bottom - track_top).max(1);
+    if max_scroll > 0 {
+        let track_w = p.s(4.0);
+        let bar = TableBar {
+            x: p.width - l.pad - p.s(11.0),
+            track_w,
+            top: track_top,
+            bottom: track_bottom,
+            thumb_h: ((track_h as f32 * available as f32 / rows.len().max(1) as f32).round() as i32)
+                .clamp(p.s(24.0), track_h),
+            travel: 0,
+            max_scroll,
+        };
+        let bar = TableBar {
+            travel: (track_h - bar.thumb_h).max(0),
+            ..bar
+        };
+        state.table_bar = Some(bar);
+
+        let active = if state.table_drag { p.ui.text2 } else { p.ui.text3 };
+        // 轨道
+        p.round(
+            bar.x,
+            bar.top,
+            bar.x + track_w,
+            bar.bottom,
+            track_w,
+            p.ui.row_tint,
+            p.ui.row_tint,
+        );
+        // 滑块
+        let thumb_top = bar.thumb_top(state.scroll);
+        p.round(
+            bar.x,
+            thumb_top,
+            bar.x + track_w,
+            thumb_top + bar.thumb_h,
+            track_w,
+            active,
+            active,
+        );
+    } else {
+        state.table_bar = None;
+    }
+
     let mut y = list_top;
     for (index, day) in rows.iter().skip(state.scroll).take(available).enumerate() {
         if index % 2 == 1 {
