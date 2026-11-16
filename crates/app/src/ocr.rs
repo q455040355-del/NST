@@ -1,4 +1,4 @@
-﻿//! PaddleOCR 取字：用 Apache-2.0 的 `simd-paddle-ocr-rs`（纯 Rust，无 ONNX Runtime）。
+//! PaddleOCR 取字：用 Apache-2.0 的 `simd-paddle-ocr-rs`（纯 Rust，无 ONNX Runtime）。
 //!
 //! 引擎在后台线程里现建现用（模型加载 ~17ms、识别 ~40ms），不阻塞 UI；
 //! 模型文件放在 exe 旁边的 `models\`（或仓库根的 `models\`，开发时用）。
