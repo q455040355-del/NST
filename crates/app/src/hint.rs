@@ -126,12 +126,14 @@ pub fn visible() -> bool {
 fn measure(text: &str, scale: f32) -> (i32, i32) {
     use std::sync::{Mutex, OnceLock};
 
-    static CACHE: OnceLock<Mutex<Option<(String, i32, i32)>>> = OnceLock::new();
+    // 缓存键要带缩放：面板挪到另一块缩放不同的屏后，同样的文字尺寸不一样
+    static CACHE: OnceLock<Mutex<Option<(String, u32, i32, i32)>>> = OnceLock::new();
     let cell = CACHE.get_or_init(|| Mutex::new(None));
+    let scale_key = scale.to_bits();
 
     if let Ok(guard) = cell.lock() {
-        if let Some((cached, width, height)) = guard.as_ref() {
-            if cached == text {
+        if let Some((cached, cached_scale, width, height)) = guard.as_ref() {
+            if cached == text && *cached_scale == scale_key {
                 return (*width, *height);
             }
         }
@@ -146,7 +148,7 @@ fn measure(text: &str, scale: f32) -> (i32, i32) {
     };
 
     if let Ok(mut guard) = cell.lock() {
-        *guard = Some((text.to_string(), size.0, size.1));
+        *guard = Some((text.to_string(), scale_key, size.0, size.1));
     }
     size
 }

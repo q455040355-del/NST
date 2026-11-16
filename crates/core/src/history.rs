@@ -241,8 +241,9 @@ pub fn load_files_only(days: i64) -> Vec<UsageRecord> {
     }
 
     // 3) 先把索引写回去（下次打开就只剩目录扫描），再按天数过滤出结果
-    if dirty {
-        index.save(&entries);
+    //    有文件变动、或者片上还是旧格式，都要重写一遍
+    if dirty || !index.upgrade.is_empty() {
+        index.save(&entries, from_ms);
     }
 
     let mut out = Vec::new();
@@ -306,6 +307,8 @@ struct Index {
     shards: HashMap<i64, u64>,
     /// 数据是从老的单文件索引读出来的：下次保存时顺手迁移
     legacy: bool,
+    /// 还是旧格式（< v3）的分片：保存时强制重写一遍，把消息 id 补进去
+    upgrade: std::collections::HashSet<i64>,
 }
 
 impl Index {
@@ -327,6 +330,7 @@ impl Index {
     fn load() -> Self {
         let mut entries = HashMap::new();
         let mut shards = HashMap::new();
+        let mut upgrade = std::collections::HashSet::new();
 
         if let Some(dir) = Self::dir() {
             if let Ok(list) = std::fs::read_dir(&dir) {
@@ -335,7 +339,10 @@ impl Index {
                     let Some(day) = shard_day(&path) else {
                         continue;
                     };
-                    if let Ok((hash, loaded)) = read_index(&path) {
+                    if let Ok((version, hash, loaded)) = read_index(&path) {
+                        if version < INDEX_VERSION {
+                            upgrade.insert(day);
+                        }
                         shards.insert(day, hash);
                         entries.extend(loaded);
                     }
@@ -347,7 +354,7 @@ impl Index {
         let mut legacy = false;
         if entries.is_empty() {
             if let Some(path) = Self::legacy_path() {
-                if let Ok((_, loaded)) = read_index(&path) {
+                if let Ok((_, _, loaded)) = read_index(&path) {
                     legacy = !loaded.is_empty();
                     entries = loaded;
                 }
@@ -358,6 +365,7 @@ impl Index {
             entries,
             shards,
             legacy,
+            upgrade,
         }
     }
 
@@ -370,7 +378,12 @@ impl Index {
         Some(entry.records)
     }
 
-    fn save(&mut self, entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)]) {
+    /// `from_ms`：这次扫描的起始时间（用来判断哪些老分片不该动）
+    fn save(
+        &mut self,
+        entries: &[(PathBuf, (u64, u64), &'static str, Vec<UsageRecord>)],
+        from_ms: i64,
+    ) {
         let Some(dir) = Self::dir() else {
             return;
         };
@@ -386,7 +399,8 @@ impl Index {
         let mut written: HashMap<i64, u64> = HashMap::new();
         for (day, picks) in &groups {
             let hash = fingerprint(entries, picks);
-            if self.shards.get(day) == Some(&hash) {
+            // 旧格式的分片即使内容没变也要重写（补消息 id 等新字段）
+            if !self.upgrade.contains(day) && self.shards.get(day) == Some(&hash) {
                 written.insert(*day, hash);
                 continue;
             }
@@ -413,8 +427,14 @@ impl Index {
             let _ = std::fs::remove_file(&temp);
         }
 
-        // 已经不存在的那一天：把整片删掉
+        // 已经不存在的那一天：把整片删掉。
+        // 注意只删「这次扫过的时间范围」里的片：窗口调小（比如只看今天）时，
+        // 更早那些天根本没扫，不能把它们的缓存一起清掉，否则下次看长区间要全量重解析
+        let oldest_day = ((from_ms - 86_400_000) / 1000 / 86_400) as i64;
         for day in self.shards.keys() {
+            if *day < oldest_day {
+                continue;
+            }
             if !groups.contains_key(day) {
                 if let Some(path) = Self::shard_path(*day) {
                     let _ = std::fs::remove_file(path);
@@ -431,6 +451,7 @@ impl Index {
         }
 
         self.shards = written;
+        self.upgrade.clear();
     }
 }
 
@@ -521,7 +542,7 @@ fn write_index(
     Ok(())
 }
 
-fn read_index(path: &Path) -> std::io::Result<(u64, HashMap<PathBuf, IndexEntry>)> {
+fn read_index(path: &Path) -> std::io::Result<(u32, u64, HashMap<PathBuf, IndexEntry>)> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
@@ -573,7 +594,7 @@ fn read_index(path: &Path) -> std::io::Result<(u64, HashMap<PathBuf, IndexEntry>
         entries.insert(path, IndexEntry { stamp, source, records });
     }
 
-    Ok((hash, entries))
+    Ok((version, hash, entries))
 }
 
 fn put_u8(writer: &mut impl std::io::Write, value: u8) -> std::io::Result<()> {
@@ -1433,7 +1454,8 @@ mod tests {
         let path = dir.join("usage-test.bin");
         std::fs::write(&path, &buffer).unwrap();
 
-        let (read_hash, loaded) = read_index(&path).unwrap();
+        let (version, read_hash, loaded) = read_index(&path).unwrap();
+        assert_eq!(version, INDEX_VERSION);
         assert_eq!(read_hash, hash);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[&PathBuf::from("C:/x/b.jsonl")].records[0].output, 22);

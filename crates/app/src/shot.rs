@@ -30,6 +30,7 @@ use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime as GetLocalTime2;
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -1343,6 +1344,7 @@ fn clipboard_bitmap(bitmap: &Bitmap) {
 
         let pointer = GlobalLock(handle) as *mut u8;
         if pointer.is_null() {
+            let _ = GlobalFree(handle);
             return;
         }
 
@@ -1376,8 +1378,13 @@ fn clipboard_bitmap(bitmap: &Bitmap) {
 
         if OpenClipboard(std::ptr::null_mut()) != 0 {
             EmptyClipboard();
-            SetClipboardData(CF_DIB, handle as *mut _);
+            // 成功时所有权交给剪贴板；失败要自己释放，否则这块内存就漏了
+            if SetClipboardData(CF_DIB, handle as *mut _).is_null() {
+                let _ = GlobalFree(handle);
+            }
             CloseClipboard();
+        } else {
+            let _ = GlobalFree(handle);
         }
     }
 }
