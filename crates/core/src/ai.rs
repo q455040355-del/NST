@@ -567,8 +567,10 @@ struct StreamState {
     merged: HashMap<String, (Response, i64)>,
     /// 上一行的 timestamp（推算 start 用）
     last_ts: i64,
-    /// Codex 的 token_count 事件没有稳定 id，用文件内序号当 key
+    /// Codex 的 token_count 事件没有稳定 id，用「文件指纹 + 文件内序号」当 key
     seq: u64,
+    /// 文件指纹：不同会话文件的序号都从 1 开始，不加这个会互相覆盖
+    salt: u64,
 }
 
 impl StreamState {
@@ -578,6 +580,7 @@ impl StreamState {
             merged: HashMap::new(),
             last_ts: 0,
             seq: 0,
+            salt: 0,
         }
     }
 }
@@ -836,6 +839,10 @@ fn parse_into(
             let state = entry
                 .stream
                 .get_or_insert_with(|| StreamState::new(prefix));
+            // 文件指纹只算一次：Codex 的 key 要用它区分不同会话
+            if state.salt == 0 {
+                state.salt = path_salt(path);
+            }
             entry.offset = parse_stream_into(
                 kind,
                 path,
@@ -848,6 +855,17 @@ fn parse_into(
         }
     }
     Ok(())
+}
+
+/// 文件路径的稳定指纹（FNV-1a）：只用来给「没有 id 的事件」拼 key
+fn path_salt(path: &Path) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in path.to_string_lossy().to_lowercase().bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // 0 是「还没算过」的哨兵值
+    hash.max(1)
 }
 
 /// 文件开头 64 字节的指纹（FNV-1a）：只为区分「追加」和「重写」
@@ -1185,9 +1203,9 @@ fn apply_codex_line(line: &str, state: &mut StreamState, rows: &mut FileRows, de
         return;
     };
 
-    // token_count 没有稳定 id：用文件内序号（只追加，所以序号稳定）
+    // token_count 没有稳定 id：用「文件指纹 + 文件内序号」（只追加，序号稳定）
     state.seq += 1;
-    let key = format!("{}:{}", state.prefix, state.seq);
+    let key = format!("{}:{:x}:{}", state.prefix, state.salt, state.seq);
     let last_ts = state.last_ts;
 
     let start = if last_ts > 0 && timestamp > last_ts && timestamp - last_ts < 300_000 {
@@ -1449,10 +1467,11 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows["codex:1"].output, 12);
-        assert_eq!(rows["codex:3"].output, 5);
+        let key = |seq: u64| format!("codex:{:x}:{seq}", state.salt);
+        assert_eq!(rows[&key(1)].output, 12);
+        assert_eq!(rows[&key(3)].output, 5);
         // 相邻事件间隔 1 秒：start 取上一条的时间
-        assert!(rows["codex:2"].end - rows["codex:2"].start <= 1000);
+        assert!(rows[&key(2)].end - rows[&key(2)].start <= 1000);
     }
 
     #[test]
@@ -1535,6 +1554,35 @@ mod tests {
             month + 1,
             days + 1
         )
+    }
+
+    #[test]
+    fn codex_files_do_not_collide() {
+        // 两个 Codex 会话文件的 token_count 序号都从 1 开始，key 必须带文件指纹
+        let dir = std::env::temp_dir().join("nst-codex-two");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = r#"{"timestamp":"2026-11-15T10:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#;
+        let a = dir.join("rollout-a.jsonl");
+        let b = dir.join("rollout-b.jsonl");
+        std::fs::write(&a, format!("{line}\n")).unwrap();
+        std::fs::write(&b, format!("{line}\n")).unwrap();
+
+        let mut entry_a = FileEntry::new(FileKind::Codex, "codex");
+        let mut entry_b = FileEntry::new(FileKind::Codex, "codex");
+        let mut delta_a = Delta::default();
+        let mut delta_b = Delta::default();
+        parse_into(FileKind::Codex, &a, &mut entry_a, &mut delta_a).unwrap();
+        parse_into(FileKind::Codex, &b, &mut entry_b, &mut delta_b).unwrap();
+
+        assert_eq!(delta_a.changed.len(), 1);
+        assert_eq!(delta_b.changed.len(), 1);
+        assert_ne!(
+            delta_a.changed[0].0, delta_b.changed[0].0,
+            "不同会话的同序号事件不能互相覆盖"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

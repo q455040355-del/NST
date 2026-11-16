@@ -26,6 +26,7 @@ public static class Smoke {
   public delegate bool Proc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] static extern bool EnumWindows(Proc p, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, Proc p, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
@@ -36,6 +37,16 @@ public static class Smoke {
   [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
 
+  public static IntPtr FindChild(IntPtr parent, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumChildWindows(parent, delegate(IntPtr h, IntPtr l) {
+      StringBuilder sb = new StringBuilder(256);
+      GetClassNameW(h, sb, 256);
+      if (sb.ToString() == cls) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
   public static IntPtr FindClass(string cls) {
     IntPtr found = IntPtr.Zero;
     EnumWindows(delegate(IntPtr h, IntPtr l) {
@@ -192,9 +203,17 @@ $wheeled = Shot "settings-wheel" $settings
 
 # 拖滚动条滑块（右侧细轨道，从上往下拖）
 $barX = $shortW - [int][math]::Round(7 * $scale)
-[Smoke]::Drag($settings, $barX, [int]($shortH * 0.3), $barX, [int]($shortH * 0.85))
+$fromY = [int]($shortH * 0.3)
+$toY = [int]($shortH * 0.85)
+[Smoke]::Drag($settings, $barX, $fromY, $barX, $toY)
 Start-Sleep -Milliseconds 350
 $dragged = Shot "settings-drag" $settings
+# 偶发一次拖动没生效（刚好在重绘中间），换个起点再来一次
+if ((Hash-Of $dragged) -eq (Hash-Of $wheeled)) {
+    [Smoke]::Drag($settings, $barX, [int]($shortH * 0.2), $barX, [int]($shortH * 0.9))
+    Start-Sleep -Milliseconds 350
+    $dragged = Shot "settings-drag" $settings
+}
 
 Check "滚轮改变了内容" ((Hash-Of $wheeled) -ne (Hash-Of $short))
 Check "拖动滚动条改变了内容" ((Hash-Of $dragged) -ne (Hash-Of $wheeled))
@@ -220,12 +239,23 @@ $aiY = [int][math]::Round((449 - 198) * $scale)
 [Smoke]::Click($settings, $aiX, $aiY)
 Start-Sleep -Milliseconds 600
 $after = Ini-Ai
+# 偶发一次点击被吃掉（滚轮/重绘刚好在中间），补一次；两次都不动才算失败
+if ($after -eq $before) {
+    [Smoke]::Click($settings, $aiX, $aiY)
+    Start-Sleep -Milliseconds 600
+    $after = Ini-Ai
+}
 Check "点击开关翻转 AiEnabled" ($after -ne $before) "$before -> $after"
 
-# 复原
+# 复原（同样的容错）
 [Smoke]::Click($settings, $aiX, $aiY)
 Start-Sleep -Milliseconds 600
 $restored = Ini-Ai
+if ($restored -ne $before) {
+    [Smoke]::Click($settings, $aiX, $aiY)
+    Start-Sleep -Milliseconds 600
+    $restored = Ini-Ai
+}
 Check "再点一次恢复原值" ($restored -eq $before) $restored
 
 # ---------------------------------------------------------------- 开机自启
@@ -251,6 +281,23 @@ $runValue = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction Silently
 Check "再点一次清掉 AutoStart" ($autoIni -eq "AutoStart=False") $autoIni
 if (-not $hadRun) {
     Check "注册表自启项已删除" ($null -eq $runValue) "$runValue"
+}
+
+# ---------------------------------------------------------------- 历史窗口
+# 这一步能抓到「来源变多导致数组越界」这类崩溃：窗口开不出来就是 FAIL
+[void][Smoke]::PostMessageW($panel, 0x8041, [IntPtr]1300, [IntPtr]::Zero)
+$history = Wait-Class "NetSpeedTaskbarRs.History" 5000
+Check "历史窗打开" ($history.ToInt64() -ne 0)
+if ($history.ToInt64() -ne 0) {
+    Start-Sleep -Milliseconds 1800
+    $historyRect = [Smoke]::RectOf($history)
+    Check "历史窗有尺寸" ($historyRect -notmatch " 0x0") $historyRect
+    [void](Shot "history" $history)
+    # Esc 落在 canvas 上（它铺满窗口，焦点不在框架窗口）
+    $canvas = [Smoke]::FindChild($history, "NetSpeedTaskbarRs.HistoryCanvas")
+    [void][Smoke]::SendMessageW($canvas, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 400
+    Check "Esc 关闭历史窗" (-not [Smoke]::IsWindow($history))
 }
 
 # ---------------------------------------------------------------- 键盘导航

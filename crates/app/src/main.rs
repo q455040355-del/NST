@@ -553,6 +553,18 @@ fn reveal_existing() {
         // 允许前台化：这是用户主动双击触发的，Windows 会放行
         AllowSetForegroundWindow(0xFFFF_FFFF);
         PostMessageW(found, WM_APP_REVEAL, 0, 0);
+
+        // `netspeed --history` / `--settings` 在已经跑着的时候也要能打开对应窗口，
+        // 否则用户从快捷方式带参数启动会什么反应都没有
+        for arg in std::env::args() {
+            let id = match arg.as_str() {
+                "--history" => ID_HISTORY,
+                "--settings" => ID_SETTINGS,
+                _ => continue,
+            };
+            PostMessageW(found, menu::WM_APP_MENU_PICK, id, 0);
+            break;
+        }
     }
 }
 

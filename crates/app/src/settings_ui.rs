@@ -1698,7 +1698,7 @@ fn nav_items(state: &State) -> Vec<Hit> {
     ];
     if state.ai_enabled {
         items.push(Hit::AiToggle);
-        for index in 0..4 {
+        for index in 0..6 {
             items.push(Hit::AiSource(index));
         }
     }

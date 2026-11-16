@@ -379,10 +379,13 @@ fn prefs_path() -> Option<PathBuf> {
 }
 
 /// 上次的 (区间, 来源位掩码)。读不到就用「今天 / 全部」。
-/// 老版本存的是 `source=0..4`（0 = 全部），这里兼容读。
+/// 老版本存的是 `source=0..4`（0 = 全部），加来源之前存的是 4 位掩码，这里都兼容。
 fn prefs() -> (usize, u8) {
     let mut range = 0;
-    let mut sources: u8 = 0b1111;
+    let mut sources: u8 = 0b11_1111;
+    let mut legacy_mask = false;
+    let mut has_version = false;
+
     if let Some(path) = prefs_path() {
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
@@ -393,12 +396,16 @@ fn prefs() -> (usize, u8) {
                     continue;
                 };
                 match key.trim() {
+                    "version" => has_version = value >= 2,
                     "range" => range = value.min(RANGE_LABELS.len() - 1),
-                    "sources" => sources = (value as u8) & 0b1111,
+                    "sources" => {
+                        sources = (value as u8) & 0b11_1111;
+                        legacy_mask = true;
+                    }
                     // 单选的旧格式：0 = 全部，n = 只开第 n-1 路
                     "source" => {
                         sources = if value == 0 {
-                            0b1111
+                            0b11_1111
                         } else {
                             1 << ((value - 1).min(3))
                         }
@@ -408,8 +415,15 @@ fn prefs() -> (usize, u8) {
             }
         }
     }
+
+    // 加来源之前的 4 位掩码：那时「全选」是 0b1111，要展开成 6 位全选，
+    // 否则老用户打开历史窗会看不到 Claude / Codex 的数据
+    if legacy_mask && !has_version && sources == 0b00_1111 {
+        sources = 0b11_1111;
+    }
+
     if sources == 0 {
-        sources = 0b1111;
+        sources = 0b11_1111;
     }
     (range, sources)
 }
@@ -425,7 +439,10 @@ fn save_prefs(range: usize, sources: [bool; 6]) {
         .iter()
         .enumerate()
         .fold(0u8, |mask, (index, on)| if *on { mask | 1 << index } else { mask });
-    let _ = std::fs::write(path, format!("range={range}\nsources={mask}\n"));
+    let _ = std::fs::write(
+        path,
+        format!("version=2\nrange={range}\nsources={mask}\n"),
+    );
 }
 
 fn start_loading(hwnd: HWND) {
@@ -1639,7 +1656,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
     // ---- 来源：右侧轻量按钮（窄窗口时换到第二行，从左边排）
     state.source_rects.clear();
     let labels = SOURCE_LABELS;
-    let mut widths = [0_i32; 5];
+    let mut widths = [0_i32; SOURCE_LABELS.len()];
     let mut total = 0;
     for (index, label) in labels.iter().enumerate() {
         widths[index] = p.text_width(label, 8.5, 500) + p.s(26.0) + if index == 0 { 0 } else { p.s(10.0) };
