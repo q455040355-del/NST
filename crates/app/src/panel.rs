@@ -387,7 +387,7 @@ impl Panel {
         if self.settings.ai_enabled {
             self.ai_snapshot = self.ai.snapshot();
             self.ai_speed_text = format_ai_speed(self.ai_snapshot.speed);
-            self.ai_today_text = format_tokens(self.ai_snapshot.today_output);
+            self.ai_today_text = format_tokens(self.ai_snapshot.today_tokens);
         } else {
             self.ai_snapshot = AiSnapshot::default();
             self.ai_speed_text = format_ai_speed(0.0);

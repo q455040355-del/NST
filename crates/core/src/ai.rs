@@ -1,7 +1,7 @@
 //! AI token 速度：多来源聚合（OpenCode / DSH / WorkBuddy）。
 //!
 //! 和 C# 版 `AiSpeedMeter` 同口径：
-//! - 今日累计 = 今天所有响应（assistant 消息）的 output 之和；
+//! - 今日累计 = 今天所有响应（assistant 消息）的 input + output 之和；
 //! - 实时速度 = 最近 3 秒内完成的响应按重叠比例摊进去，再除以 3；
 //! - 正在生成时，用最近几次实测平均速度补一个在飞估算。
 //!
@@ -21,7 +21,8 @@ const WINDOW_MS: i64 = 3000;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AiSnapshot {
     pub speed: f64,
-    pub today_output: i64,
+    /// 今日累计：输入 + 输出（和历史窗口同口径）
+    pub today_tokens: i64,
     pub generating: bool,
     pub sources: u32,
 }
@@ -31,6 +32,8 @@ struct Response {
     start: i64,
     end: i64,
     output: i64,
+    /// 输入 token（含缓存命中/写入，口径和历史窗口一致）
+    input: i64,
 }
 
 /// 一个文件解析出来的响应（key 已带来源前缀）
@@ -83,7 +86,7 @@ pub struct AiEngine {
     recent: Vec<(i64, f64)>,
     in_flight: i64,
     today_start: i64,
-    today_output: i64,
+    today_tokens: i64,
     sources: Sources,
     opencode: OpenCodeSource,
     dsh: FileSource,
@@ -109,7 +112,7 @@ impl AiEngine {
             recent: Vec::new(),
             in_flight: 0,
             today_start: 0,
-            today_output: 0,
+            today_tokens: 0,
             sources,
             opencode: OpenCodeSource::new(),
             dsh: FileSource::new(
@@ -242,7 +245,7 @@ impl AiEngine {
 
         for response in self.responses.values() {
             if response.end >= self.today_start {
-                today += response.output;
+                today += response.output + response.input;
             }
 
             // 只有“刚刚开始”的未完成响应才算在飞；库里可能残留很久以前的残缺行
@@ -269,7 +272,7 @@ impl AiEngine {
             recent.drain(..recent.len() - 8);
         }
 
-        self.today_output = today;
+        self.today_tokens = today;
         self.busy = self.in_flight > 0
             || recent
                 .last()
@@ -329,7 +332,7 @@ impl AiEngine {
 
         AiSnapshot {
             speed: live.max(0.0),
-            today_output: self.today_output.max(0),
+            today_tokens: self.today_tokens.max(0),
             generating: self.in_flight > 0,
             sources: self.responses.len() as u32,
         }
@@ -444,7 +447,8 @@ impl OpenCodeSource {
             "SELECT id, \
              IFNULL(json_extract(data,'$.time.created'),0), \
              IFNULL(json_extract(data,'$.time.streamed'),0), \
-             IFNULL(json_extract(data,'$.tokens.output'),0) + IFNULL(json_extract(data,'$.tokens.reasoning'),0) \
+             IFNULL(json_extract(data,'$.tokens.output'),0) + IFNULL(json_extract(data,'$.tokens.reasoning'),0), \
+             IFNULL(json_extract(data,'$.tokens.input'),0) + IFNULL(json_extract(data,'$.tokens.cache.read'),0) + IFNULL(json_extract(data,'$.tokens.cache.write'),0) \
              FROM session_message \
              WHERE type = 'assistant' AND time_created > ?1"
                 .to_string()
@@ -453,7 +457,8 @@ impl OpenCodeSource {
                 "SELECT id, \
                  IFNULL(json_extract(data,'$.time.created'),0), \
                  IFNULL(json_extract(data,'$.time.streamed'),0), \
-                 IFNULL(json_extract(data,'$.tokens.output'),0) + IFNULL(json_extract(data,'$.tokens.reasoning'),0) \
+                 IFNULL(json_extract(data,'$.tokens.output'),0) + IFNULL(json_extract(data,'$.tokens.reasoning'),0), \
+                 IFNULL(json_extract(data,'$.tokens.input'),0) + IFNULL(json_extract(data,'$.tokens.cache.read'),0) + IFNULL(json_extract(data,'$.tokens.cache.write'),0) \
                  FROM session_message \
                  WHERE type = 'assistant' AND (time_created > ?1 OR id IN ({in_flight}))"
             )
@@ -470,6 +475,7 @@ impl OpenCodeSource {
                     start: row.get(1)?,
                     end: row.get(2)?,
                     output: row.get(3)?,
+                    input: row.get(4)?,
                 },
             ))
         }) else {
@@ -929,7 +935,11 @@ fn parse_dsh(path: &Path, prefix: &'static str) -> std::io::Result<FileRows> {
 
         let usage = &value["data"]["usage"];
         let output = usage["outputTokens"].as_i64().unwrap_or(0);
-        if output <= 0 {
+        let cache_read = usage["cacheReadTokens"].as_i64().unwrap_or(0);
+        let input = usage["inputTokens"].as_i64().unwrap_or(0)
+            + cache_read
+            + usage["cacheWriteTokens"].as_i64().unwrap_or(0);
+        if output <= 0 && input <= 0 {
             continue;
         }
 
@@ -949,6 +959,7 @@ fn parse_dsh(path: &Path, prefix: &'static str) -> std::io::Result<FileRows> {
                 start,
                 end: time,
                 output,
+                input,
             },
         );
 
@@ -1062,6 +1073,7 @@ fn apply_workbuddy_line(
                 start: timestamp,
                 end: timestamp,
                 output: 0,
+                input: 0,
             },
             last_ts,
         )
@@ -1069,6 +1081,10 @@ fn apply_workbuddy_line(
 
     if output > entry.0.output {
         entry.0.output = output;
+    }
+
+    if input > entry.0.input {
+        entry.0.input = input;
     }
 
     if timestamp > entry.0.end {
@@ -1112,8 +1128,10 @@ fn apply_claude_line(line: &str, state: &mut StreamState, rows: &mut FileRows, d
 
     let usage = &value["message"]["usage"];
     let output = usage["output_tokens"].as_i64().unwrap_or(0);
-    let input = usage["input_tokens"].as_i64().unwrap_or(0);
     let cache_read = usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
+    let input = usage["input_tokens"].as_i64().unwrap_or(0)
+        + cache_read
+        + usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
     if output <= 0 && input <= 0 {
         return;
     }
@@ -1146,6 +1164,7 @@ fn apply_claude_line(line: &str, state: &mut StreamState, rows: &mut FileRows, d
                 start,
                 end: timestamp,
                 output: 0,
+                input: 0,
             },
             last_ts,
         )
@@ -1155,7 +1174,9 @@ fn apply_claude_line(line: &str, state: &mut StreamState, rows: &mut FileRows, d
     if output > entry.0.output {
         entry.0.output = output;
     }
-    let _ = (input, cache_read); // 暂不参与速度，聚合时由历史窗口自己算
+    if input > entry.0.input {
+        entry.0.input = input;
+    }
 
     if timestamp > entry.0.end {
         if last_ts > 0 && timestamp - last_ts < 120_000 {
@@ -1218,6 +1239,7 @@ fn apply_codex_line(line: &str, state: &mut StreamState, rows: &mut FileRows, de
         start,
         end: timestamp,
         output,
+        input,
     };
     state.last_ts = timestamp;
 
@@ -1542,7 +1564,10 @@ mod tests {
         );
         engine.poll(now);
         let snapshot = engine.snapshot(now);
-        assert_eq!(snapshot.today_output, 321, "Claude 的用量要算进今日");
+        assert_eq!(
+            snapshot.today_tokens, 331,
+            "今日 = 输入 10 + 输出 321，不能只算输出"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1806,6 +1831,7 @@ mod tests {
                 start: now - 1000,
                 end: now,
                 output: 10,
+                input: 0,
             },
         ));
         engine.apply(delta);
@@ -1819,6 +1845,7 @@ mod tests {
                 start: now - 1000,
                 end: now,
                 output: 25,
+                input: 0,
             },
         ));
         engine.apply(delta);
@@ -1834,9 +1861,41 @@ mod tests {
                 start: now - 500,
                 end: now,
                 output: 7,
+                input: 0,
             },
         ));
         engine.apply(delta);
         assert_eq!(engine.responses["wb:a"].output, 7, "先删后插，重写的 key 要留下");
+    }
+
+    #[test]
+    fn today_counts_input_plus_output() {
+        let mut engine = AiEngine::new(Sources {
+            opencode: false,
+            dsh: false,
+            workbuddy: false,
+            workbuddy_ai: false,
+            claude: false,
+            codex: false,
+        });
+        let now = now_ms();
+        engine.today_start = local_midnight_ms(now);
+
+        let mut delta = Delta::default();
+        delta.changed.push((
+            "wb:a".to_string(),
+            Response {
+                start: now - 1_000,
+                end: now,
+                output: 7,
+                input: 93,
+            },
+        ));
+        engine.apply(delta);
+        engine.recompute(now);
+
+        let snapshot = engine.snapshot(now);
+        assert_eq!(snapshot.today_tokens, 100, "今日应该是输入 + 输出");
+        assert!(snapshot.speed > 0.0, "速度仍然只按输出算");
     }
 }

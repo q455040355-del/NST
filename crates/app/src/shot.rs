@@ -751,11 +751,11 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Pen) => "画笔",
         Action::Tool(Tool::Text) => "文字",
         Action::Tool(Tool::Mosaic) => "马赛克",
-        Action::Tool(Tool::Ocr) => "取字",
+        Action::Tool(Tool::Ocr) => "OCR",
         Action::Undo => "撤销",
         Action::Copy => "复制",
         Action::Save => "保存",
-        Action::Ocr => "取字",
+        Action::Ocr => "OCR",
         Action::Pin => "贴图",
         Action::Close => "关闭",
     }
