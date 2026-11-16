@@ -20,14 +20,16 @@ mod ui;
 use netspeed_core::settings::{parse_hotkey, Settings};
 use panel::Panel;
 use std::ffi::c_void;
-use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -657,6 +659,67 @@ fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
     }
 }
 
+/// 已知的远程控制客户端进程名（小写、去掉 .exe）。
+///
+/// 前台是这些窗口时，本机只是「控制端」：快捷键会被远控软件同时转发给被控端，
+/// 两边都注册了全局热键就会两台机器一起弹截图。这里让控制端自己不触发，
+/// 由被控端（前台不是远控窗口）去截图。
+const REMOTE_CLIENTS: [&str; 11] = [
+    "gameviewer", // 网易 UU 远程
+    "uuremote",   // UU 远程的新版 exe 名
+    "todesk",
+    "sunloginclient", // 向日葵
+    "anydesk",
+    "teamviewer",
+    "teamviewer_service",
+    "rustdesk",
+    "parsecd", // Parsec
+    "mstsc",   // Windows 远程桌面
+    "moonlight",
+];
+
+fn is_remote_client_exe(path: &str) -> bool {
+    let name = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    REMOTE_CLIENTS.contains(&name)
+}
+
+/// 当前前台窗口是不是远程控制软件（UU 远程 / ToDesk / 向日葵…）。
+fn foreground_is_remote_client() -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+
+        let mut pid = 0_u32;
+        GetWindowThreadProcessId(foreground, &mut pid);
+        if pid == 0 {
+            return false;
+        }
+
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+        if ok == 0 {
+            return false;
+        }
+
+        let path = String::from_utf16_lossy(&buffer[..size as usize]);
+        is_remote_client_exe(&path)
+    }
+}
+
 /// 周期刷新：后台线程每 500ms 投递一次 WM_APP_TICK。
 /// （本进程 SetTimer/WM_TIMER 实测完全收不到，改用线程投递最稳。）
 /// 前台是不是一个占满整块显示器的窗口（游戏、视频全屏）。
@@ -1056,12 +1119,15 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_HOTKEY => {
-            let enabled = panel_mut(hwnd)
+            let settings = panel_mut(hwnd)
                 .map(|panel| panel.settings.clone())
                 .unwrap_or_default();
+            // 本机前台是远控窗口（UU 远程 / ToDesk / 向日葵…）：说明它只是控制端，
+            // 这次按键会被远控转发到被控端，让那边去截图，本机不要再弹一份。
+            let controller = foreground_is_remote_client();
             match wparam as i32 {
-                HOTKEY_SHOT if enabled.shot_enabled => shot::request(hwnd),
-                HOTKEY_OCR if enabled.ocr_enabled => shot::request_ocr(hwnd),
+                HOTKEY_SHOT if settings.shot_enabled && !controller => shot::request(hwnd),
+                HOTKEY_OCR if settings.ocr_enabled && !controller => shot::request_ocr(hwnd),
                 _ => {}
             }
             0
@@ -1454,5 +1520,25 @@ pub(crate) fn dpi_for_window(hwnd: HWND) -> u32 {
         let dpi = GetDeviceCaps(dc, 88) as u32;
         ReleaseDC(hwnd, dc);
         dpi.max(96)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_remote_client_exe;
+
+    #[test]
+    fn remote_client_exe_names() {
+        assert!(is_remote_client_exe(r"F:\uu\GameViewer\bin\GameViewer.exe"));
+        assert!(is_remote_client_exe(
+            r"C:\Program Files\UU Remote\UURemote.exe"
+        ));
+        assert!(is_remote_client_exe(r"C:\Program Files\ToDesk\ToDesk.exe"));
+        assert!(is_remote_client_exe(r"C:\Program Files\Sunlogin\SunloginClient.exe"));
+
+        // 名字里只是包含关键词不算
+        assert!(!is_remote_client_exe(r"C:\Windows\explorer.exe"));
+        assert!(!is_remote_client_exe(r"C:\Tools\GameViewerHelper\foo.exe"));
+        assert!(!is_remote_client_exe(""));
     }
 }

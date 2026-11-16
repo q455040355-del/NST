@@ -119,6 +119,8 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **取字（框选区域）**：编辑窗点「OCR」→ 拖框选一块 → **只识别这块**；整图就拖满。
   `Ctrl+Shift+O` 则是先截图再取字（设置里开取字后才有），同样支持框选；结果窗多行可编辑、自动进剪贴板；
 - **输出**：`Ctrl+C` 复制到剪贴板（CF_DIB）、`Ctrl+S` 另存为 PNG（标准另存为对话框）、`Ctrl+Z` 撤销、`Esc` 关闭；
+- **远程控制**：用 UU 远程 / ToDesk / 向日葵 / AnyDesk / TeamViewer / RustDesk / Parsec / mstsc 等控制另一台机器时，
+  控制端前台是远控窗口，截图 / 取字热键**不会在本机触发**，由被控端响应——避免按一次两台机器同时弹截图；
 - **贴图**：一键把结果钉在最上层，拖动移动，右键 / 双击 / Esc 关闭。
 
 实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一画在「图片坐标系」里，靠 `SetViewportOrgEx` 平移到显示位置，导出时把原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
