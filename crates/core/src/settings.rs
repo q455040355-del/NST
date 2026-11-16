@@ -34,6 +34,14 @@ pub struct Settings {
     pub ai_workbuddy_ai: bool,
     /// 开机自启（写 HKCU\…\Run）
     pub auto_start: bool,
+    /// 截图功能开关：关掉后菜单不显示、热键不注册
+    pub shot_enabled: bool,
+    /// 取字 / OCR 开关（默认关，开了才注册热键、截图工具栏才出现「OCR」）
+    pub ocr_enabled: bool,
+    /// 截图热键（如 `Ctrl+Shift+A`）
+    pub shot_hotkey: String,
+    /// 取字热键（如 `Ctrl+Shift+O`）
+    pub ocr_hotkey: String,
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
     extra: BTreeMap<String, String>,
 }
@@ -57,6 +65,10 @@ impl Default for Settings {
             ai_workbuddy: true,
             ai_workbuddy_ai: true,
             auto_start: false,
+            shot_enabled: true,
+            ocr_enabled: false,
+            shot_hotkey: "Ctrl+Shift+A".to_string(),
+            ocr_hotkey: "Ctrl+Shift+O".to_string(),
             extra: BTreeMap::new(),
         }
     }
@@ -107,6 +119,18 @@ impl Settings {
                 "AiWorkBuddy" => settings.ai_workbuddy = parse_bool(value),
                 "AiWorkBuddyAi" => settings.ai_workbuddy_ai = parse_bool(value),
                 "AutoStart" => settings.auto_start = parse_bool(value),
+                "ShotEnabled" => settings.shot_enabled = parse_bool(value),
+                "OcrEnabled" => settings.ocr_enabled = parse_bool(value),
+                "ShotHotkey" => {
+                    if let Some((mods, vk)) = parse_hotkey(value) {
+                        settings.shot_hotkey = format_hotkey(mods, vk);
+                    }
+                }
+                "OcrHotkey" => {
+                    if let Some((mods, vk)) = parse_hotkey(value) {
+                        settings.ocr_hotkey = format_hotkey(mods, vk);
+                    }
+                }
                 _ => {
                     settings.extra.insert(key.to_string(), value.to_string());
                 }
@@ -154,6 +178,10 @@ impl Settings {
         out.push_str(&format!("AiWorkBuddy={}\n", self.ai_workbuddy));
         out.push_str(&format!("AiWorkBuddyAi={}\n", self.ai_workbuddy_ai));
         out.push_str(&format!("AutoStart={}\n", self.auto_start));
+        out.push_str(&format!("ShotEnabled={}\n", self.shot_enabled));
+        out.push_str(&format!("OcrEnabled={}\n", self.ocr_enabled));
+        out.push_str(&format!("ShotHotkey={}\n", self.shot_hotkey));
+        out.push_str(&format!("OcrHotkey={}\n", self.ocr_hotkey));
 
         for (key, value) in &self.extra {
             // 上面这些键已经写过，不再重复
@@ -177,6 +205,10 @@ impl Settings {
                     | "AiWorkBuddy"
                     | "AiWorkBuddyAi"
                     | "AutoStart"
+                    | "ShotEnabled"
+                    | "OcrEnabled"
+                    | "ShotHotkey"
+                    | "OcrHotkey"
             ) {
                 continue;
             }
@@ -214,6 +246,105 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes"
     )
+}
+
+// ---------------------------------------------------------------- 全局热键
+
+pub const HOTKEY_MOD_ALT: u32 = 0x0001;
+pub const HOTKEY_MOD_CONTROL: u32 = 0x0002;
+pub const HOTKEY_MOD_SHIFT: u32 = 0x0004;
+pub const HOTKEY_MOD_WIN: u32 = 0x0008;
+
+/// `Ctrl+Shift+A` → (修饰键位, 虚拟键码)。必须带至少一个修饰键，
+/// 免得把普通打字键注册成全局热键。
+pub fn parse_hotkey(text: &str) -> Option<(u32, u32)> {
+    let mut mods = 0_u32;
+    let mut key = None;
+
+    for part in text.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+
+        let lower = part.to_ascii_lowercase();
+        let bit = match lower.as_str() {
+            "ctrl" | "control" => HOTKEY_MOD_CONTROL,
+            "shift" => HOTKEY_MOD_SHIFT,
+            "alt" => HOTKEY_MOD_ALT,
+            "win" | "windows" => HOTKEY_MOD_WIN,
+            _ => {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(key_code(&lower)?);
+                continue;
+            }
+        };
+        mods |= bit;
+    }
+
+    let key = key?;
+    if mods == 0 {
+        return None;
+    }
+    Some((mods, key))
+}
+
+fn key_code(lower: &str) -> Option<u32> {
+    if lower.len() == 1 {
+        let ch = lower.chars().next()?.to_ascii_uppercase();
+        if ch.is_ascii_alphanumeric() {
+            return Some(ch as u32);
+        }
+    }
+
+    if let Some(rest) = lower.strip_prefix('f') {
+        if let Ok(number) = rest.parse::<u32>() {
+            if (1..=24).contains(&number) {
+                return Some(0x70 + number - 1);
+            }
+        }
+    }
+
+    match lower {
+        "space" => Some(0x20),
+        "tab" => Some(0x09),
+        "enter" | "return" => Some(0x0D),
+        _ => None,
+    }
+}
+
+/// (修饰键位, 虚拟键码) → `Ctrl+Shift+A`（显示/落盘用固定顺序）
+pub fn format_hotkey(mods: u32, vk: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if mods & HOTKEY_MOD_WIN != 0 {
+        parts.push("Win".to_string());
+    }
+    if mods & HOTKEY_MOD_CONTROL != 0 {
+        parts.push("Ctrl".to_string());
+    }
+    if mods & HOTKEY_MOD_SHIFT != 0 {
+        parts.push("Shift".to_string());
+    }
+    if mods & HOTKEY_MOD_ALT != 0 {
+        parts.push("Alt".to_string());
+    }
+    if let Some(key) = key_name(vk) {
+        parts.push(key);
+    }
+    parts.join("+")
+}
+
+fn key_name(vk: u32) -> Option<String> {
+    match vk {
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk).map(|ch| ch.to_string()),
+        0x70..=0x87 => Some(format!("F{}", vk - 0x70 + 1)),
+        0x20 => Some("Space".to_string()),
+        0x09 => Some("Tab".to_string()),
+        0x0D => Some("Enter".to_string()),
+        _ => None,
+    }
 }
 
 /// 指示条只允许两种指标：内存占用百分比 / Token 速度（外加关闭）。
@@ -289,5 +420,28 @@ mod tests {
         assert_eq!(settings.view, "ai");
         settings.cycle_view();
         assert_eq!(settings.view, "speed");
+    }
+
+    #[test]
+    fn hotkey_roundtrip() {
+        let (mods, vk) = parse_hotkey("Ctrl+Shift+A").unwrap();
+        assert_eq!(mods, HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT);
+        assert_eq!(vk, 0x41);
+        assert_eq!(format_hotkey(mods, vk), "Ctrl+Shift+A");
+
+        // 大小写、别名、功能键
+        let (mods, vk) = parse_hotkey("alt + f5").unwrap();
+        assert_eq!(mods, HOTKEY_MOD_ALT);
+        assert_eq!(format_hotkey(mods, vk), "Alt+F5");
+
+        let (mods, vk) = parse_hotkey("win+shift+s").unwrap();
+        assert_eq!(format_hotkey(mods, vk), "Win+Shift+S");
+
+        // 必须有修饰键，也不能有多余的键
+        assert!(parse_hotkey("A").is_none());
+        assert!(parse_hotkey("Ctrl+").is_none());
+        assert!(parse_hotkey("Ctrl+A+B").is_none());
+        assert!(parse_hotkey("Ctrl+F25").is_none());
+        assert!(parse_hotkey("Ctrl+中文").is_none());
     }
 }

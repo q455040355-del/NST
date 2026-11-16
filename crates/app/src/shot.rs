@@ -13,6 +13,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
@@ -52,6 +53,16 @@ use crate::WM_APP_SHOT_FIRE;
 
 /// 标记：截图/编辑进行中（面板的自动显示要让路）。
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 设置里的取字（OCR）开关：关掉后截图工具栏不出现 OCR，热键也不会触发
+static OCR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_ocr_enabled(enabled: bool) {
+    OCR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn ocr_enabled() -> bool {
+    OCR_ENABLED.load(Ordering::Relaxed)
+}
 
 static mut PANEL: HWND = std::ptr::null_mut();
 static mut RESTORE_PANEL: bool = false;
@@ -76,6 +87,9 @@ pub fn request(panel: HWND) {
 
 /// 截图后直接取字（PaddleOCR）
 pub fn request_ocr(panel: HWND) {
+    if !ocr_enabled() {
+        return;
+    }
     start(panel, Mode::Ocr);
 }
 
@@ -345,7 +359,11 @@ struct Overlay {
     dimmed: Vec<u8>,
     origin: (i32, i32),
     start: Option<POINT>,
+    /// 按下但还没拖动：用来区分「单击截窗口」和「拖框选区」
+    press: Option<POINT>,
     current: POINT,
+    /// 鼠标下自动聚焦的窗口（截图坐标）：没拖动时就是默认选区
+    hover: Option<RECT>,
     /// 常驻的整屏画布：每帧只改动选区那几行，不再整屏重新分配 + 拷 14 MB
     canvas: Option<(HDC, HBITMAP, *mut u8)>,
     /// 上一帧的选区（用来把那些行恢复成压暗版本）
@@ -383,7 +401,10 @@ unsafe fn dim_pixels(shot: &Bitmap) -> Vec<u8> {
 }
 
 fn selection(overlay: &Overlay) -> Option<RECT> {
-    let start = overlay.start?;
+    // 还没开始拖：用鼠标下自动聚焦的窗口当默认选区（微信那种「点一下截这个窗口」）
+    let Some(start) = overlay.start else {
+        return overlay.hover;
+    };
     let left = start.x.min(overlay.current.x).max(0);
     let top = start.y.min(overlay.current.y).max(0);
     let right = start.x.max(overlay.current.x).min(overlay.shot.width);
@@ -397,6 +418,122 @@ fn selection(overlay: &Overlay) -> Option<RECT> {
         right,
         bottom,
     })
+}
+
+// ---------------------------------------------------------------- 窗口自动聚焦
+
+/// 截图自己的窗口和 shell 的桌面/任务栏不算「目标窗口」。
+fn is_not_target(class: &str) -> bool {
+    class == OVERLAY_CLASS
+        || class == EDITOR_CLASS
+        || class == PIN_CLASS
+        || class == "NetSpeedTaskbarRs.Panel"
+        || class == "NetSpeedTaskbarRs.Hint"
+        || class == "NetSpeedTaskbarRs.Menu"
+        || class == "Shell_TrayWnd"
+        || class == "Shell_SecondaryTrayWnd"
+        || class == "Progman"
+        || class == "WorkerW"
+}
+
+struct WindowQuery {
+    point: POINT,
+    found: Option<RECT>,
+}
+
+/// 鼠标下那个窗口的屏幕矩形（微信那种「自动聚焦窗口」）。
+///
+/// EnumWindows 按 z-order 从上到下枚举，第一个包含鼠标点、可见且没被 DWM
+/// 藏起来的顶层窗口，就是用户实际看到的那个；跳过桌面、任务栏和截图自己的窗口。
+unsafe fn window_rect_under(point: POINT) -> Option<RECT> {
+    let mut query = WindowQuery {
+        point,
+        found: None,
+    };
+    EnumWindows(
+        Some(find_window_under),
+        &mut query as *mut WindowQuery as isize,
+    );
+    query.found
+}
+
+unsafe extern "system" fn find_window_under(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let query = &mut *(lparam as *mut WindowQuery);
+
+    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        return 1;
+    }
+
+    let mut class = [0u16; 128];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+    let name = String::from_utf16_lossy(&class[..length]);
+    if is_not_target(&name) {
+        return 1;
+    }
+
+    // 点击穿透的覆盖层（自己画的提示条之类）不是用户想截的对象
+    if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0 {
+        return 1;
+    }
+
+    // UWP 切到后台后窗口还在 z-order 里，但 DWM 已经把它藏了
+    let mut cloaked = 0_u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED as u32,
+        &mut cloaked as *mut u32 as *mut c_void,
+        std::mem::size_of::<u32>() as u32,
+    ) == 0
+        && cloaked != 0
+    {
+        return 1;
+    }
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if GetWindowRect(hwnd, &mut rect) == 0 {
+        return 1;
+    }
+
+    if query.point.x < rect.left
+        || query.point.x >= rect.right
+        || query.point.y < rect.top
+        || query.point.y >= rect.bottom
+    {
+        return 1;
+    }
+
+    if rect.right - rect.left < 16 || rect.bottom - rect.top < 16 {
+        return 1;
+    }
+
+    query.found = Some(rect);
+    0 // 找到就停：EnumWindows 是按 z-order 从上层往下的
+}
+
+/// 屏幕矩形 → 截图坐标（多屏时截图原点可能不是 0,0）
+fn shot_rect(rect: RECT, origin: (i32, i32), width: i32, height: i32) -> Option<RECT> {
+    let left = (rect.left - origin.0).clamp(0, width);
+    let top = (rect.top - origin.1).clamp(0, height);
+    let right = (rect.right - origin.0).clamp(0, width);
+    let bottom = (rect.bottom - origin.1).clamp(0, height);
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    Some(RECT {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn rect_key(rect: Option<RECT>) -> Option<(i32, i32, i32, i32)> {
+    rect.map(|r| (r.left, r.top, r.right, r.bottom))
 }
 
 unsafe fn overlay_paint(hwnd: HWND) {
@@ -500,34 +637,54 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_LBUTTONDOWN => {
             let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
             if !state.is_null() {
-                let mut point = POINT {
-                    x: (lparam as i32) & 0xFFFF,
-                    y: ((lparam as i32) >> 16) & 0xFFFF,
-                };
+                let mut point = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut point);
                 let state = &mut *state;
-                state.start = Some(POINT {
-                    x: point.x - state.origin.0,
-                    y: point.y - state.origin.1,
-                });
-                state.current = state.start.unwrap();
+                let press = POINT {
+                    x: (point.x - state.origin.0).clamp(0, state.shot.width),
+                    y: (point.y - state.origin.1).clamp(0, state.shot.height),
+                };
+                // 先不急着开始拖：没移动就是「单击截取高亮窗口」
+                state.press = Some(press);
+                state.current = press;
+                state.start = None;
                 SetCapture(hwnd);
-                InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0
         }
         WM_MOUSEMOVE => {
             let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
             if !state.is_null() {
+                let mut point = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut point);
                 let state = &mut *state;
-                if state.start.is_some() {
-                    let mut point = POINT { x: 0, y: 0 };
-                    GetCursorPos(&mut point);
-                    state.current = POINT {
-                        x: (point.x - state.origin.0).clamp(0, state.shot.width),
-                        y: (point.y - state.origin.1).clamp(0, state.shot.height),
-                    };
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                let current = POINT {
+                    x: (point.x - state.origin.0).clamp(0, state.shot.width),
+                    y: (point.y - state.origin.1).clamp(0, state.shot.height),
+                };
+
+                if let Some(press) = state.press {
+                    // 移动超过阈值才算框选，否则这次按下/抬起就是「点选窗口」
+                    if state.start.is_none() {
+                        let dx = current.x - press.x;
+                        let dy = current.y - press.y;
+                        let threshold = s(3.0).max(2);
+                        if dx * dx + dy * dy >= threshold * threshold {
+                            state.start = Some(press);
+                        }
+                    }
+                    if state.start.is_some() {
+                        state.current = current;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                } else {
+                    // 没按下：跟着鼠标换高亮窗口
+                    let hover = window_rect_under(point)
+                        .and_then(|rect| shot_rect(rect, state.origin, state.shot.width, state.shot.height));
+                    if rect_key(hover) != rect_key(state.hover) {
+                        state.hover = hover;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
                 }
             }
             0
@@ -537,7 +694,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
             if !state.is_null() {
                 let state = &mut *state;
-                if let Some(rect) = selection(state) {
+                // 拖过就用手画的框，没拖就截鼠标下高亮的窗口
+                let rect = if state.start.is_some() {
+                    selection(state)
+                } else {
+                    state.hover
+                };
+                state.press = None;
+                state.start = None;
+
+                if let Some(rect) = rect {
                     let cropped = state.shot.crop(
                         rect.left,
                         rect.top,
@@ -641,12 +807,20 @@ pub unsafe fn begin(panel: HWND) {
     RegisterClassW(&wc);
 
     let dimmed = dim_pixels(&shot);
+
+    // 打开遮罩前先看鼠标压在哪个窗口上：直接把它当成默认选区
+    let mut cursor = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut cursor);
+    let hover = window_rect_under(cursor).and_then(|rect| shot_rect(rect, (vx, vy), vw, vh));
+
     let state = Box::into_raw(Box::new(Overlay {
         shot,
         dimmed,
         origin: (vx, vy),
         start: None,
+        press: None,
         current: POINT { x: 0, y: 0 },
+        hover,
         canvas: None,
         last_rect: None,
     }));
@@ -710,6 +884,7 @@ enum Action {
     Save,
     Ocr,
     Pin,
+    Minimize,
     Close,
 }
 
@@ -757,6 +932,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Save => "保存",
         Action::Ocr => "OCR",
         Action::Pin => "贴图",
+        Action::Minimize => "最小化",
         Action::Close => "关闭",
     }
 }
@@ -1156,13 +1332,16 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     let height = s(26.0);
     let mut x = s(12.0);
-    let actions = [
+    let mut actions = vec![
         Action::Tool(Tool::Arrow),
         Action::Tool(Tool::Rect),
         Action::Tool(Tool::Pen),
         Action::Tool(Tool::Text),
         Action::Tool(Tool::Mosaic),
     ];
+    if ocr_enabled() {
+        actions.push(Action::Tool(Tool::Ocr));
+    }
 
     for action in actions {
         let label = text_of_action(action);
@@ -1198,14 +1377,13 @@ unsafe fn editor_paint(hwnd: HWND) {
     }
 
     x += s(10.0);
-    let tail = [
-        Action::Undo,
-        Action::Copy,
-        Action::Save,
-        Action::Ocr,
-        Action::Pin,
-        Action::Close,
-    ];
+    let mut tail = vec![Action::Undo, Action::Copy, Action::Save];
+    if ocr_enabled() {
+        tail.push(Action::Ocr);
+    }
+    tail.push(Action::Pin);
+    tail.push(Action::Minimize);
+    tail.push(Action::Close);
     for action in tail {
         let label = text_of_action(action);
         let width_px = wide_width(dc, label) + s(16.0);
@@ -1750,6 +1928,9 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let bitmap = composite(editor);
             open_pin(bitmap);
         }
+        Action::Minimize => {
+            ShowWindow(hwnd, SW_MINIMIZE);
+        }
         Action::Close => {
             DestroyWindow(hwnd);
         }
@@ -2063,7 +2244,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
         0,
         class.as_ptr(),
         wide("截图编辑").as_ptr(),
-        WS_POPUP | WS_VISIBLE,
+        WS_POPUP | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
         window_x,
         window_y,
         window_w,

@@ -14,7 +14,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
     InvalidateRect, IntersectClipRect, LineTo, MoveToEx, ReleaseDC, RestoreDC, RoundRect, SaveDC,
     ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetViewportOrgEx, UpdateWindow,
-    BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_RIGHT,
+    BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -23,7 +23,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCaptur
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme::wide;
-use netspeed_core::settings::Settings;
+use netspeed_core::settings::{
+    format_hotkey, parse_hotkey, Settings, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT,
+    HOTKEY_MOD_WIN,
+};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Settings";
 const POPUP_CLASS: &str = "NetSpeedTaskbarRs.Settings.Popup";
@@ -74,10 +77,17 @@ const AI_SOURCE_LABELS: [&str; 6] = [
     "Codex",
 ];
 
+// 截图 / 取字区块（AI 来源下面）
+const SHOT_HEAD_TOP: f32 = 596.0; // 分隔线
+const SHOT_TITLE_TOP: f32 = 602.0; // 「截图与取字」小标题
+const SHOT_FIRST_TOP: f32 = 626.0; // 截图行
+const SHOT_OCR_TOP: f32 = 674.0; // 取字行
+const SHOT_ROW_H: f32 = 44.0;
+
 /// 可滚动内容区：分隔线往下到页脚分割线往上
 const CONTENT_TOP: f32 = 65.0;
 /// 内容总高度（最后一个来源行 + 一点留白）；窗口比这个矮就出现滚动
-const CONTENT_BOTTOM: f32 = 582.0;
+const CONTENT_BOTTOM: f32 = 726.0;
 /// 页脚（分割线 + 完成按钮）高度
 const FOOTER_H: f32 = 64.0;
 
@@ -89,6 +99,10 @@ enum Hit {
     Select(usize),
     AiToggle,
     AiSource(usize),
+    ShotToggle,
+    OcrToggle,
+    ShotHotkey,
+    OcrHotkey,
     Scrollbar,
     AutoStart,
 }
@@ -327,6 +341,12 @@ struct State {
     ai_enabled: bool,
     ai_sources: [bool; 6],
     auto_start: bool,
+    shot_enabled: bool,
+    ocr_enabled: bool,
+    shot_hotkey: String,
+    ocr_hotkey: String,
+    /// 正在录制快捷键：0 = 没在录，1 = 截图，2 = 取字
+    capture: usize,
     fonts: Fonts,
     scale: f32,
     hover: Option<Hit>,
@@ -351,6 +371,10 @@ struct Layout {
     selects: [RECT; 4],
     ai_toggle: RECT,
     ai_sources: [RECT; 6],
+    shot_toggle: RECT,
+    ocr_toggle: RECT,
+    shot_hotkey: RECT,
+    ocr_hotkey: RECT,
     /// 页脚左边的「开机自启」整行热区
     auto_start: RECT,
 }
@@ -409,6 +433,15 @@ fn layout(state: &State, client: RECT) -> Layout {
         };
     }
 
+    let row_h = s(SHOT_ROW_H, scale);
+    let shot_top = s(SHOT_FIRST_TOP, scale);
+    let ocr_top = s(SHOT_OCR_TOP, scale);
+    let switcher_w = s(40.0, scale);
+    let hotkey_w = s(116.0, scale);
+    let hotkey_h = s(26.0, scale);
+    let hotkey_right = right - switcher_w - s(10.0, scale);
+    let hotkey_left = hotkey_right - hotkey_w;
+
     Layout {
         close,
         done,
@@ -421,6 +454,30 @@ fn layout(state: &State, client: RECT) -> Layout {
             bottom: s(AI_TOGGLE_TOP + AI_ROW_H, scale),
         },
         ai_sources: ai_source_rects(scale, right),
+        shot_toggle: RECT {
+            left: s(12.0, scale),
+            top: shot_top,
+            right,
+            bottom: shot_top + row_h,
+        },
+        ocr_toggle: RECT {
+            left: s(12.0, scale),
+            top: ocr_top,
+            right,
+            bottom: ocr_top + row_h,
+        },
+        shot_hotkey: RECT {
+            left: hotkey_left,
+            top: shot_top + (row_h - hotkey_h) / 2,
+            right: hotkey_right,
+            bottom: shot_top + (row_h - hotkey_h) / 2 + hotkey_h,
+        },
+        ocr_hotkey: RECT {
+            left: hotkey_left,
+            top: ocr_top + (row_h - hotkey_h) / 2,
+            right: hotkey_right,
+            bottom: ocr_top + (row_h - hotkey_h) / 2 + hotkey_h,
+        },
         // 页脚左边：标签 + 开关都在这个热区里
         auto_start: RECT {
             left: pad + s(4.0, scale),
@@ -970,6 +1027,154 @@ unsafe fn paint(hwnd: HWND) {
         }
     }
 
+    // ---------------------------------------------------------------- 截图 / 取字
+    p.fill(
+        0,
+        p.s(SHOT_HEAD_TOP),
+        client.right,
+        p.s(SHOT_HEAD_TOP) + 1,
+        c.border,
+    );
+    p.text(
+        "截图与取字",
+        state.fonts.small,
+        c.text3,
+        pad + p.s(4.0),
+        p.s(SHOT_TITLE_TOP),
+        content_right,
+        p.s(SHOT_TITLE_TOP + 20.0),
+        DT_LEFT,
+    );
+
+    let shot_rows = [
+        (
+            l.shot_toggle,
+            l.shot_hotkey,
+            Hit::ShotToggle,
+            Hit::ShotHotkey,
+            "截图",
+            "截图后标注、贴图、另存为",
+            state.shot_enabled,
+            state.shot_hotkey.as_str(),
+            state.capture == 1,
+        ),
+        (
+            l.ocr_toggle,
+            l.ocr_hotkey,
+            Hit::OcrToggle,
+            Hit::OcrHotkey,
+            "取字（OCR）",
+            "框选区域识别文字（需要 models/）",
+            state.ocr_enabled,
+            state.ocr_hotkey.as_str(),
+            state.capture == 2,
+        ),
+    ];
+
+    for (row, hotkey_rect, toggle_hit, hotkey_hit, title, subtitle, on, value, capturing) in shot_rows
+    {
+        let mid = (row.top + row.bottom) / 2;
+        let hovered = state.hover == Some(toggle_hit) || state.hover == Some(hotkey_hit);
+        if hovered {
+            p.round(
+                row.left,
+                row.top + p.s(1.0),
+                content_right,
+                row.bottom - p.s(1.0),
+                p.s(8.0),
+                c.chip,
+                c.chip,
+            );
+        }
+
+        p.text(
+            title,
+            state.fonts.label,
+            if on { c.text } else { c.text2 },
+            pad + p.s(4.0),
+            row.top + p.s(2.0),
+            hotkey_rect.left - p.s(10.0),
+            row.top + p.s(24.0),
+            DT_LEFT,
+        );
+        p.text(
+            subtitle,
+            state.fonts.small,
+            c.text3,
+            pad + p.s(4.0),
+            mid,
+            hotkey_rect.left - p.s(10.0),
+            row.bottom,
+            DT_LEFT,
+        );
+
+        // 快捷键胶囊：点一下进入录制，按 Esc 取消
+        let fill = if capturing || state.hover == Some(hotkey_hit) {
+            c.chip_hover
+        } else {
+            c.chip
+        };
+        let border = if capturing { c.accent } else { fill };
+        p.round(
+            hotkey_rect.left,
+            hotkey_rect.top,
+            hotkey_rect.right,
+            hotkey_rect.bottom,
+            p.s(8.0),
+            fill,
+            border,
+        );
+        p.text(
+            if capturing { "按下组合键…" } else { value },
+            state.fonts.small,
+            if capturing {
+                c.text
+            } else if on {
+                c.text2
+            } else {
+                c.text3
+            },
+            hotkey_rect.left + p.s(5.0),
+            hotkey_rect.top,
+            hotkey_rect.right - p.s(5.0),
+            hotkey_rect.bottom,
+            DT_CENTER,
+        );
+
+        // 开关本体
+        let sw_w = p.s(40.0);
+        let sw_h = p.s(22.0);
+        let sx = content_right - sw_w;
+        let sy = mid - sw_h / 2;
+        if on {
+            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
+            p.circle(
+                sx + sw_w - sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                KNOB,
+            );
+        } else {
+            p.round(
+                sx,
+                sy,
+                sx + sw_w,
+                sy + sw_h,
+                sw_h,
+                c.chip,
+                mix_white(c.border, 0.05),
+            );
+            p.circle(
+                sx + sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                mix_white(c.border, 0.05),
+            );
+        }
+    }
+
     // 键盘焦点框：内容区的控件画在滚动坐标系里（还在裁剪区内）
     if state.keyboard {
         if let Some(hit) = state.focus {
@@ -1509,7 +1714,7 @@ pub fn open(parent: HWND, settings: &Settings) {
         // 窗口开在鼠标那块屏上：缩放按那块屏算（多屏缩放不同也对）
         let scale = crate::cursor_scale();
         let width_px = s(440.0, scale);
-        let mut height_px = s(710.0, scale);
+        let mut height_px = s(790.0, scale);
 
         let screen = crate::work_area();
 
@@ -1570,6 +1775,11 @@ pub fn open(parent: HWND, settings: &Settings) {
                 settings.ai_codex,
             ],
             auto_start: settings.auto_start,
+            shot_enabled: settings.shot_enabled,
+            ocr_enabled: settings.ocr_enabled,
+            shot_hotkey: settings.shot_hotkey.clone(),
+            ocr_hotkey: settings.ocr_hotkey.clone(),
+            capture: 0,
             fonts: Fonts::create(scale),
             scale,
             hover: None,
@@ -1676,6 +1886,19 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
             return Some(Hit::Select(index + 1));
         }
     }
+    // 快捷键胶囊比整行矮，得先判
+    if contains(&l.shot_hotkey, point) {
+        return Some(Hit::ShotHotkey);
+    }
+    if contains(&l.ocr_hotkey, point) {
+        return Some(Hit::OcrHotkey);
+    }
+    if contains(&l.shot_toggle, point) {
+        return Some(Hit::ShotToggle);
+    }
+    if contains(&l.ocr_toggle, point) {
+        return Some(Hit::OcrToggle);
+    }
     if contains(&l.ai_toggle, point) {
         return Some(Hit::AiToggle);
     }
@@ -1702,6 +1925,10 @@ fn nav_items(state: &State) -> Vec<Hit> {
             items.push(Hit::AiSource(index));
         }
     }
+    items.push(Hit::ShotToggle);
+    items.push(Hit::ShotHotkey);
+    items.push(Hit::OcrToggle);
+    items.push(Hit::OcrHotkey);
     items.push(Hit::AutoStart);
     items.push(Hit::Done);
     items
@@ -1715,6 +1942,10 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
         Hit::Select(row) => *l.selects.get(row.checked_sub(1)?)?,
         Hit::AiToggle => l.ai_toggle,
         Hit::AiSource(index) => *l.ai_sources.get(index)?,
+        Hit::ShotToggle => l.shot_toggle,
+        Hit::OcrToggle => l.ocr_toggle,
+        Hit::ShotHotkey => l.shot_hotkey,
+        Hit::OcrHotkey => l.ocr_hotkey,
         Hit::AutoStart => l.auto_start,
         Hit::Done => l.done,
         _ => return None,
@@ -1793,6 +2024,49 @@ fn toggle_source(state: &mut State, index: usize) {
 fn toggle_auto_start(state: &mut State) {
     state.auto_start = !state.auto_start;
     crate::apply_auto_start(state.parent, state.auto_start);
+}
+
+fn toggle_shot(state: &mut State) {
+    state.shot_enabled = !state.shot_enabled;
+    crate::apply_shot_enabled(state.parent, state.shot_enabled);
+}
+
+fn toggle_ocr(state: &mut State) {
+    state.ocr_enabled = !state.ocr_enabled;
+    crate::apply_ocr_enabled(state.parent, state.ocr_enabled);
+}
+
+/// 把当前按下的组合键写进对应那一行
+fn accept_hotkey(state: &mut State, vk: u32) {
+    let mut mods = 0_u32;
+    unsafe {
+        if GetKeyState(0x11) < 0 {
+            mods |= HOTKEY_MOD_CONTROL;
+        }
+        if GetKeyState(0x10) < 0 {
+            mods |= HOTKEY_MOD_SHIFT;
+        }
+        if GetKeyState(0x12) < 0 {
+            mods |= HOTKEY_MOD_ALT;
+        }
+        if GetKeyState(0x5B) < 0 || GetKeyState(0x5C) < 0 {
+            mods |= HOTKEY_MOD_WIN;
+        }
+    }
+
+    let text = format_hotkey(mods, vk);
+    if parse_hotkey(&text).is_none() {
+        return;
+    }
+
+    if state.capture == 1 {
+        state.shot_hotkey = text.clone();
+        crate::apply_hotkey(state.parent, false, &text);
+    } else {
+        state.ocr_hotkey = text.clone();
+        crate::apply_hotkey(state.parent, true, &text);
+    }
+    state.capture = 0;
 }
 
 /// 键盘焦点框：比控件大 3px 的空心圆角框，不挡住里面的内容
@@ -1931,6 +2205,11 @@ unsafe extern "system" fn dialog_proc(
 
             // 鼠标点谁，焦点就落在谁身上（焦点框只在键盘操作时显示）
             let hit = hit_test(state, client, point);
+            if state.capture != 0
+                && !matches!(hit, Some(Hit::ShotHotkey) | Some(Hit::OcrHotkey))
+            {
+                state.capture = 0;
+            }
             if let Some(hit) = hit {
                 state.focus = Some(hit);
                 state.keyboard = false;
@@ -1964,6 +2243,22 @@ unsafe extern "system" fn dialog_proc(
                 }
                 Some(Hit::AiSource(index)) => {
                     toggle_source(state, index);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::ShotToggle) => {
+                    toggle_shot(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::OcrToggle) => {
+                    toggle_ocr(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::ShotHotkey) => {
+                    state.capture = 1;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::OcrHotkey) => {
+                    state.capture = 2;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::AutoStart) => {
@@ -2046,7 +2341,7 @@ unsafe extern "system" fn dialog_proc(
                 (*state).scroll = 0;
 
                 let width = s(440.0, scale);
-                let mut height = s(710.0, scale);
+                let mut height = s(790.0, scale);
                 let suggested = lparam as *const RECT;
                 let (left, top) = if suggested.is_null() {
                     let mut rect = RECT {
@@ -2085,6 +2380,18 @@ unsafe extern "system" fn dialog_proc(
                 return 0;
             }
             let state = &mut *state;
+
+            // 正在录快捷键：这一下按键只用来组合，Esc 取消
+            if state.capture != 0 {
+                if wparam as u32 == 0x1B {
+                    state.capture = 0;
+                } else if !matches!(wparam as u32, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C) {
+                    accept_hotkey(state, wparam as u32);
+                }
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+
             if wparam as u32 == 0x1B {
                 if !state.popup.is_null() {
                     DestroyWindow(state.popup);
@@ -2144,6 +2451,10 @@ unsafe extern "system" fn dialog_proc(
                 0x20 | 0x0D => match hit {
                     Hit::AiToggle => toggle_ai(state),
                     Hit::AiSource(index) => toggle_source(state, index),
+                    Hit::ShotToggle => toggle_shot(state),
+                    Hit::OcrToggle => toggle_ocr(state),
+                    Hit::ShotHotkey => state.capture = 1,
+                    Hit::OcrHotkey => state.capture = 2,
                     Hit::AutoStart => toggle_auto_start(state),
                     Hit::Done => {
                         DestroyWindow(hwnd);

@@ -17,7 +17,7 @@ mod theme;
 mod tray;
 mod ui;
 
-use netspeed_core::settings::Settings;
+use netspeed_core::settings::{parse_hotkey, Settings};
 use panel::Panel;
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, MOD_CONTROL, MOD_SHIFT, TME_LEAVE,
+    RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey, TME_LEAVE,
     TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -204,9 +204,9 @@ fn main() {
         // 回调形式也一样），所以周期刷新用一个后台线程投递消息，保证一定能到。
         start_ticker(hwnd);
 
-        // Ctrl+Shift+A 截图
-        RegisterHotKey(hwnd, HOTKEY_SHOT, MOD_CONTROL | MOD_SHIFT, 0x41);
-        RegisterHotKey(hwnd, HOTKEY_OCR, MOD_CONTROL | MOD_SHIFT, 0x4F);
+        // 全局热键按设置注册（截图 / 取字都有开关，关掉的不占组合键）
+        shot::set_ocr_enabled(settings.ocr_enabled);
+        register_hotkeys(hwnd);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
         if std::env::args().any(|arg| arg == "--settings") {
@@ -1056,9 +1056,12 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_HOTKEY => {
+            let enabled = panel_mut(hwnd)
+                .map(|panel| panel.settings.clone())
+                .unwrap_or_default();
             match wparam as i32 {
-                HOTKEY_SHOT => shot::request(hwnd),
-                HOTKEY_OCR => shot::request_ocr(hwnd),
+                HOTKEY_SHOT if enabled.shot_enabled => shot::request(hwnd),
+                HOTKEY_OCR if enabled.ocr_enabled => shot::request_ocr(hwnd),
                 _ => {}
             }
             0
@@ -1177,8 +1180,16 @@ fn show_menu(hwnd: HWND) {
     rows.push(menu::Entry::item(ID_HISTORY, "Token 用量历史…"));
     rows.push(menu::Entry::item(ID_SETTINGS, "设置…"));
     rows.push(menu::Entry::separator());
-    rows.push(menu::Entry::hotkey(ID_SHOT, "截图…", "Ctrl+Shift+A"));
-    rows.push(menu::Entry::hotkey(ID_OCR, "取字…", "Ctrl+Shift+O"));
+    if panel.settings.shot_enabled {
+        rows.push(menu::Entry::hotkey(ID_SHOT, "截图…", panel.settings.shot_hotkey.clone()));
+    }
+    if panel.settings.ocr_enabled {
+        rows.push(menu::Entry::hotkey(
+            ID_OCR,
+            "取字（OCR）…",
+            panel.settings.ocr_hotkey.clone(),
+        ));
+    }
     rows.push(menu::Entry::separator());
     rows.push(menu::Entry::item(ID_PANEL_SNAP, "吸附到任务栏"));
     rows.push(menu::Entry::item(ID_PANEL_HIDE, "隐藏面板"));
@@ -1325,6 +1336,62 @@ pub(crate) fn apply_network_interface(parent: HWND, interface: &str) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_network_interface(interface);
     }
+}
+
+/// 按面板当前设置注册 / 重注册全局热键：关掉的功能不注册，也不占着组合键。
+fn register_hotkeys(hwnd: HWND) {
+    let Some(panel) = panel_mut(hwnd) else {
+        return;
+    };
+    let settings = &panel.settings;
+
+    unsafe {
+        UnregisterHotKey(hwnd, HOTKEY_SHOT);
+        UnregisterHotKey(hwnd, HOTKEY_OCR);
+
+        if settings.shot_enabled {
+            if let Some((mods, vk)) = parse_hotkey(&settings.shot_hotkey) {
+                RegisterHotKey(hwnd, HOTKEY_SHOT, mods, vk);
+            }
+        }
+        if settings.ocr_enabled {
+            if let Some((mods, vk)) = parse_hotkey(&settings.ocr_hotkey) {
+                RegisterHotKey(hwnd, HOTKEY_OCR, mods, vk);
+            }
+        }
+    }
+}
+
+/// 设置里打开/关闭截图：菜单项和全局热键一起跟着开关。
+pub(crate) fn apply_shot_enabled(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.shot_enabled = enabled;
+        panel.settings.save();
+    }
+    register_hotkeys(parent);
+}
+
+/// 设置里打开/关闭取字（OCR）：截图工具栏里的 OCR 按钮也一起隐藏。
+pub(crate) fn apply_ocr_enabled(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.ocr_enabled = enabled;
+        panel.settings.save();
+    }
+    shot::set_ocr_enabled(enabled);
+    register_hotkeys(parent);
+}
+
+/// 设置里改截图 / 取字快捷键（`ocr` = true 时改取字）：立刻重注册。
+pub(crate) fn apply_hotkey(parent: HWND, ocr: bool, hotkey: &str) {
+    if let Some(panel) = panel_mut(parent) {
+        if ocr {
+            panel.settings.ocr_hotkey = hotkey.to_string();
+        } else {
+            panel.settings.shot_hotkey = hotkey.to_string();
+        }
+        panel.settings.save();
+    }
+    register_hotkeys(parent);
 }
 
 /// 设置里改刷新间隔：立刻按新节奏采样重绘。

@@ -35,7 +35,7 @@ pub enum Kind {
     Item {
         id: usize,
         label: &'static str,
-        shortcut: &'static str,
+        shortcut: String,
         mark: Mark,
         /// 勾上 / 选中
         on: bool,
@@ -52,7 +52,7 @@ impl Entry {
             kind: Kind::Item {
                 id,
                 label,
-                shortcut: "",
+                shortcut: String::new(),
                 mark: Mark::None,
                 on: false,
             },
@@ -64,7 +64,7 @@ impl Entry {
             kind: Kind::Item {
                 id,
                 label,
-                shortcut: "",
+                shortcut: String::new(),
                 mark: Mark::Check,
                 on,
             },
@@ -77,19 +77,19 @@ impl Entry {
             kind: Kind::Item {
                 id,
                 label,
-                shortcut: "",
+                shortcut: String::new(),
                 mark: Mark::Radio,
                 on,
             },
         }
     }
 
-    pub fn hotkey(id: usize, label: &'static str, shortcut: &'static str) -> Self {
+    pub fn hotkey(id: usize, label: &'static str, shortcut: impl Into<String>) -> Self {
         Self {
             kind: Kind::Item {
                 id,
                 label,
-                shortcut,
+                shortcut: shortcut.into(),
                 mark: Mark::None,
                 on: false,
             },

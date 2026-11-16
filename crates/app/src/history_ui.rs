@@ -315,7 +315,7 @@ pub fn open(_parent: HWND) {
             0,
             class_name.as_ptr(),
             window_title.as_ptr(),
-            WS_POPUP | WS_CLIPCHILDREN,
+            WS_POPUP | WS_CLIPCHILDREN | WS_SYSMENU | WS_MINIMIZEBOX,
             left,
             top,
             width,
