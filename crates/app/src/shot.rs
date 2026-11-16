@@ -1332,16 +1332,14 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     let height = s(26.0);
     let mut x = s(12.0);
-    let mut actions = vec![
+    let actions = vec![
         Action::Tool(Tool::Arrow),
         Action::Tool(Tool::Rect),
         Action::Tool(Tool::Pen),
         Action::Tool(Tool::Text),
         Action::Tool(Tool::Mosaic),
+        Action::Tool(Tool::Ocr),
     ];
-    if ocr_enabled() {
-        actions.push(Action::Tool(Tool::Ocr));
-    }
 
     for action in actions {
         let label = text_of_action(action);
@@ -1377,14 +1375,8 @@ unsafe fn editor_paint(hwnd: HWND) {
     }
 
     x += s(10.0);
-    let mut tail = vec![Action::Undo, Action::Copy, Action::Save];
-    if ocr_enabled() {
-        tail.push(Action::Ocr);
-    }
-    tail.push(Action::Pin);
-    tail.push(Action::Minimize);
-    tail.push(Action::Close);
-    for action in tail {
+    let mut tail = vec![Action::Undo, Action::Copy, Action::Save, Action::Ocr, Action::Pin];
+    for action in tail.drain(..) {
         let label = text_of_action(action);
         let width_px = wide_width(dc, label) + s(16.0);
         let rect = RECT {
@@ -1407,6 +1399,46 @@ unsafe fn editor_paint(hwnd: HWND) {
         editor.buttons.push((rect, action));
         x = rect.right + s(5.0);
     }
+
+    // 右上角：最小化 / 关闭，用普通窗口的符号，不占工具栏文字
+    let control = s(28.0);
+    let close = RECT {
+        left: client.right - s(12.0) - control,
+        top: s(9.0),
+        right: client.right - s(12.0),
+        bottom: s(9.0) + height,
+    };
+    let minimize = RECT {
+        left: close.left - s(4.0) - control,
+        top: close.top,
+        right: close.left - s(4.0),
+        bottom: close.bottom,
+    };
+
+    let icon_color = crate::theme::ui().text2;
+    let pen = CreatePen(0, s(1.4).max(1), icon_color);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+
+    // —
+    let mx = (minimize.left + minimize.right) / 2;
+    let my = (minimize.top + minimize.bottom) / 2;
+    let arm = s(6.0);
+    MoveToEx(dc, mx - arm, my, std::ptr::null_mut());
+    LineTo(dc, mx + arm, my);
+
+    // ×
+    let cx = (close.left + close.right) / 2;
+    let cy = (close.top + close.bottom) / 2;
+    let arm = s(5.0);
+    MoveToEx(dc, cx - arm, cy - arm, std::ptr::null_mut());
+    LineTo(dc, cx + arm, cy + arm);
+    MoveToEx(dc, cx - arm, cy + arm, std::ptr::null_mut());
+    LineTo(dc, cx + arm, cy - arm);
+
+    SelectObject(dc, old_pen);
+    DeleteObject(pen as *mut _);
+    editor.buttons.push((minimize, Action::Minimize));
+    editor.buttons.push((close, Action::Close));
 
     SelectObject(dc, old_font);
 

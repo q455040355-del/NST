@@ -171,6 +171,8 @@ struct State {
     source_rects: Vec<RECT>,
     /// 右上角的关闭按钮
     close_rect: RECT,
+    /// 右上角的最小化按钮（在关闭左边）
+    minimize_rect: RECT,
     scroll: usize,
     /// 明细表右侧滚动条（内容放得下时为 None）；绘制时更新，鼠标事件用它命中
     table_bar: Option<TableBar>,
@@ -286,6 +288,12 @@ pub fn open(_parent: HWND) {
             ],
             source_rects: Vec::new(),
             close_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            minimize_rect: RECT {
                 left: 0,
                 top: 0,
                 right: 0,
@@ -883,6 +891,12 @@ unsafe extern "system" fn canvas_proc(
             let state = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut State;
             if !state.is_null() {
                 let state = &mut *state;
+                let m = state.minimize_rect;
+                if x >= m.left && x <= m.right && y >= m.top && y <= m.bottom {
+                    ShowWindow(parent, SW_MINIMIZE);
+                    return 0;
+                }
+
                 let c = state.close_rect;
                 if x >= c.left && x <= c.right && y >= c.top && y <= c.bottom {
                     DestroyWindow(parent);
@@ -1601,6 +1615,12 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         right: p.width - l.pad,
         bottom: p.s(12.0) + close_size,
     };
+    state.minimize_rect = RECT {
+        left: state.close_rect.left - p.s(4.0) - close_size,
+        top: state.close_rect.top,
+        right: state.close_rect.left - p.s(4.0),
+        bottom: state.close_rect.bottom,
+    };
     {
         let c = state.close_rect;
         let cx = (c.left + c.right) / 2;
@@ -1608,6 +1628,14 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         let arm = p.s(5.0);
         p.solid_line(cx - arm, cy - arm, cx + arm, cy + arm, p.ui.text3);
         p.solid_line(cx - arm, cy + arm, cx + arm, cy - arm, p.ui.text3);
+    }
+    {
+        // 最小化：一条横线，和系统窗口按钮同一套符号
+        let m = state.minimize_rect;
+        let mx = (m.left + m.right) / 2;
+        let my = (m.top + m.bottom) / 2;
+        let arm = p.s(6.0);
+        p.solid_line(mx - arm, my, mx + arm, my, p.ui.text3);
     }
 
     let subtitle = if state.loading {

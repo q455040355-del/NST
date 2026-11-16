@@ -1064,7 +1064,7 @@ unsafe fn paint(hwnd: HWND) {
             Hit::OcrToggle,
             Hit::OcrHotkey,
             "取字（OCR）",
-            "框选区域识别文字（需要 models/）",
+            "只管菜单项和直接取字热键；编辑窗里的 OCR 不受影响",
             state.ocr_enabled,
             state.ocr_hotkey.as_str(),
             state.capture == 2,
