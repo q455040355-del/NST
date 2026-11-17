@@ -168,7 +168,10 @@ struct State {
     pill_rects: Vec<RECT>,
     /// 哪几个来源参与统计（all_sources() 的顺序）；全 false 会当成全选
     sources: [bool; 6],
-    source_rects: Vec<RECT>,
+    /// 设置里真正打开的来源：没勾的那几个在历史窗口里直接不出现
+    available: [bool; 6],
+    /// (0 = 「全部」，1..=6 = 来源下标 + 1, 矩形)
+    source_rects: Vec<(usize, RECT)>,
     /// 右上角的关闭按钮
     close_rect: RECT,
     /// 右上角的最小化按钮（在关闭左边）
@@ -251,6 +254,8 @@ pub fn open(_parent: HWND) {
         let top = (work.top + ((work.bottom - work.top) - height) / 3).max(work.top);
 
         let (saved_range, saved_sources) = prefs();
+        // 设置里没勾的来源，历史窗口里不出现（也不统计）
+        let settings = netspeed_core::Settings::load();
         let state = Box::into_raw(Box::new(State {
             records: Vec::new(),
             // 上次看的是哪个区间 / 来源：存在同目录的小文件里（不写 settings.ini，
@@ -285,6 +290,14 @@ pub fn open(_parent: HWND) {
                 saved_sources & 0b00_1000 != 0,
                 saved_sources & 0b01_0000 != 0,
                 saved_sources & 0b10_0000 != 0,
+            ],
+            available: [
+                settings.ai_opencode,
+                settings.ai_dsh,
+                settings.ai_workbuddy,
+                settings.ai_workbuddy_ai,
+                settings.ai_claude,
+                settings.ai_codex,
             ],
             source_rects: Vec::new(),
             close_rect: RECT {
@@ -656,17 +669,36 @@ fn source_slot(source: &str) -> Option<usize> {
     all_sources().iter().position(|name| *name == source)
 }
 
+/// 实际参与统计的来源：设置里开了 + 窗口里勾了。
+fn effective_sources(state: &State) -> [bool; 6] {
+    let mut out = [false; 6];
+    for index in 0..6 {
+        out[index] = state.available[index] && state.sources[index];
+    }
+    out
+}
+
 /// 勾选的来源列表（按 all_sources() 顺序）。一个都没勾时退回全选。
 fn enabled_sources(state: &State) -> Vec<&'static str> {
     let all = all_sources();
+    let active = effective_sources(state);
     let list: Vec<&'static str> = all
         .iter()
         .enumerate()
-        .filter(|(index, _)| state.sources[*index])
+        .filter(|(index, _)| active[*index])
         .map(|(_, name)| *name)
         .collect();
     if list.is_empty() {
-        all.to_vec()
+        // 设置里一个来源都没开：什么都不统计，别把没勾的又拉回来
+        if state.available.iter().any(|on| *on) {
+            all.iter()
+                .enumerate()
+                .filter(|(index, _)| state.available[*index])
+                .map(|(_, name)| *name)
+                .collect()
+        } else {
+            Vec::new()
+        }
     } else {
         list
     }
@@ -730,14 +762,14 @@ fn recalc(state: &mut State) {
 
         // 列始终按 all_sources() 排，没勾的来源清零（图例/颜色不用跟着变）
         let mut rows = history::hourly_by_source(&state.records, day, &all_sources());
-        zero_disabled_columns(&mut rows, state.sources);
+        zero_disabled_columns(&mut rows, effective_sources(state));
         state.stack = rows;
     } else {
         state.days = history::summarize_filtered(&state.records, from, to, &sources);
         // daily_by_source 是按「区间内每一天」返回的，而 days 只含「有记录的天」，
         // 直接按下标取会错位（柱子会全部落空），这里按日期重新对齐。
         let mut rows = history::daily_by_source(&state.records, from, to, &all_sources());
-        zero_disabled_columns(&mut rows, state.sources);
+        zero_disabled_columns(&mut rows, effective_sources(state));
         state.stack = state
             .days
             .iter()
@@ -906,7 +938,7 @@ unsafe extern "system" fn canvas_proc(
                 let on_chip = state
                     .pill_rects
                     .iter()
-                    .chain(state.source_rects.iter())
+                    .chain(state.source_rects.iter().map(|(_, rect)| rect))
                     .any(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom);
                 if y < crate::ui::s(70.0, ui_scale()) && !on_chip {
                     ReleaseCapture();
@@ -944,21 +976,33 @@ unsafe extern "system" fn canvas_proc(
                     return 0;
                 }
 
-                for (index, rect) in state.source_rects.iter().enumerate() {
+                for (slot, rect) in state.source_rects.clone() {
                     if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                        // 0 = 「全部」：一次全开；1..=6 = 单路开关（不允许全关）
-                        if index == 0 {
-                            if !state.sources.iter().all(|on| *on) {
-                                state.sources = [true; 6];
-                                save_prefs(state.range, state.sources);
-                                recalc(state);
-                                start_animator(hwnd);
+                        // slot 0 = 「全部」：把设置里开着的来源一次全选上
+                        if slot == 0 {
+                            for (index, on) in state.available.iter().enumerate() {
+                                if *on {
+                                    state.sources[index] = true;
+                                }
                             }
+                            save_prefs(state.range, state.sources);
+                            recalc(state);
+                            start_animator(hwnd);
                         } else {
-                            let slot = index - 1;
-                            state.sources[slot] = !state.sources[slot];
-                            if !state.sources.iter().any(|on| *on) {
-                                state.sources = [true; 6];
+                            let index = slot - 1;
+                            state.sources[index] = !state.sources[index];
+                            // 设置里开着的来源至少留一个
+                            let any = state
+                                .available
+                                .iter()
+                                .enumerate()
+                                .any(|(index, on)| *on && state.sources[index]);
+                            if !any {
+                                for (index, on) in state.available.iter().enumerate() {
+                                    if *on {
+                                        state.sources[index] = true;
+                                    }
+                                }
                             }
                             save_prefs(state.range, state.sources);
                             recalc(state);
@@ -1473,7 +1517,18 @@ fn chart_ready(rect: &RECT) -> bool {
 }
 
 /// 两组胶囊各自的宽度（含组内间距和「来源」小标题）：布局和绘制共用
-unsafe fn chip_widths(p: &Painter) -> (i32, i32) {
+/// 历史窗口里真正要画的来源胶囊：设置里关掉的不出现（下标 0 = 「全部」）
+fn visible_source_labels(available: &[bool; 6]) -> Vec<&'static str> {
+    let mut labels = vec![SOURCE_LABELS[0]];
+    for (index, label) in SOURCE_LABELS.iter().enumerate().skip(1) {
+        if available.get(index - 1).copied().unwrap_or(false) {
+            labels.push(*label);
+        }
+    }
+    labels
+}
+
+unsafe fn chip_widths(p: &Painter, available: &[bool; 6]) -> (i32, i32) {
     let chip_pad = p.s(14.0);
     let gap = p.s(4.0);
 
@@ -1484,25 +1539,26 @@ unsafe fn chip_widths(p: &Painter) -> (i32, i32) {
     range += gap * (RANGE_LABELS.len() as i32 - 1);
 
     let mut source = p.text_width("来源", 8.5, 400) + p.s(14.0) + p.s(16.0);
-    for (index, label) in SOURCE_LABELS.iter().enumerate() {
+    let visible = visible_source_labels(available);
+    for (index, label) in visible.iter().enumerate() {
         source += p.text_width(label, 8.5, 500) + p.s(26.0);
         if index > 0 {
             source += p.s(10.0);
         }
     }
-    source += gap * (SOURCE_LABELS.len() as i32 - 1);
+    source += gap * (visible.len() as i32 - 1);
 
     (range, source)
 }
 
-fn layout(p: &Painter) -> Layout {
+fn layout(p: &Painter, available: &[bool; 6]) -> Layout {
     let pad = p.s(26.0);
     let row_top = p.s(86.0);
     let chips_h = p.s(30.0);
 
     // 窗口窄（1366×768 @125% 这种）时两组胶囊挤不进一行：来源组挪到第二行，
     // 以前是右对齐硬摆，两组的字会直接叠在一起
-    let (range_w, source_w) = unsafe { chip_widths(p) };
+    let (range_w, source_w) = unsafe { chip_widths(p, available) };
     let wrap = range_w + source_w > p.width - pad * 2;
     let source_top = row_top + if wrap { p.s(32.0) } else { 0 };
 
@@ -1591,7 +1647,7 @@ unsafe fn draw_chip(
 
 /// 整页绘制（数据变化、尺寸变化、露出时用）
 unsafe fn draw_all(p: &Painter, state: &mut State) {
-    let l = layout(p);
+    let l = layout(p, &state.available);
     p.fill(0, 0, p.width, p.height, p.ui.bg);
 
     // ---- 标题
@@ -1641,7 +1697,8 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
     let subtitle = if state.loading {
         "正在读取…".to_string()
     } else {
-        let count = if state.sources.iter().all(|on| *on) {
+        let active = effective_sources(state);
+        let count = if active.iter().all(|on| *on) {
             thousands(state.records.len() as i64)
         } else {
             thousands(
@@ -1649,7 +1706,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
                     .records
                     .iter()
                     .filter(|record| {
-                        state.sources[source_slot(record.source).unwrap_or(0)]
+                        active[source_slot(record.source).unwrap_or(0)]
                             && record.day >= state.from_day
                             && record.day <= state.to_day
                     })
@@ -1722,10 +1779,17 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
 
     // ---- 来源：右侧轻量按钮（窄窗口时换到第二行，从左边排）
     state.source_rects.clear();
-    let labels = SOURCE_LABELS;
-    let mut widths = [0_i32; SOURCE_LABELS.len()];
+    // 设置里没勾的来源直接不画（下标 0 = 「全部」，其余是来源下标 + 1）
+    let mut visible: Vec<(usize, &'static str)> = vec![(0, SOURCE_LABELS[0])];
+    for (index, label) in SOURCE_LABELS.iter().enumerate().skip(1) {
+        if state.available.get(index - 1).copied().unwrap_or(false) {
+            visible.push((index, *label));
+        }
+    }
+    let labels = visible;
+    let mut widths = vec![0_i32; labels.len()];
     let mut total = 0;
-    for (index, label) in labels.iter().enumerate() {
+    for (index, (_, label)) in labels.iter().enumerate() {
         widths[index] = p.text_width(label, 8.5, 500) + p.s(26.0) + if index == 0 { 0 } else { p.s(10.0) };
         total += widths[index];
     }
@@ -1748,27 +1812,31 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
         DT_RIGHT,
     );
 
-    for (index, label) in labels.iter().enumerate() {
+    for (index, (slot, label)) in labels.iter().enumerate() {
         let rect = RECT {
             left: sx,
             top: l.source_top,
             right: sx + widths[index],
             bottom: l.source_top + l.chips_h,
         };
-        let accent = if index == 0 {
+        let accent = if *slot == 0 {
             None
         } else {
-            Some(series_color(all_sources()[index - 1]))
+            Some(series_color(all_sources()[slot - 1]))
         };
-        // 0 = 「全部」：全开时高亮；1..=4 = 单路开关，选中的用实心字 + 饱和圆点
-        let all_on = state.sources.iter().all(|on| *on);
-        let (active, on) = if index == 0 {
+        // 0 = 「全部」：可用来源全开时高亮；其余是单路开关
+        let all_on = state
+            .available
+            .iter()
+            .enumerate()
+            .all(|(index, on)| !*on || state.sources[index]);
+        let (active, on) = if *slot == 0 {
             (all_on, all_on)
         } else {
-            (false, state.sources[index - 1])
+            (false, state.sources[slot - 1])
         };
         draw_chip(p, rect, label, active, accent, on);
-        state.source_rects.push(rect);
+        state.source_rects.push((*slot, rect));
         sx += widths[index] + gap;
     }
 
@@ -1895,7 +1963,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
 
 /// 只重画图表卡片（动画期间用，其它区域保持不动）
 unsafe fn draw_chart(p: &Painter, state: &mut State) {
-    let l = layout(p);
+    let l = layout(p, &state.available);
     state.chart_rect = RECT {
         left: l.pad,
         top: l.chart_top,
@@ -2047,6 +2115,10 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
 
 
         let single = row.iter().filter(|value| **value > 0.0).count() == 1;
+        // 堆叠时只有最上面那一段带圆角：找出最高的一段（从下往上画，最后画的就是它）
+        let top_slot = (0..row.len())
+            .rev()
+            .find(|slot| row.get(*slot).copied().unwrap_or(0.0) > 0.0);
         // 像素对齐，1px 的边不会糊
         let slot_left = plot_left as f32 + slot * index as f32;
         let left = (slot_left + (slot - bar_width) / 2.0).round() as i32;
@@ -2070,7 +2142,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             let top = bottom.round() as i32;
             let bottom_px = (bottom + segment).round() as i32;
             // 只有整根柱子最上面一段带圆角，堆叠处保持平直
-            let is_top = bottom_px >= plot_bottom - 1;
+            let is_top = top_slot == Some(slot_index);
             let is_today = !state.hourly
                 && state.days.get(index).map(|day| day.day).unwrap_or(-1)
                     == history::today(now_ms());

@@ -49,6 +49,9 @@ const OVERLAY_CLASS: &str = "NetSpeedTaskbarRs.ShotOverlay";
 const EDITOR_CLASS: &str = "NetSpeedTaskbarRs.ShotEditor";
 const PIN_CLASS: &str = "NetSpeedTaskbarRs.ShotPin";
 
+/// 编辑窗的「小提示该消失了」
+const WM_APP_EDITOR_TOAST: u32 = WM_APP + 40;
+
 use crate::WM_APP_SHOT_FIRE;
 
 /// 标记：截图/编辑进行中（面板的自动显示要让路）。
@@ -906,6 +909,8 @@ pub unsafe fn begin(panel: HWND) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
+    /// 没选任何工具：点图上是「不做任何事」，画布保持干净
+    None,
     Arrow,
     Rect,
     Pen,
@@ -955,6 +960,10 @@ struct Editor {
     pen_points: Vec<(i32, i32)>,
     text: Option<TextEdit>,
     buttons: Vec<(RECT, Action)>,
+    /// 正按着哪个按钮（按下高亮、松开才执行）
+    pressed: Option<Action>,
+    /// 底部小提示（复制成功之类），带出现时间
+    toast: Option<(String, std::time::Instant)>,
     /// 原图只拷进内存 DC 一次，之后每帧直接 blit
     source: Option<(HDC, HBITMAP)>,
     /// 客户区双缓冲（尺寸变了才重建）
@@ -967,8 +976,31 @@ fn editor_state(hwnd: HWND) -> *mut Editor {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Editor }
 }
 
+/// 底部小提示：显示 1.4 秒后自己消失。
+///
+/// 本进程里 `SetTimer` / `WM_TIMER` 不触发（见 README），所以用线程睡完再投递消息。
+fn show_toast(hwnd: HWND, text: &str) {
+    unsafe {
+        let editor = editor_state(hwnd);
+        if editor.is_null() {
+            return;
+        }
+        (*editor).toast = Some((text.to_string(), std::time::Instant::now()));
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+
+    let raw = hwnd as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1400));
+        unsafe {
+            PostMessageW(raw as HWND, WM_APP_EDITOR_TOAST, 0, 0);
+        }
+    });
+}
+
 fn text_of_action(action: Action) -> &'static str {
     match action {
+        Action::Tool(Tool::None) => "",
         Action::Tool(Tool::Arrow) => "箭头",
         Action::Tool(Tool::Rect) => "矩形",
         Action::Tool(Tool::Pen) => "画笔",
@@ -1222,6 +1254,7 @@ fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
 
 fn hint_for(tool: Tool) -> &'static str {
     match tool {
+        Tool::None => "选一个工具再画 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 关闭",
         Tool::Text => "拖出文字位置后直接输入 · Enter 提交 · Esc 取消",
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
@@ -1399,7 +1432,8 @@ unsafe fn editor_paint(hwnd: HWND) {
             bottom: s(9.0) + height,
         };
         let active = matches!(action, Action::Tool(tool) if tool == editor.tool);
-        draw_pill(dc, rect, active);
+        let pressed = editor.pressed == Some(action);
+        draw_pill(dc, rect, active, pressed);
         SetTextColor(
             dc,
             if active {
@@ -1410,6 +1444,10 @@ unsafe fn editor_paint(hwnd: HWND) {
         );
         let mut text_rect = rect;
         text_rect.bottom += 1;
+        if pressed {
+            text_rect.top += 1;
+            text_rect.bottom += 1;
+        }
         DrawTextW(
             dc,
             wide(label).as_ptr(),
@@ -1433,10 +1471,15 @@ unsafe fn editor_paint(hwnd: HWND) {
             right: x + width_px,
             bottom: s(9.0) + height,
         };
-        draw_pill(dc, rect, false);
+        let pressed = editor.pressed == Some(action);
+        draw_pill(dc, rect, false, pressed);
         SetTextColor(dc, crate::theme::ui().text);
         let mut text_rect = rect;
         text_rect.bottom += 1;
+        if pressed {
+            text_rect.top += 1;
+            text_rect.bottom += 1;
+        }
         DrawTextW(
             dc,
             wide(label).as_ptr(),
@@ -1489,6 +1532,55 @@ unsafe fn editor_paint(hwnd: HWND) {
     editor.buttons.push((close, Action::Close));
 
     SelectObject(dc, old_font);
+
+    // 小提示（复制成功 / 已保存）：底部中间一个深色胶囊，1.4 秒后自己消失
+    if let Some((text, at)) = &editor.toast {
+        if at.elapsed() < std::time::Duration::from_millis(1400) {
+            let ui = crate::theme::ui();
+            let font = cached_font(9.0, 600);
+            let old_toast_font = SelectObject(dc, font as HGDIOBJ);
+            SetBkMode(dc, TRANSPARENT as i32);
+            let text_w = wide_width(dc, text) + s(28.0);
+            let height_px = s(26.0);
+            let left = (client.right - text_w) / 2;
+            let top = client.bottom - s(60.0);
+            let rect = RECT {
+                left,
+                top,
+                right: left + text_w,
+                bottom: top + height_px,
+            };
+            let brush = CreateSolidBrush(ui.text);
+            let pen = CreatePen(0, 1, ui.text);
+            let old_brush = SelectObject(dc, brush as HGDIOBJ);
+            let old_toast_pen = SelectObject(dc, pen as HGDIOBJ);
+            windows_sys::Win32::Graphics::Gdi::RoundRect(
+                dc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                height_px,
+                height_px,
+            );
+            SelectObject(dc, old_toast_pen);
+            SelectObject(dc, old_brush);
+            DeleteObject(pen as *mut _);
+            DeleteObject(brush as *mut _);
+
+            SetTextColor(dc, ui.bg);
+            let mut text_rect = rect;
+            text_rect.bottom += 1;
+            DrawTextW(
+                dc,
+                wide(text).as_ptr(),
+                -1,
+                &mut text_rect,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+            SelectObject(dc, old_toast_font);
+        }
+    }
 
     // 提示
     let hint = hint_for(editor.tool);
@@ -1546,11 +1638,17 @@ fn wide_width(dc: HDC, text: &str) -> i32 {
 
 const DT_CALCRECT: u32 = 0x0400;
 
-fn draw_pill(dc: HDC, rect: RECT, active: bool) {
+fn draw_pill(dc: HDC, rect: RECT, active: bool, pressed: bool) {
     unsafe {
         let c = crate::theme::ui();
-        let brush = CreateSolidBrush(if active { c.chip } else { c.surface });
-        let pen = CreatePen(0, 1, if active { c.accent } else { c.border });
+        let brush = CreateSolidBrush(if pressed {
+            c.chip_hover
+        } else if active {
+            c.chip
+        } else {
+            c.surface
+        });
+        let pen = CreatePen(0, 1, if active || pressed { c.accent } else { c.border });
         let old_brush = SelectObject(dc, brush as HGDIOBJ);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         windows_sys::Win32::Graphics::Gdi::RoundRect(
@@ -1608,6 +1706,8 @@ impl Editor {
             pen_points: Vec::new(),
             text: None,
             buttons: Vec::new(),
+            pressed: None,
+            toast: None,
             source: None,
             back: None,
         }
@@ -1671,7 +1771,14 @@ fn clipboard_bitmap(bitmap: &Bitmap) {
     }
 }
 
-fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> bool {
+/// 保存结果：取消和真失败要区分开 —— 用户点「取消」不该弹权限/磁盘的警告
+enum SaveOutcome {
+    Saved,
+    Cancelled,
+    Failed,
+}
+
+fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> SaveOutcome {
     unsafe {
         let mut name = vec![0u16; 512];
         let mut filter: Vec<u16> = "PNG 图片\0*.png\0所有文件\0*.*\0\0".encode_utf16().collect();
@@ -1701,8 +1808,12 @@ fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> bool {
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 
         if GetSaveFileNameW(&mut dialog) == 0 {
-            let _code = CommDlgExtendedError();
-            return false;
+            // 对话框返回 0 有两种：用户点了取消（扩展错误码为 0），或者真出错
+            return if CommDlgExtendedError() == 0 {
+                SaveOutcome::Cancelled
+            } else {
+                SaveOutcome::Failed
+            };
         }
 
         let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
@@ -1722,11 +1833,14 @@ fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> bool {
             rgba,
         ) {
             Some(buffer) => buffer,
-            None => return false,
+            None => return SaveOutcome::Failed,
         };
 
-        let result = buffer.save(&path);
-        result.is_ok()
+        if buffer.save(&path).is_ok() {
+            SaveOutcome::Saved
+        } else {
+            SaveOutcome::Failed
+        }
     }
 }
 
@@ -1963,7 +2077,8 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         Action::Tool(tool) => {
             commit_text(hwnd);
             let editor = &mut *editor;
-            editor.tool = tool;
+            // 再点一次同一个工具就取消选中
+            editor.tool = if editor.tool == tool { Tool::None } else { tool };
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
         Action::Undo => {
@@ -1977,22 +2092,29 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let bitmap = composite(editor);
             clipboard_bitmap(&bitmap);
             SetWindowTextW(hwnd, wide("截图编辑 · 已复制到剪贴板").as_ptr());
+            show_toast(hwnd, "已复制到剪贴板");
         }
         Action::Save => {
             commit_text(hwnd);
             let editor = &*editor;
             let bitmap = composite(editor);
-            if save_bitmap(&bitmap, hwnd) {
-                SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
-            } else {
-                // 以前失败是完全静默的：磁盘满/没权限时用户以为存上了
-                MessageBoxW(
-                    hwnd,
-                    wide("保存失败：磁盘空间不足、没有写入权限，或路径无效。")
-                        .as_ptr(),
-                    wide("保存截图").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
+            match save_bitmap(&bitmap, hwnd) {
+                SaveOutcome::Saved => {
+                    SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
+                    show_toast(hwnd, "已保存");
+                }
+                // 用户自己点了取消，什么都不用说
+                SaveOutcome::Cancelled => {}
+                SaveOutcome::Failed => {
+                    // 以前失败是完全静默的：磁盘满/没权限时用户以为存上了
+                    MessageBoxW(
+                        hwnd,
+                        wide("保存失败：磁盘空间不足、没有写入权限，或路径无效。")
+                            .as_ptr(),
+                        wide("保存截图").as_ptr(),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
             }
         }
         Action::Ocr => {
@@ -2028,6 +2150,21 @@ unsafe fn hit_button(editor: &Editor, point: POINT) -> Option<Action> {
 
 unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_APP_EDITOR_TOAST => {
+            let editor = editor_state(hwnd);
+            if !editor.is_null() {
+                let expired = (*editor)
+                    .toast
+                    .as_ref()
+                    .map(|(_, at)| at.elapsed() >= std::time::Duration::from_millis(1400))
+                    .unwrap_or(true);
+                if expired {
+                    (*editor).toast = None;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            0
+        }
         WM_NCHITTEST => {
             // 无边框窗口：工具栏空白处按住能拖窗口，按钮还是要能点
             let mut point = POINT {
@@ -2069,7 +2206,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
 
             if let Some(action) = hit_button(&*editor, point) {
-                editor_command(hwnd, action);
+                // 先记下「按着」，松开鼠标才执行 —— 按下有反馈，滑出去松开就不算点击
+                let editor = &mut *editor;
+                editor.pressed = Some(action);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
 
@@ -2084,6 +2225,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
             let _ = &mut point;
             match editor.tool {
+                Tool::None => {}
                 Tool::Text | Tool::Ocr => {
                     // 文字 / 取字都先拖一个框，框住要处理的区域
                     editor.drag_from = Some((ix, iy));
@@ -2134,6 +2276,21 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
             let editor = &mut *editor;
 
+            // 按钮：松开时还停在同一个按钮上才算点击
+            if let Some(action) = editor.pressed.take() {
+                let mut point = POINT {
+                    x: (lparam as i32) & 0xFFFF,
+                    y: ((lparam as i32) >> 16) & 0xFFFF,
+                };
+                let _ = &mut point;
+                let same = hit_button(editor, point) == Some(action);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                if same {
+                    editor_command(hwnd, action);
+                }
+                return 0;
+            }
+
             if editor.tool == Tool::Pen {
                 if editor.pen_points.len() > 1 {
                     let points = std::mem::take(&mut editor.pen_points);
@@ -2166,7 +2323,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     Tool::Ocr if wide_enough => {
                         // 只对框里这块做 OCR
                         let region = editor.base.crop(left, top, right - left, bottom - top);
-                        editor.tool = Tool::Arrow;
+                        editor.tool = Tool::None;
                         let panel = PANEL;
                         crate::ocr::recognize_async(panel, region);
                         SetWindowTextW(hwnd, wide("截图编辑 · 正在识别…").as_ptr());
@@ -2188,7 +2345,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     if !editor.is_null() && (*editor).text.is_some() {
                         cancel_text(hwnd);
                     } else if !editor.is_null() && (*editor).tool == Tool::Ocr {
-                        (*editor).tool = Tool::Arrow;
+                        (*editor).tool = Tool::None;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     } else {
                         DestroyWindow(hwnd);
@@ -2200,6 +2357,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let bitmap = composite(editor);
                     clipboard_bitmap(&bitmap);
                     SetWindowTextW(hwnd, wide("截图编辑 · 已复制到剪贴板").as_ptr());
+                    show_toast(hwnd, "已复制到剪贴板");
                 }
                 0x5A if GetKeyState(0x11) < 0 => {
                     // Ctrl+Z
@@ -2213,13 +2371,27 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let bitmap = composite(editor);
                     clipboard_bitmap(&bitmap);
                     SetWindowTextW(hwnd, wide("截图编辑 · 已复制到剪贴板").as_ptr());
+                    show_toast(hwnd, "已复制到剪贴板");
                 }
                 0x53 if GetKeyState(0x11) < 0 => {
                     commit_text(hwnd);
                     let editor = &*editor_state(hwnd);
                     let bitmap = composite(editor);
-                    if save_bitmap(&bitmap, hwnd) {
-                        SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
+                    match save_bitmap(&bitmap, hwnd) {
+                        SaveOutcome::Saved => {
+                            SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
+                            show_toast(hwnd, "已保存");
+                        }
+                        SaveOutcome::Cancelled => {}
+                        SaveOutcome::Failed => {
+                            MessageBoxW(
+                                hwnd,
+                                wide("保存失败：磁盘空间不足、没有写入权限，或路径无效。")
+                                    .as_ptr(),
+                                wide("保存截图").as_ptr(),
+                                MB_OK | MB_ICONWARNING,
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -2307,7 +2479,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     let state = Box::into_raw(Box::new(Editor {
         base: bitmap,
         shapes: Vec::new(),
-        tool: Tool::Arrow,
+        tool: Tool::None,
         scale,
         image_left: (client_w - image_w) / 2,
         image_top: toolbar,
@@ -2316,6 +2488,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
         pen_points: Vec::new(),
         text: None,
         buttons: Vec::new(),
+        pressed: None,
+        toast: None,
         source: None,
         back: None,
     }));
