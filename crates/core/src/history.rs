@@ -19,6 +19,13 @@ pub const SOURCE_CODEX: &str = "codex";
 
 pub const DAY_MS: i64 = 86_400_000;
 
+/// 低于这个速度（t/s）的请求当成「在等首字 / 等工具跑完」，不计入平均 token 速度。
+///
+/// 日志里只有「请求开始」和「消息完成」两个时间点，没有首字时间，
+/// 所以等响应、等工具的那段时间没法从时长里精确扣掉 —— 只能把实测速度低到
+/// 明显不像在生成的请求整条剔出平均（它们几乎都是等待，产出只有几十个 token）。
+pub const MIN_GENERATION_SPEED: f64 = 20.0;
+
 pub use super::ai::format_tokens;
 
 #[derive(Debug, Clone)]
@@ -1082,6 +1089,8 @@ pub fn summarize_filtered(
 ) -> Vec<DailyRow> {
     let mut map: HashMap<i64, DailyRow> = HashMap::new();
     let mut models: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+    // 被剔除的「等待中」请求：整段区间一条合格的都没有时退回用它们
+    let mut fallback: HashMap<i64, (i64, i64)> = HashMap::new();
 
     for record in records {
         if record.day < from_day || record.day > to_day {
@@ -1103,13 +1112,18 @@ pub fn summarize_filtered(
         row.requests += 1;
 
         if record.duration_ms > 0 {
-            row.measured_output += record.output;
-            row.measured_ms += record.duration_ms;
-            if record.duration_ms >= 200 {
-                let speed = record.output as f64 * 1000.0 / record.duration_ms as f64;
-                if speed > row.peak_speed {
-                    row.peak_speed = speed;
-                }
+            let speed = record.output as f64 * 1000.0 / record.duration_ms as f64;
+            if speed >= MIN_GENERATION_SPEED {
+                row.measured_output += record.output;
+                row.measured_ms += record.duration_ms;
+            } else {
+                let idle = fallback.entry(record.day).or_default();
+                idle.0 += record.output;
+                idle.1 += record.duration_ms;
+            }
+
+            if record.duration_ms >= 200 && speed > row.peak_speed {
+                row.peak_speed = speed;
             }
         }
 
@@ -1127,6 +1141,17 @@ pub fn summarize_filtered(
                     best = *output;
                     row.main_model = model.clone();
                 }
+            }
+        }
+    }
+
+    // 一整天都是「慢请求」（比如本地小模型本来就 10 t/s）：全部被剔除时退回用它们，
+    // 免得平均速度一直显示「—」
+    for row in map.values_mut() {
+        if row.measured_ms == 0 {
+            if let Some((output, ms)) = fallback.get(&row.day) {
+                row.measured_output = *output;
+                row.measured_ms = *ms;
             }
         }
     }
@@ -1179,6 +1204,7 @@ pub fn summarize_hours(
         })
         .collect();
     let mut models: Vec<HashMap<String, i64>> = vec![HashMap::new(); 24];
+    let mut fallback = vec![(0_i64, 0_i64); 24];
 
     for record in records {
         if record.day != day {
@@ -1196,18 +1222,30 @@ pub fn summarize_hours(
         row.requests += 1;
 
         if record.duration_ms > 0 {
-            row.measured_output += record.output;
-            row.measured_ms += record.duration_ms;
-            if record.duration_ms >= 200 {
-                let speed = record.output as f64 * 1000.0 / record.duration_ms as f64;
-                if speed > row.peak_speed {
-                    row.peak_speed = speed;
-                }
+            let speed = record.output as f64 * 1000.0 / record.duration_ms as f64;
+            if speed >= MIN_GENERATION_SPEED {
+                row.measured_output += record.output;
+                row.measured_ms += record.duration_ms;
+            } else {
+                fallback[index].0 += record.output;
+                fallback[index].1 += record.duration_ms;
+            }
+
+            if record.duration_ms >= 200 && speed > row.peak_speed {
+                row.peak_speed = speed;
             }
         }
 
         if record.output > 0 {
             *models[index].entry(record.model.clone()).or_insert(0) += record.output;
+        }
+    }
+
+    // 同样：这一小时全是慢请求时退回用它们
+    for (index, row) in rows.iter_mut().enumerate() {
+        if row.measured_ms == 0 && fallback[index].1 > 0 {
+            row.measured_output = fallback[index].0;
+            row.measured_ms = fallback[index].1;
         }
     }
 
@@ -1464,7 +1502,35 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_message_ids_are_merged() {        let mut first = record(5, SOURCE_CLAUDE, "claude-x", 100);
+    fn waiting_requests_do_not_dilute_average_speed() {
+        // 100 t/s 的正常请求
+        let mut fast = record(5, SOURCE_DSH, "m", 100);
+        fast.duration_ms = 1_000;
+        // 等首字 / 等工具：60 秒只出了 10 个 token
+        let mut waiting = record(5, SOURCE_DSH, "m", 10);
+        waiting.duration_ms = 60_000;
+
+        let rows = summarize_filtered(&[fast, waiting], 5, 5, &all_sources());
+        assert!(
+            (rows[0].speed() - 100.0).abs() < 0.01,
+            "等待中的请求不该摊进平均速度"
+        );
+        assert!((rows[0].peak_speed - 100.0).abs() < 0.01, "峰值不受影响");
+    }
+
+    #[test]
+    fn slow_day_falls_back_to_all_requests() {
+        // 本地小模型本来就只有 2 t/s：全被剔除时退回用它们，别显示成 0
+        let mut slow = record(5, SOURCE_DSH, "m", 10);
+        slow.duration_ms = 5_000;
+
+        let rows = summarize_filtered(&[slow], 5, 5, &all_sources());
+        assert!((rows[0].speed() - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn duplicate_message_ids_are_merged() {
+        let mut first = record(5, SOURCE_CLAUDE, "claude-x", 100);
         first.id = 42;
         let mut same = first.clone();
         same.output = 120;

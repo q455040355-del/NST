@@ -1819,7 +1819,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             thousands(total_requests),
             if total_requests > 0 {
                 format!(
-                    "{per} {} · 命中 {:.0}%",
+                    "{per} {} · 命中 {:.2}%",
                     thousands(total_requests / days_count),
                     hit_rate
                 )
@@ -1835,7 +1835,7 @@ unsafe fn draw_all(p: &Painter, state: &mut State) {
             } else {
                 "—".to_string()
             },
-            "按可测请求估算".to_string(),
+            "按生成中的请求估算".to_string(),
             series_color("workbuddy"),
         ),
     ];

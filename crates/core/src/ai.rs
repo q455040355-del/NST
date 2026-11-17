@@ -3,7 +3,8 @@
 //! 和 C# 版 `AiSpeedMeter` 同口径：
 //! - 今日累计 = 今天所有响应（assistant 消息）的 input + output 之和；
 //! - 实时速度 = 最近 3 秒内完成的响应按重叠比例摊进去，再除以 3；
-//! - 正在生成时，用最近几次实测平均速度补一个在飞估算。
+//! - 等待响应（在飞但 3 秒内没有产出）时显示 0，不拿历史平均值补位 ——
+//!   那样会把等首字 / 等工具的时间一起摊进「平均速度」，数字是假的。
 //!
 //! 所有文件来源都按「路径 + 修改时间」缓存，只有变过的文件才重新解析。
 
@@ -84,7 +85,6 @@ impl Sources {
 
 pub struct AiEngine {
     responses: HashMap<String, Response>,
-    recent: Vec<(i64, f64)>,
     in_flight: i64,
     today_start: i64,
     today_tokens: i64,
@@ -110,7 +110,6 @@ impl AiEngine {
     pub fn with_home(home: PathBuf, sources: Sources) -> Self {
         Self {
             responses: HashMap::new(),
-            recent: Vec::new(),
             in_flight: 0,
             today_start: 0,
             today_tokens: 0,
@@ -165,7 +164,6 @@ impl AiEngine {
         if midnight != self.today_start {
             self.today_start = midnight;
             self.responses.clear();
-            self.recent.clear();
             self.opencode.reset();
             self.dsh.reset();
             self.workbuddy.reset();
@@ -241,7 +239,8 @@ impl AiEngine {
 
     fn recompute(&mut self, now_ms: i64) {
         let mut today = 0_i64;
-        let mut recent = Vec::new();
+        // 最近一次真正产出过 token 的响应完成时间（判断忙 / 闲用）
+        let mut latest_end = 0_i64;
         self.in_flight = 0;
 
         for response in self.responses.values() {
@@ -257,29 +256,16 @@ impl AiEngine {
                 continue;
             }
 
-            if response.end > response.start && response.end > 0 && response.output > 0 {
+            if response.end > response.start && response.output > 0 {
                 let duration = (response.end - response.start) as f64;
                 if duration >= 200.0 {
-                    recent.push((
-                        response.end,
-                        response.output as f64 * 1000.0 / duration,
-                    ));
+                    latest_end = latest_end.max(response.end);
                 }
             }
         }
 
-        recent.sort_by_key(|(end, _)| *end);
-        if recent.len() > 8 {
-            recent.drain(..recent.len() - 8);
-        }
-
         self.today_tokens = today;
-        self.busy = self.in_flight > 0
-            || recent
-                .last()
-                .map(|(end, _)| (now_ms - *end) < 15_000)
-                .unwrap_or(false);
-        self.recent = recent;
+        self.busy = self.in_flight > 0 || (latest_end > 0 && now_ms - latest_end < 15_000);
     }
 
     pub fn snapshot(&self, now_ms: i64) -> AiSnapshot {
@@ -309,28 +295,10 @@ impl AiEngine {
             measured += response.output as f64 * overlap as f64 / (response.end - start) as f64;
         }
 
-        let mut live = measured / (WINDOW_MS as f64 / 1000.0);
+        let live = measured / (WINDOW_MS as f64 / 1000.0);
 
-        if self.in_flight > 0 && now_ms - self.in_flight < 15 * 60 * 1000 && live <= 0.0 {
-            let mut total = 0.0;
-            let mut count = 0;
-            for (end, speed) in self.recent.iter().rev() {
-                if now_ms - end > 10 * 60 * 1000 {
-                    continue;
-                }
-
-                total += speed;
-                count += 1;
-                if count >= 3 {
-                    break;
-                }
-            }
-
-            if count > 0 {
-                live = total / count as f64;
-            }
-        }
-
+        // 等待响应（在飞、但最近 3 秒一条完成都没有）时不再拿历史平均补位：
+        // 那种「平均」把等首字 / 等工具的时间也摊进去了，显示出来是假的。
         AiSnapshot {
             speed: live.max(0.0),
             today_tokens: self.today_tokens.max(0),
@@ -1632,6 +1600,32 @@ mod tests {
         assert_eq!(rows[&key(3)].output, 5);
         // 相邻事件间隔 1 秒：start 取上一条的时间
         assert!(rows[&key(2)].end - rows[&key(2)].start <= 1000);
+    }
+
+    #[test]
+    fn waiting_for_response_reports_zero_speed() {
+        // 上一次响应 10 秒前就完成了，现在这条请求还在等首字：
+        // 不能拿「最近几次的平均速度」补位，否则面板会一直显示一个假的速度
+        let now = now_ms();
+        let mut engine = AiEngine::with_home(
+            std::env::temp_dir().join("nst-engine-idle"),
+            Sources::all(),
+        );
+        engine.today_start = local_midnight_ms(now);
+        engine.responses.insert(
+            "a".to_string(),
+            Response {
+                start: now - 11_000,
+                end: now - 10_000,
+                output: 100,
+                input: 0,
+            },
+        );
+        engine.in_flight = now - 3_000;
+
+        let snapshot = engine.snapshot(now);
+        assert!(snapshot.generating, "还在生成，只是没有产出");
+        assert_eq!(snapshot.speed, 0.0, "等待响应时速度是 0");
     }
 
     #[test]
