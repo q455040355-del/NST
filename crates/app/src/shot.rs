@@ -1017,7 +1017,19 @@ fn text_of_action(action: Action) -> &'static str {
     }
 }
 
-fn draw_arrow(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32) {
+/// 图形都存「图片坐标」，画到窗口上要乘显示缩放。
+///
+/// 大图（整屏截图）会被缩到工作区的 85% 显示，之前只平移没缩放，
+/// 箭头 / 矩形就会画在离左上角更近的地方 —— 用户看到的「标注错位」就是这个。
+fn scaled(point: (i32, i32), scale: f32) -> (i32, i32) {
+    (
+        (point.0 as f32 * scale).round() as i32,
+        (point.1 as f32 * scale).round() as i32,
+    )
+}
+
+fn draw_arrow(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
+    let (a, b) = (scaled(a, scale), scaled(b, scale));
     unsafe {
         let pen = CreatePen(0, width, ANNOT);
         let old = SelectObject(dc, pen as HGDIOBJ);
@@ -1050,7 +1062,8 @@ fn draw_arrow(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32) {
     }
 }
 
-fn draw_rect(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32) {
+fn draw_rect(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
+    let (a, b) = (scaled(a, scale), scaled(b, scale));
     unsafe {
         let pen = CreatePen(0, width, ANNOT);
         let old = SelectObject(dc, pen as HGDIOBJ);
@@ -1069,14 +1082,20 @@ fn draw_rect(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32) {
     }
 }
 
-fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32) {
+fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {
     if points.len() < 2 {
         return;
     }
     unsafe {
         let pen = CreatePen(0, width, ANNOT);
         let old = SelectObject(dc, pen as HGDIOBJ);
-        let pts: Vec<POINT> = points.iter().map(|p| POINT { x: p.0, y: p.1 }).collect();
+        let pts: Vec<POINT> = points
+            .iter()
+            .map(|p| {
+                let (x, y) = scaled(*p, scale);
+                POINT { x, y }
+            })
+            .collect();
         Polyline(dc, pts.as_ptr(), pts.len() as i32);
         SelectObject(dc, old);
         DeleteObject(pen as *mut _);
@@ -1169,10 +1188,11 @@ fn draw_mosaic(dc: HDC, base: &Bitmap, a: (i32, i32), b: (i32, i32), scale: f32,
 }
 /// 拖拽时的选框：虚线边框 + 右上角的尺寸标签，让「框到哪儿」一眼看得见
 fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
-    let left = a.0.min(b.0);
-    let top = a.1.min(b.1);
-    let right = a.0.max(b.0);
-    let bottom = a.1.max(b.1);
+    // 尺寸标签显示图片坐标（真实像素），框本身按显示缩放画
+    let (left_px, top_px) = (a.0.min(b.0), a.1.min(b.1));
+    let (right_px, bottom_px) = (a.0.max(b.0), a.1.max(b.1));
+    let (left, top) = scaled((left_px, top_px), scale);
+    let (right, bottom) = scaled((right_px, bottom_px), scale);
     if right - left < 1 || bottom - top < 1 {
         return;
     }
@@ -1193,7 +1213,7 @@ fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
         }
 
         // 尺寸标签
-        let label = format!("{} × {}", right - left, bottom - top);
+        let label = format!("{} × {}", right_px - left_px, bottom_px - top_px);
         let font = cached_font(9.0, 600);
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let mut measure = RECT {
@@ -1264,23 +1284,27 @@ fn hint_for(tool: Tool) -> &'static str {
 
 fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
     let width = (2.0 * editor.scale).round().max(2.0) as i32;
+    let scale = editor.scale;
     for shape in editor.shapes.iter().skip(from) {
         match shape {
-            Shape::Arrow { a, b } => draw_arrow(dc, *a, *b, width),
-            Shape::Rect { a, b } => draw_rect(dc, *a, *b, width),
-            Shape::Pen { points } => draw_pen(dc, points, width),
+            Shape::Arrow { a, b } => draw_arrow(dc, *a, *b, width, scale),
+            Shape::Rect { a, b } => draw_rect(dc, *a, *b, width, scale),
+            Shape::Pen { points } => draw_pen(dc, points, width, scale),
             Shape::Text { at, text } => {
-                let font = cached_font(12.0, 700);
+                // 字号也跟着显示缩放走，导出时 scale=1 不受影响
+                let font = cached_font(12.0 * scale, 700);
+                let (x, y) = scaled(*at, scale);
                 unsafe {
                     let old = SelectObject(dc, font as HGDIOBJ);
                     SetBkMode(dc, TRANSPARENT as i32);
                     SetTextColor(dc, ANNOT);
-                    TextOutW(dc, at.0, at.1, wide(text).as_ptr(), text.encode_utf16().count() as i32);
+                    TextOutW(dc, x, y, wide(text).as_ptr(), text.encode_utf16().count() as i32);
                     SelectObject(dc, old);
                 }
             }
             Shape::Mosaic { a, b } => {
-                draw_mosaic(dc, &editor.base, *a, *b, editor.scale, (8.0 * editor.scale) as i32)
+                let (from, to) = (scaled(*a, scale), scaled(*b, scale));
+                draw_mosaic(dc, &editor.base, from, to, scale, (8.0 * scale) as i32)
             }
         }
     }
@@ -1370,11 +1394,12 @@ unsafe fn editor_paint(hwnd: HWND) {
     let width = (2.0 * editor.scale).round().max(2.0) as i32;
     if let (Some(from), Some(to)) = (editor.drag_from, editor.drag_to) {
         match editor.tool {
-            Tool::Arrow => draw_arrow(dc, from, to, width),
-            Tool::Rect => draw_rect(dc, from, to, width),
+            Tool::Arrow => draw_arrow(dc, from, to, width, editor.scale),
+            Tool::Rect => draw_rect(dc, from, to, width, editor.scale),
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
-                draw_mosaic(dc, &editor.base, from, to, editor.scale, (8.0 * editor.scale) as i32);
+                let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
+                draw_mosaic(dc, &editor.base, from_px, to_px, editor.scale, (8.0 * editor.scale) as i32);
                 draw_drag_frame(dc, from, to, editor.scale);
             }
             Tool::Text | Tool::Ocr => draw_drag_frame(dc, from, to, editor.scale),
@@ -1382,15 +1407,14 @@ unsafe fn editor_paint(hwnd: HWND) {
         }
     }
     if editor.tool == Tool::Pen && editor.pen_points.len() > 1 {
-        draw_pen(dc, &editor.pen_points, width);
+        draw_pen(dc, &editor.pen_points, width, editor.scale);
     }
 
     // 正在输入文字：把位置框出来，免得白底白字看不见输入框在哪
     if let Some(text) = &editor.text {
-        let height = (24.0 * editor.scale).round() as i32;
-        let left = text.at.0;
-        let top = text.at.1;
-        let right = left + text.width.max(40);
+        let height = (24.0 * editor.scale).round().max(1.0) as i32;
+        let (left, top) = scaled(text.at, editor.scale);
+        let right = left + ((text.width as f32 * editor.scale) as i32).max(40);
         let bottom = top + height;
         let pen = CreatePen(2, 1, crate::theme::ui().accent); // PS_DOT
         let old = SelectObject(dc, pen as HGDIOBJ);

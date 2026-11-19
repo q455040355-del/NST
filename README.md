@@ -139,7 +139,7 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   控制端前台是远控窗口，截图 / 取字热键**不会在本机触发**，由被控端响应——避免按一次两台机器同时弹截图；
 - **贴图**：一键把结果钉在最上层，拖动移动，右键 / 双击 / Esc 关闭。
 
-实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一画在「图片坐标系」里，靠 `SetViewportOrgEx` 平移到显示位置，导出时把原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
+实现说明：抓屏走 `BitBlt(SRCCOPY|CAPTUREBLT)`，编辑窗是普通窗口 + GDI 双缓冲；图形统一存「图片坐标系」，显示时按 `image_left/top` 平移**并乘显示缩放** `scale`（大图缩到工作区 85% 后箭头/矩形才不会偏向画布左上角），导出时 `scale=1`、原点归零再合成一遍。文字工具用真正的 `EDIT` 子窗口（这样中文输入法可用），`Enter` 提交、`Esc` 取消。另存为对话框要求进程先 `CoInitializeEx`，否则 `GetSaveFileNameW` 直接失败。
 
 拖拽性能（之前拖箭头/马赛克会顿）：原图只拷进常驻内存 DC 一次、背缓冲按客户区尺寸复用、字体走 `cached_font` 缓存；
 马赛克从「每块 `CreateSolidBrush` + `FillRect`」改成「先算成一张块级小位图，再一次 `StretchBlt(COLORONCOLOR)` 放大」。
