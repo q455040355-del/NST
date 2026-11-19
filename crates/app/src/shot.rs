@@ -309,11 +309,17 @@ fn make_font(points: f32, weight: i32) -> HFONT {
 thread_local! {
     /// 字体缓存。CreateFontW 要建一份字库，拖拽时每帧都建一次会明显发顿。
     /// 缓存里的句柄常驻，调用方**不要** DeleteObject。
-    static FONTS: RefCell<HashMap<(i32, i32), HFONT>> = RefCell::new(HashMap::new());
+    static FONTS: RefCell<HashMap<(i32, i32, i32), HFONT>> = RefCell::new(HashMap::new());
 }
 
 fn cached_font(points: f32, weight: i32) -> HFONT {
-    let key = ((points * 10.0).round() as i32, weight);
+    // 缩放也进缓存键：窗口被拖到另一块缩放不同的屏时，字号要重新建，
+    // 不然会沿用旧屏那份（偏小/偏大）
+    let key = (
+        (points * 10.0).round() as i32,
+        weight,
+        (ui_scale() * 100.0).round() as i32,
+    );
     FONTS.with(|cell| {
         if let Some(handle) = cell.borrow().get(&key) {
             return *handle;
@@ -2172,8 +2178,70 @@ unsafe fn hit_button(editor: &Editor, point: POINT) -> Option<Action> {
     None
 }
 
+/// 窗口被拖到另一块缩放不同的屏：按新屏的缩放重排（工具条高度、图片显示比例、居中偏移）。
+///
+/// 不处理 `WM_DPICHANGED` 的话，`s()` 和图片 `scale` 都还是旧屏那份，
+/// 箭头 / 矩形就会重新出现偏移（就是修掉的那个「错位」的另一种触发方式）。
+unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
+    let editor = editor_state(hwnd);
+    if editor.is_null() {
+        return;
+    }
+    let editor = &mut *editor;
+
+    // 按窗口中心所在的显示器重定缩放
+    let mut rect: RECT = std::mem::zeroed();
+    if GetWindowRect(hwnd, &mut rect) == 0 {
+        return;
+    }
+    let anchor = POINT {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    use_scale_at(anchor);
+
+    let work = crate::work_area_at(anchor);
+    let max_w = ((work.right - work.left) as f32 * 0.85).max(1.0);
+    let max_h = ((work.bottom - work.top) as f32 * 0.8).max(1.0);
+    let scale = (max_w / editor.base.width as f32)
+        .min(max_h / editor.base.height as f32)
+        .min(1.0);
+
+    let image_w = (editor.base.width as f32 * scale) as i32;
+    let image_h = (editor.base.height as f32 * scale) as i32;
+    let toolbar = s(44.0);
+    let hint = s(24.0);
+    let client_w = image_w.max(s(600.0));
+    let client_h = toolbar + image_h + hint;
+
+    editor.scale = scale;
+    editor.image_left = (client_w - image_w) / 2;
+    editor.image_top = toolbar;
+
+    let (x, y) = if suggested.is_null() {
+        (rect.left, rect.top)
+    } else {
+        ((*suggested).left, (*suggested).top)
+    };
+    // 背缓冲尺寸变了会自己重建；这里只管窗口尺寸和坐标
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        x,
+        y,
+        client_w,
+        client_h,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
 unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_DPICHANGED => {
+            editor_relayout(hwnd, lparam as *const RECT);
+            0
+        }
         WM_APP_EDITOR_TOAST => {
             let editor = editor_state(hwnd);
             if !editor.is_null() {
