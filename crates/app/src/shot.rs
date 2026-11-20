@@ -142,7 +142,7 @@ unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
     match MODE {
         Mode::Ocr => crate::ocr::recognize_async(panel, bitmap),
         Mode::Gif => crate::gifrec::start(panel, GIF_RECT, GIF_FPS.load(Ordering::Relaxed)),
-        Mode::Edit => open_editor(panel, bitmap),
+        Mode::Edit => open_editor(panel, bitmap, GIF_RECT),
     }
 }
 
@@ -2548,7 +2548,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 }
 
 /// 打开编辑窗（截图选好区域后调用）。
-pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
+pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32)) {
     PANEL = panel;
 
     let instance = GetModuleHandleW(std::ptr::null());
@@ -2587,19 +2587,30 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
     let client_w = image_w.max(s(600.0));
     let client_h = toolbar + image_h + hint;
 
-    // 无边框：窗口就是客户区，位置居中
-    let window_w = client_w;
-    let window_h = client_h;
-    let window_x = work.left + ((work.right - work.left) - window_w) / 2;
-    let window_y = work.top + ((work.bottom - work.top) - window_h) / 3;
+    // 图片尽量盖在原来截下来的那块位置上：工具栏优先摆到图片上方，
+    // 上方贴边放不下时工具栏压进窗口里（图片整体下移一个工具栏的高度）
+    let image_left = (client_w - image_w) / 2;
+    let mut image_top = toolbar;
+    let mut window_x = rect.0 - image_left;
+    let mut window_y = rect.1 - toolbar;
+    if window_y < work.top {
+        window_y = rect.1;
+        image_top = 0;
+    }
+    if window_x + client_w > work.right {
+        window_x = (work.right - client_w).max(work.left);
+    }
+    if window_x < work.left {
+        window_x = work.left;
+    }
 
     let state = Box::into_raw(Box::new(Editor {
         base: bitmap,
         shapes: Vec::new(),
         tool: Tool::None,
         scale,
-        image_left: (client_w - image_w) / 2,
-        image_top: toolbar,
+        image_left,
+        image_top,
         drag_from: None,
         drag_to: None,
         pen_points: Vec::new(),
@@ -2618,8 +2629,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap) {
         WS_POPUP | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
         window_x,
         window_y,
-        window_w,
-        window_h,
+        client_w,
+        client_h,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         instance,
