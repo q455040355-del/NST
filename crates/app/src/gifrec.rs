@@ -364,7 +364,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let started = std::time::Instant::now();
-    let limit = std::time::Duration::from_secs(120);
+    let limit = std::time::Duration::from_secs(20);
     let mut next = std::time::Instant::now();
 
     while !STOP_REQUEST.load(Ordering::Relaxed)

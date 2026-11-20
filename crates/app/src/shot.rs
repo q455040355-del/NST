@@ -953,20 +953,54 @@ enum Tool {
 
 #[derive(Clone)]
 enum Shape {
-    Arrow { a: (i32, i32), b: (i32, i32) },
-    Rect { a: (i32, i32), b: (i32, i32) },
-    Pen { points: Vec<(i32, i32)> },
-    Text { at: (i32, i32), text: String },
-    Mosaic { a: (i32, i32), b: (i32, i32) },
+    Arrow {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+    Rect {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+    Pen {
+        points: Vec<(i32, i32)>,
+        stroke: u8,
+    },
+    Text {
+        at: (i32, i32),
+        text: String,
+    },
+    Mosaic {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+}
+
+/// 描边浓淡：细 / 中 / 粗（倍数）
+const STROKE_LABELS: [&str; 3] = ["细", "中", "粗"];
+const STROKE_FACTORS: [f32; 3] = [1.0, 1.8, 3.0];
+
+fn stroke_width(scale: f32, stroke: u8) -> i32 {
+    let factor = STROKE_FACTORS[stroke.min(2) as usize];
+    ((2.0 * factor) * scale).round().max(2.0) as i32
+}
+
+/// 马赛克格子也跟着浓淡走：细 = 格子更小（更细的码）
+fn mosaic_block(scale: f32, stroke: u8) -> i32 {
+    let factor = [6.0, 8.0, 12.0][stroke.min(2) as usize];
+    (factor * scale).round().max(4.0) as i32
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
+    /// 描边浓淡切换（细 / 中 / 粗）
+    Stroke,
     Tool(Tool),
     Undo,
     Copy,
     Save,
-    Ocr,
     Pin,
     Minimize,
     Close,
@@ -990,6 +1024,8 @@ struct Editor {
     drag_to: Option<(i32, i32)>,
     pen_points: Vec<(i32, i32)>,
     text: Option<TextEdit>,
+    /// 描边浓淡：0 细 / 1 中 / 2 粗
+    stroke: u8,
     buttons: Vec<(RECT, Action)>,
     /// 正按着哪个按钮（按下高亮、松开才执行）
     pressed: Option<Action>,
@@ -1041,7 +1077,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Undo => "撤销",
         Action::Copy => "复制",
         Action::Save => "保存",
-        Action::Ocr => "OCR",
+        Action::Stroke => "中",
         Action::Pin => "贴图",
         Action::Minimize => "最小化",
         Action::Close => "关闭",
@@ -1314,13 +1350,18 @@ fn hint_for(tool: Tool) -> &'static str {
 }
 
 fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
-    let width = (2.0 * editor.scale).round().max(2.0) as i32;
     let scale = editor.scale;
     for shape in editor.shapes.iter().skip(from) {
         match shape {
-            Shape::Arrow { a, b } => draw_arrow(dc, *a, *b, width, scale),
-            Shape::Rect { a, b } => draw_rect(dc, *a, *b, width, scale),
-            Shape::Pen { points } => draw_pen(dc, points, width, scale),
+            Shape::Arrow { a, b, stroke } => {
+                draw_arrow(dc, *a, *b, stroke_width(scale, *stroke), scale)
+            }
+            Shape::Rect { a, b, stroke } => {
+                draw_rect(dc, *a, *b, stroke_width(scale, *stroke), scale)
+            }
+            Shape::Pen { points, stroke } => {
+                draw_pen(dc, points, stroke_width(scale, *stroke), scale)
+            }
             Shape::Text { at, text } => {
                 // 字号也跟着显示缩放走，导出时 scale=1 不受影响
                 let font = cached_font(12.0 * scale, 700);
@@ -1333,9 +1374,16 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
                     SelectObject(dc, old);
                 }
             }
-            Shape::Mosaic { a, b } => {
+            Shape::Mosaic { a, b, stroke } => {
                 let (from, to) = (scaled(*a, scale), scaled(*b, scale));
-                draw_mosaic(dc, &editor.base, from, to, scale, (8.0 * scale) as i32)
+                draw_mosaic(
+                    dc,
+                    &editor.base,
+                    from,
+                    to,
+                    scale,
+                    mosaic_block(scale, *stroke),
+                )
             }
         }
     }
@@ -1422,7 +1470,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     draw_shapes(dc, editor, 0);
 
     // 正在拖拽的图形（临时）
-    let width = (2.0 * editor.scale).round().max(2.0) as i32;
+    let width = stroke_width(editor.scale, editor.stroke);
     if let (Some(from), Some(to)) = (editor.drag_from, editor.drag_to) {
         match editor.tool {
             Tool::Arrow => draw_arrow(dc, from, to, width, editor.scale),
@@ -1430,7 +1478,7 @@ unsafe fn editor_paint(hwnd: HWND) {
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
                 let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
-                draw_mosaic(dc, &editor.base, from_px, to_px, editor.scale, (8.0 * editor.scale) as i32);
+                draw_mosaic(dc, &editor.base, from_px, to_px, editor.scale, mosaic_block(editor.scale, editor.stroke));
                 draw_drag_frame(dc, from, to, editor.scale);
             }
             Tool::Text | Tool::Ocr => draw_drag_frame(dc, from, to, editor.scale),
@@ -1467,8 +1515,15 @@ unsafe fn editor_paint(hwnd: HWND) {
     SetBkMode(dc, TRANSPARENT as i32);
 
     let height = s(26.0);
-    let mut x = s(12.0);
-    let actions = vec![
+    let image_h = (editor.base.height as f32 * editor.scale) as i32;
+    // 固定的两行布局：顶部一行是浓淡 + 撤销 / 复制 / 保存 / 贴图，
+    // 底部一行是工具（箭头 / 矩形 / 画笔 / 文字 / 马赛克 / OCR），都居中
+    let bar_top = s(9.0);
+    let tools_y = editor.image_top + image_h + s(9.0);
+
+    // 每一行先量总宽再居中；窄图时窗口比图片宽，两侧留白看起来才不歪
+    let gap = s(5.0);
+    let actions = [
         Action::Tool(Tool::Arrow),
         Action::Tool(Tool::Rect),
         Action::Tool(Tool::Pen),
@@ -1476,15 +1531,32 @@ unsafe fn editor_paint(hwnd: HWND) {
         Action::Tool(Tool::Mosaic),
         Action::Tool(Tool::Ocr),
     ];
+    let tools_w: i32 = actions
+        .iter()
+        .map(|action| wide_width(dc, text_of_action(*action)) + s(16.0))
+        .sum::<i32>()
+        + gap * (actions.len() as i32 - 1);
+    // 顶部还跟着浓淡 + 撤销…，宽图时和工具排成一行一起居中
+    let stroke_label = STROKE_LABELS[editor.stroke.min(2) as usize];
+    let mut top_row: Vec<(Action, &str)> = vec![(Action::Stroke, stroke_label)];
+    for action in [Action::Undo, Action::Copy, Action::Save, Action::Pin] {
+        top_row.push((action, text_of_action(action)));
+    }
+    let top_w: i32 = top_row
+        .iter()
+        .map(|(_, label)| wide_width(dc, label) + s(16.0))
+        .sum::<i32>()
+        + gap * (top_row.len() as i32 - 1);
+    let mut x = ((client.right - tools_w) / 2).max(s(12.0));
 
     for action in actions {
         let label = text_of_action(action);
         let width_px = wide_width(dc, label) + s(16.0);
         let rect = RECT {
             left: x,
-            top: s(9.0),
+            top: tools_y,
             right: x + width_px,
-            bottom: s(9.0) + height,
+            bottom: tools_y + height,
         };
         let active = matches!(action, Action::Tool(tool) if tool == editor.tool);
         let pressed = editor.pressed == Some(action);
@@ -1512,23 +1584,27 @@ unsafe fn editor_paint(hwnd: HWND) {
         );
 
         editor.buttons.push((rect, action));
-        x = rect.right + s(5.0);
+        x = rect.right + gap;
     }
 
-    x += s(10.0);
-    let mut tail = vec![Action::Undo, Action::Copy, Action::Save, Action::Ocr, Action::Pin];
-    for action in tail.drain(..) {
-        let label = text_of_action(action);
+    // 顶部一行：浓淡（细 / 中 / 粗）+ 撤销 / 复制 / 保存 / 贴图，整组居中
+    let mut x = ((client.right - top_w) / 2).max(s(12.0));
+
+    for (action, label) in top_row {
         let width_px = wide_width(dc, label) + s(16.0);
         let rect = RECT {
             left: x,
-            top: s(9.0),
+            top: bar_top,
             right: x + width_px,
-            bottom: s(9.0) + height,
+            bottom: bar_top + height,
         };
         let pressed = editor.pressed == Some(action);
+
         draw_pill(dc, rect, false, pressed);
-        SetTextColor(dc, crate::theme::ui().text);
+        SetTextColor(
+            dc,
+            crate::theme::ui().text,
+        );
         let mut text_rect = rect;
         text_rect.bottom += 1;
         if pressed {
@@ -1543,16 +1619,16 @@ unsafe fn editor_paint(hwnd: HWND) {
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
         );
         editor.buttons.push((rect, action));
-        x = rect.right + s(5.0);
+        x = rect.right + gap;
     }
 
     // 右上角：最小化 / 关闭，用普通窗口的符号，不占工具栏文字
     let control = s(28.0);
     let close = RECT {
         left: client.right - s(12.0) - control,
-        top: s(9.0),
+        top: bar_top,
         right: client.right - s(12.0),
-        bottom: s(9.0) + height,
+        bottom: bar_top + height,
     };
     let minimize = RECT {
         left: close.left - s(4.0) - control,
@@ -1760,6 +1836,7 @@ impl Editor {
             drag_to: None,
             pen_points: Vec::new(),
             text: None,
+            stroke: 1,
             buttons: Vec::new(),
             pressed: None,
             toast: None,
@@ -2141,6 +2218,11 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             editor.shapes.pop();
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
+        Action::Stroke => {
+            let editor = &mut *editor;
+            editor.stroke = (editor.stroke + 1) % 3;
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
         Action::Copy => {
             commit_text(hwnd);
             let editor = &*editor;
@@ -2171,13 +2253,6 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
                     );
                 }
             }
-        }
-        Action::Ocr => {
-            // 进入框选模式：拖一块出来，只识别那块（整图就拖满）
-            commit_text(hwnd);
-            let editor = &mut *editor;
-            editor.tool = Tool::Ocr;
-            SetWindowTextW(hwnd, wide("截图编辑 · 拖框选择要识别的区域").as_ptr());
         }
         Action::Pin => {
             commit_text(hwnd);
@@ -2237,7 +2312,7 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
     let toolbar = s(44.0);
     let hint = s(24.0);
     let client_w = image_w.max(s(600.0));
-    let client_h = toolbar + image_h + hint;
+    let client_h = toolbar + image_h + toolbar + hint;
 
     editor.scale = scale;
     editor.image_left = (client_w - image_w) / 2;
@@ -2411,7 +2486,10 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if editor.tool == Tool::Pen {
                 if editor.pen_points.len() > 1 {
                     let points = std::mem::take(&mut editor.pen_points);
-                    editor.shapes.push(Shape::Pen { points });
+                    editor.shapes.push(Shape::Pen {
+                        points,
+                        stroke: editor.stroke,
+                    });
                 } else {
                     editor.pen_points.clear();
                 }
@@ -2424,13 +2502,25 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
                 match editor.tool {
                     Tool::Arrow if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
-                        editor.shapes.push(Shape::Arrow { a: from, b: to })
+                        editor.shapes.push(Shape::Arrow {
+                            a: from,
+                            b: to,
+                            stroke: editor.stroke,
+                        })
                     }
                     Tool::Rect if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
-                        editor.shapes.push(Shape::Rect { a: from, b: to })
+                        editor.shapes.push(Shape::Rect {
+                            a: from,
+                            b: to,
+                            stroke: editor.stroke,
+                        })
                     }
                     Tool::Mosaic if wide_enough => {
-                        editor.shapes.push(Shape::Mosaic { a: from, b: to })
+                        editor.shapes.push(Shape::Mosaic {
+                            a: from,
+                            b: to,
+                            stroke: editor.stroke,
+                        })
                     }
                     Tool::Text if wide_enough => {
                         // 框的左下角起笔，输入框宽度跟框一样宽
@@ -2585,17 +2675,17 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let toolbar = s(44.0);
     let hint = s(24.0);
     let client_w = image_w.max(s(600.0));
-    let client_h = toolbar + image_h + hint;
+    // 图片比工具栏还窄时，工具那一组要多占一条（放图片下面）
+    let client_h = toolbar + image_h + toolbar + hint;
 
-    // 图片尽量盖在原来截下来的那块位置上：工具栏优先摆到图片上方，
-    // 上方贴边放不下时工具栏压进窗口里（图片整体下移一个工具栏的高度）
+    // 图片尽量盖在原来截下来的那块位置上：顶部工具栏摆在图片上方，
+    // 上方贴边放不下时窗口往下挪，图片整体下移一个工具栏的高度
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = toolbar;
+    let image_top = toolbar;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1 - toolbar;
     if window_y < work.top {
         window_y = rect.1;
-        image_top = 0;
     }
     if window_x + client_w > work.right {
         window_x = (work.right - client_w).max(work.left);
@@ -2614,6 +2704,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         drag_from: None,
         drag_to: None,
         pen_points: Vec::new(),
+        stroke: 1,
         text: None,
         buttons: Vec::new(),
         pressed: None,
