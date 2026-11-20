@@ -420,7 +420,7 @@ fn encode_webp(width: i32, height: i32, frames: &[Vec<u8>], delay_ms: i32) -> Ve
         return Vec::new();
     }
     let mut config = webp::WebPConfig::new().unwrap();
-    config.quality = 72.0;
+    config.quality = 60.0;
     config.method = 4;
     config.lossless = 0;
     config.thread_level = 1;
