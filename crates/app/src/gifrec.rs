@@ -351,8 +351,10 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let mut shots: Vec<Vec<u8>> = Vec::new();
     let mut last_raw: Vec<u8> = Vec::new();
     // 内存兜底：整段最多占 600MB
-    let max_frames = ((600 * 1024 * 1024) / (width.max(1) * height.max(1) * 4) as usize).max(30);
-    let delay_ms = if fps >= 60 { 16 } else { 33 };
+    // 内存兜底：整段最多占 900MB（120fps 下比 30fps 时限短得多）
+    let max_frames = ((900 * 1024 * 1024) / (width.max(1) * height.max(1) * 4) as usize).max(30);
+    // WebP 动画的时间戳是毫秒：120fps 取 8ms（≈125fps），60 取 16，30 取 33
+    let delay_ms = (1000 / fps.max(1) as i32).max(1);
 
     for shot in &warmup {
         shots.push(to_rgba(shot));

@@ -141,7 +141,7 @@ impl Settings {
                     }
                 }
                 "GifEnabled" => settings.gif_enabled = parse_bool(value),
-                "GifFps" => settings.gif_fps = if value.trim() == "60" { 60 } else { 30 },
+                "GifFps" => settings.gif_fps = normalize_fps(value.trim().parse().unwrap_or(30)),
                 "GifHotkey" => {
                     if let Some((mods, vk)) = parse_hotkey(value) {
                         settings.gif_hotkey = format_hotkey(mods, vk);
@@ -268,6 +268,17 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes"
     )
+}
+
+/// 录制帧率只认 30 / 60 / 120，别的值回落到 30
+fn normalize_fps(fps: i32) -> i32 {
+    if fps >= 120 {
+        120
+    } else if fps >= 60 {
+        60
+    } else {
+        30
+    }
 }
 
 // ---------------------------------------------------------------- 全局热键

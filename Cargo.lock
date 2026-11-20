@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-app"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "image",
  "netspeed-core",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "rusqlite",
  "ruzstd",

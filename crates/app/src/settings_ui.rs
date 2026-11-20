@@ -2458,7 +2458,7 @@ unsafe extern "system" fn dialog_proc(
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::GifFps) => {
-                    state.gif_fps = if state.gif_fps >= 60 { 30 } else { 60 };
+                    state.gif_fps = match state.gif_fps { 30 => 60, 60 => 120, _ => 30 };
                     crate::apply_gif_fps(state.parent, state.gif_fps);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
@@ -2662,7 +2662,7 @@ unsafe extern "system" fn dialog_proc(
                     Hit::OcrHotkey => state.capture = 2,
                     Hit::GifToggle => toggle_gif(state),
                     Hit::GifFps => {
-                        state.gif_fps = if state.gif_fps >= 60 { 30 } else { 60 };
+                        state.gif_fps = match state.gif_fps { 30 => 60, 60 => 120, _ => 30 };
                         crate::apply_gif_fps(state.parent, state.gif_fps);
                     }
                     Hit::GifHotkey => state.capture = 3,
