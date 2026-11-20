@@ -42,6 +42,12 @@ pub struct Settings {
     pub shot_hotkey: String,
     /// 取字热键（如 `Ctrl+Shift+O`）
     pub ocr_hotkey: String,
+    /// 截区域录 GIF 的开关（关了不注册热键、菜单不出）
+    pub gif_enabled: bool,
+    /// GIF 录制帧率（30 / 60）
+    pub gif_fps: i32,
+    /// GIF 录制热键
+    pub gif_hotkey: String,
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
     extra: BTreeMap<String, String>,
 }
@@ -69,6 +75,9 @@ impl Default for Settings {
             ocr_enabled: false,
             shot_hotkey: "Ctrl+Shift+A".to_string(),
             ocr_hotkey: "Ctrl+Shift+O".to_string(),
+            gif_enabled: true,
+            gif_fps: 30,
+            gif_hotkey: "Ctrl+Shift+G".to_string(),
             extra: BTreeMap::new(),
         }
     }
@@ -131,6 +140,13 @@ impl Settings {
                         settings.ocr_hotkey = format_hotkey(mods, vk);
                     }
                 }
+                "GifEnabled" => settings.gif_enabled = parse_bool(value),
+                "GifFps" => settings.gif_fps = if value.trim() == "60" { 60 } else { 30 },
+                "GifHotkey" => {
+                    if let Some((mods, vk)) = parse_hotkey(value) {
+                        settings.gif_hotkey = format_hotkey(mods, vk);
+                    }
+                }
                 _ => {
                     settings.extra.insert(key.to_string(), value.to_string());
                 }
@@ -182,6 +198,9 @@ impl Settings {
         out.push_str(&format!("OcrEnabled={}\n", self.ocr_enabled));
         out.push_str(&format!("ShotHotkey={}\n", self.shot_hotkey));
         out.push_str(&format!("OcrHotkey={}\n", self.ocr_hotkey));
+        out.push_str(&format!("GifEnabled={}\n", self.gif_enabled));
+        out.push_str(&format!("GifFps={}\n", self.gif_fps));
+        out.push_str(&format!("GifHotkey={}\n", self.gif_hotkey));
 
         for (key, value) in &self.extra {
             // 上面这些键已经写过，不再重复
@@ -209,6 +228,9 @@ impl Settings {
                     | "OcrEnabled"
                     | "ShotHotkey"
                     | "OcrHotkey"
+                    | "GifEnabled"
+                    | "GifFps"
+                    | "GifHotkey"
             ) {
                 continue;
             }

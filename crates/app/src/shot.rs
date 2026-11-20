@@ -74,14 +74,18 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// 选区确认后做什么：进编辑窗，还是直接取字
+/// 选区确认后做什么：进编辑窗，还是直接取字，还是开始录 GIF
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Edit,
     Ocr,
+    Gif,
 }
 
 static mut MODE: Mode = Mode::Edit;
+/// 录 GIF 时：选区在屏幕上的位置（物理像素）和帧率
+static mut GIF_RECT: (i32, i32, i32, i32) = (0, 0, 0, 0);
+static GIF_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
 
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
@@ -94,6 +98,15 @@ pub fn request_ocr(panel: HWND) {
         return;
     }
     start(panel, Mode::Ocr);
+}
+
+/// 框一块区域录成 GIF：复用截图那套遮罩选区，选完直接开录。
+pub fn request_gif(panel: HWND, fps: u32) {
+    if crate::gifrec::is_recording() || ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    GIF_FPS.store(fps.max(1), Ordering::Relaxed);
+    start(panel, Mode::Gif);
 }
 
 fn start(panel: HWND, mode: Mode) {
@@ -124,12 +137,12 @@ fn start(panel: HWND, mode: Mode) {
         }
     });
 }
-/// 选区确认：按模式进编辑窗或直接取字
+/// 选区确认：按模式进编辑窗 / 直接取字 / 开始录 GIF
 unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
-    if MODE == Mode::Ocr {
-        crate::ocr::recognize_async(panel, bitmap);
-    } else {
-        open_editor(panel, bitmap);
+    match MODE {
+        Mode::Ocr => crate::ocr::recognize_async(panel, bitmap),
+        Mode::Gif => crate::gifrec::start(panel, GIF_RECT, GIF_FPS.load(Ordering::Relaxed)),
+        Mode::Edit => open_editor(panel, bitmap),
     }
 }
 
@@ -766,6 +779,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         rect.right - rect.left,
                         rect.bottom - rect.top,
                     );
+                    GIF_RECT = (
+                        state.origin.0 + rect.left,
+                        state.origin.1 + rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
                     let panel = PANEL;
                     DestroyWindow(hwnd);
                     deliver(panel, cropped);
@@ -796,6 +815,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                             let cropped = state.shot.crop(
                                 rect.left,
                                 rect.top,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top,
+                            );
+                            GIF_RECT = (
+                                state.origin.0 + rect.left,
+                                state.origin.1 + rect.top,
                                 rect.right - rect.left,
                                 rect.bottom - rect.top,
                             );

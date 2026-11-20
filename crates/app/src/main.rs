@@ -4,6 +4,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod gifrec;
 mod history_ui;
 mod hint;
 mod autostart;
@@ -49,6 +50,7 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
+pub(crate) const WM_APP_GIF_DONE: u32 = WM_APP + 9;
 const WM_APP_ANIM: u32 = WM_APP + 6;
 /// 另一个实例启动时叫醒已有面板（单实例互斥体挡住重复启动，但得给点反馈）
 const WM_APP_REVEAL: u32 = WM_APP + 7;
@@ -61,6 +63,7 @@ const WM_APP_DPI_TEST: u32 = WM_APP + 8;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const HOTKEY_SHOT: i32 = 1;
 const HOTKEY_OCR: i32 = 2;
+const HOTKEY_GIF: i32 = 3;
 const TRAY_ID: u32 = 1;
 
 thread_local! {
@@ -123,6 +126,7 @@ const ID_PANEL_HIDE: usize = 1200;
 const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
 const ID_OCR: usize = 1303;
+const ID_GIF: usize = 1304;
 const ID_QUIT: usize = 1099;
 
 fn main() {
@@ -1017,7 +1021,7 @@ unsafe extern "system" fn wnd_proc(
             if !DRAG_MOVED && dx.abs() + dy.abs() < 3 {
                 return 0;
             }
-            DRAG_MOVED = true;
+            DRAG_MOVED = true;
             SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -1036,7 +1040,7 @@ unsafe extern "system" fn wnd_proc(
                 let active = DRAG_ACTIVE;
                 DRAG_ACTIVE = false;
                 active && DRAG_MOVED
-            };
+            };
             if moved {
                 // 记住拖到的位置（夹在任务栏里），下次启动还在这儿
                 let mut rect = RECT {
@@ -1128,7 +1132,23 @@ unsafe extern "system" fn wnd_proc(
             match wparam as i32 {
                 HOTKEY_SHOT if settings.shot_enabled && !controller => shot::request(hwnd),
                 HOTKEY_OCR if settings.ocr_enabled && !controller => shot::request_ocr(hwnd),
+                HOTKEY_GIF if settings.gif_enabled && !controller => {
+                    // 录着就停，没录就开始选区
+                    if gifrec::is_recording() {
+                        gifrec::stop();
+                    } else {
+                        shot::request_gif(hwnd, settings.gif_fps.max(30) as u32);
+                    }
+                }
                 _ => {}
+            }
+            0
+        }
+        WM_APP_GIF_DONE => {
+            let pointer = wparam as *mut Vec<u8>;
+            if !pointer.is_null() {
+                let bytes = *Box::from_raw(pointer);
+                gifrec::save_and_notify(hwnd, bytes);
             }
             0
         }
@@ -1256,6 +1276,13 @@ fn show_menu(hwnd: HWND) {
             panel.settings.ocr_hotkey.clone(),
         ));
     }
+    if panel.settings.gif_enabled {
+        rows.push(menu::Entry::hotkey(
+            ID_GIF,
+            if gifrec::is_recording() { "结束 GIF 录制" } else { "录制区域 GIF…" },
+            panel.settings.gif_hotkey.clone(),
+        ));
+    }
     rows.push(menu::Entry::separator());
     rows.push(menu::Entry::item(ID_PANEL_SNAP, "吸附到任务栏"));
     rows.push(menu::Entry::item(ID_PANEL_HIDE, "隐藏面板"));
@@ -1292,6 +1319,14 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);
+            }
+            ID_GIF => {
+                if gifrec::is_recording() {
+                    gifrec::stop();
+                } else {
+                    let fps = panel.settings.gif_fps.max(30) as u32;
+                    shot::request_gif(hwnd, fps);
+                }
             }
             ID_PANEL_SNAP => {
                 panel.reset_anchor();
@@ -1414,6 +1449,7 @@ fn register_hotkeys(hwnd: HWND) {
     unsafe {
         UnregisterHotKey(hwnd, HOTKEY_SHOT);
         UnregisterHotKey(hwnd, HOTKEY_OCR);
+        UnregisterHotKey(hwnd, HOTKEY_GIF);
 
         if settings.shot_enabled {
             if let Some((mods, vk)) = parse_hotkey(&settings.shot_hotkey) {
@@ -1423,6 +1459,11 @@ fn register_hotkeys(hwnd: HWND) {
         if settings.ocr_enabled {
             if let Some((mods, vk)) = parse_hotkey(&settings.ocr_hotkey) {
                 RegisterHotKey(hwnd, HOTKEY_OCR, mods, vk);
+            }
+        }
+        if settings.gif_enabled {
+            if let Some((mods, vk)) = parse_hotkey(&settings.gif_hotkey) {
+                RegisterHotKey(hwnd, HOTKEY_GIF, mods, vk);
             }
         }
     }
@@ -1455,6 +1496,32 @@ pub(crate) fn apply_hotkey(parent: HWND, ocr: bool, hotkey: &str) {
         } else {
             panel.settings.shot_hotkey = hotkey.to_string();
         }
+        panel.settings.save();
+    }
+    register_hotkeys(parent);
+}
+
+/// 设置里开关 GIF 录制：菜单项和热键一起跟着开关。
+pub(crate) fn apply_gif_enabled(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.gif_enabled = enabled;
+        panel.settings.save();
+    }
+    register_hotkeys(parent);
+}
+
+/// 设置里改 GIF 帧率（30 / 60）：下一次录制生效。
+pub(crate) fn apply_gif_fps(parent: HWND, fps: i32) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.gif_fps = if fps >= 60 { 60 } else { 30 };
+        panel.settings.save();
+    }
+}
+
+/// 设置里改 GIF 热键：立刻重注册。
+pub(crate) fn apply_gif_hotkey(parent: HWND, hotkey: &str) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.gif_hotkey = hotkey.to_string();
         panel.settings.save();
     }
     register_hotkeys(parent);
@@ -1541,4 +1608,4 @@ mod tests {
         assert!(!is_remote_client_exe(r"C:\Tools\GameViewerHelper\foo.exe"));
         assert!(!is_remote_client_exe(""));
     }
-}
+}

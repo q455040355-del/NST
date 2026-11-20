@@ -82,12 +82,13 @@ const SHOT_HEAD_TOP: f32 = 596.0; // 分隔线
 const SHOT_TITLE_TOP: f32 = 602.0; // 「截图与取字」小标题
 const SHOT_FIRST_TOP: f32 = 626.0; // 截图行
 const SHOT_OCR_TOP: f32 = 674.0; // 取字行
+const SHOT_GIF_TOP: f32 = 722.0; // 录 GIF 行
 const SHOT_ROW_H: f32 = 44.0;
 
 /// 可滚动内容区：分隔线往下到页脚分割线往上
 const CONTENT_TOP: f32 = 65.0;
 /// 内容总高度（最后一个来源行 + 一点留白）；窗口比这个矮就出现滚动
-const CONTENT_BOTTOM: f32 = 726.0;
+const CONTENT_BOTTOM: f32 = 772.0;
 /// 页脚（分割线 + 完成按钮）高度
 const FOOTER_H: f32 = 64.0;
 
@@ -103,6 +104,9 @@ enum Hit {
     OcrToggle,
     ShotHotkey,
     OcrHotkey,
+    GifToggle,
+    GifFps,
+    GifHotkey,
     Scrollbar,
     AutoStart,
 }
@@ -343,9 +347,12 @@ struct State {
     auto_start: bool,
     shot_enabled: bool,
     ocr_enabled: bool,
+    gif_enabled: bool,
+    gif_fps: i32,
     shot_hotkey: String,
     ocr_hotkey: String,
-    /// 正在录制快捷键：0 = 没在录，1 = 截图，2 = 取字
+    gif_hotkey: String,
+    /// 正在录制快捷键：0 = 没在录，1 = 截图，2 = 取字，3 = 录 GIF
     capture: usize,
     fonts: Fonts,
     scale: f32,
@@ -373,8 +380,12 @@ struct Layout {
     ai_sources: [RECT; 6],
     shot_toggle: RECT,
     ocr_toggle: RECT,
+    gif_toggle: RECT,
+    /// GIF 行左边的帧率胶囊
+    gif_fps: RECT,
     shot_hotkey: RECT,
     ocr_hotkey: RECT,
+    gif_hotkey: RECT,
     /// 页脚左边的「开机自启」整行热区
     auto_start: RECT,
 }
@@ -436,11 +447,15 @@ fn layout(state: &State, client: RECT) -> Layout {
     let row_h = s(SHOT_ROW_H, scale);
     let shot_top = s(SHOT_FIRST_TOP, scale);
     let ocr_top = s(SHOT_OCR_TOP, scale);
+    let gif_top = s(SHOT_GIF_TOP, scale);
     let switcher_w = s(40.0, scale);
     let hotkey_w = s(116.0, scale);
     let hotkey_h = s(26.0, scale);
     let hotkey_right = right - switcher_w - s(10.0, scale);
     let hotkey_left = hotkey_right - hotkey_w;
+    let fps_w = s(66.0, scale);
+    let fps_right = hotkey_left - s(8.0, scale);
+    let fps_left = fps_right - fps_w;
 
     Layout {
         close,
@@ -477,6 +492,24 @@ fn layout(state: &State, client: RECT) -> Layout {
             top: ocr_top + (row_h - hotkey_h) / 2,
             right: hotkey_right,
             bottom: ocr_top + (row_h - hotkey_h) / 2 + hotkey_h,
+        },
+        gif_toggle: RECT {
+            left: s(12.0, scale),
+            top: gif_top,
+            right,
+            bottom: gif_top + row_h,
+        },
+        gif_fps: RECT {
+            left: fps_left,
+            top: gif_top + (row_h - hotkey_h) / 2,
+            right: fps_right,
+            bottom: gif_top + (row_h - hotkey_h) / 2 + hotkey_h,
+        },
+        gif_hotkey: RECT {
+            left: hotkey_left,
+            top: gif_top + (row_h - hotkey_h) / 2,
+            right: hotkey_right,
+            bottom: gif_top + (row_h - hotkey_h) / 2 + hotkey_h,
         },
         // 页脚左边：标签 + 开关都在这个热区里
         auto_start: RECT {
@@ -1175,6 +1208,136 @@ unsafe fn paint(hwnd: HWND) {
         }
     }
 
+    // ---------------------------------------------------------------- 截区域录 GIF
+    {
+        let row = l.gif_toggle;
+        let mid = (row.top + row.bottom) / 2;
+        let hovered = matches!(
+            state.hover,
+            Some(Hit::GifToggle) | Some(Hit::GifFps) | Some(Hit::GifHotkey)
+        );
+        if hovered {
+            p.round(
+                row.left,
+                row.top + p.s(1.0),
+                content_right,
+                row.bottom - p.s(1.0),
+                p.s(8.0),
+                c.chip,
+                c.chip,
+            );
+        }
+
+        p.text(
+            "截区域为 GIF",
+            state.fonts.label,
+            if state.gif_enabled { c.text } else { c.text2 },
+            pad + p.s(4.0),
+            row.top + p.s(2.0),
+            l.gif_fps.left - p.s(10.0),
+            row.top + p.s(24.0),
+            DT_LEFT,
+        );
+        p.text(
+            "框一块区域录成动图",
+            state.fonts.small,
+            c.text3,
+            pad + p.s(4.0),
+            mid,
+            l.gif_fps.left - p.s(10.0),
+            row.bottom,
+            DT_LEFT,
+        );
+
+        // 帧率胶囊：点一下 30 ↔ 60
+        let fps = l.gif_fps;
+        let fps_hover = state.hover == Some(Hit::GifFps);
+        let fps_fill = if fps_hover { c.chip_hover } else { c.chip };
+        p.round(fps.left, fps.top, fps.right, fps.bottom, p.s(8.0), fps_fill, fps_fill);
+        p.text(
+            &format!("{} fps", state.gif_fps),
+            state.fonts.small,
+            if state.gif_enabled { c.text } else { c.text3 },
+            fps.left + p.s(5.0),
+            fps.top,
+            fps.right - p.s(5.0),
+            fps.bottom,
+            DT_CENTER,
+        );
+
+        // 热键胶囊
+        let hotkey = l.gif_hotkey;
+        let capturing = state.capture == 3;
+        let fill = if capturing || state.hover == Some(Hit::GifHotkey) {
+            c.chip_hover
+        } else {
+            c.chip
+        };
+        let border = if capturing { c.accent } else { fill };
+        p.round(
+            hotkey.left,
+            hotkey.top,
+            hotkey.right,
+            hotkey.bottom,
+            p.s(8.0),
+            fill,
+            border,
+        );
+        p.text(
+            if capturing {
+                "按下组合键…"
+            } else {
+                state.gif_hotkey.as_str()
+            },
+            state.fonts.small,
+            if capturing {
+                c.text
+            } else if state.gif_enabled {
+                c.text2
+            } else {
+                c.text3
+            },
+            hotkey.left + p.s(5.0),
+            hotkey.top,
+            hotkey.right - p.s(5.0),
+            hotkey.bottom,
+            DT_CENTER,
+        );
+
+        // 开关本体
+        let sw_w = p.s(40.0);
+        let sw_h = p.s(22.0);
+        let sx = content_right - sw_w;
+        let sy = mid - sw_h / 2;
+        if state.gif_enabled {
+            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
+            p.circle(
+                sx + sw_w - sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                KNOB,
+            );
+        } else {
+            p.round(
+                sx,
+                sy,
+                sx + sw_w,
+                sy + sw_h,
+                sw_h,
+                c.chip,
+                mix_white(c.border, 0.05),
+            );
+            p.circle(
+                sx + sw_h / 2,
+                mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                mix_white(c.border, 0.05),
+            );
+        }
+    }
+
     // 键盘焦点框：内容区的控件画在滚动坐标系里（还在裁剪区内）
     if state.keyboard {
         if let Some(hit) = state.focus {
@@ -1714,7 +1877,7 @@ pub fn open(parent: HWND, settings: &Settings) {
         // 窗口开在鼠标那块屏上：缩放按那块屏算（多屏缩放不同也对）
         let scale = crate::cursor_scale();
         let width_px = s(440.0, scale);
-        let mut height_px = s(790.0, scale);
+        let mut height_px = s(836.0, scale);
 
         let screen = crate::work_area();
 
@@ -1777,8 +1940,11 @@ pub fn open(parent: HWND, settings: &Settings) {
             auto_start: settings.auto_start,
             shot_enabled: settings.shot_enabled,
             ocr_enabled: settings.ocr_enabled,
+            gif_enabled: settings.gif_enabled,
+            gif_fps: settings.gif_fps,
             shot_hotkey: settings.shot_hotkey.clone(),
             ocr_hotkey: settings.ocr_hotkey.clone(),
+            gif_hotkey: settings.gif_hotkey.clone(),
             capture: 0,
             fonts: Fonts::create(scale),
             scale,
@@ -1893,11 +2059,20 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.ocr_hotkey, point) {
         return Some(Hit::OcrHotkey);
     }
+    if contains(&l.gif_hotkey, point) {
+        return Some(Hit::GifHotkey);
+    }
+    if contains(&l.gif_fps, point) {
+        return Some(Hit::GifFps);
+    }
     if contains(&l.shot_toggle, point) {
         return Some(Hit::ShotToggle);
     }
     if contains(&l.ocr_toggle, point) {
         return Some(Hit::OcrToggle);
+    }
+    if contains(&l.gif_toggle, point) {
+        return Some(Hit::GifToggle);
     }
     if contains(&l.ai_toggle, point) {
         return Some(Hit::AiToggle);
@@ -1929,6 +2104,9 @@ fn nav_items(state: &State) -> Vec<Hit> {
     items.push(Hit::ShotHotkey);
     items.push(Hit::OcrToggle);
     items.push(Hit::OcrHotkey);
+    items.push(Hit::GifToggle);
+    items.push(Hit::GifFps);
+    items.push(Hit::GifHotkey);
     items.push(Hit::AutoStart);
     items.push(Hit::Done);
     items
@@ -1946,6 +2124,9 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
         Hit::OcrToggle => l.ocr_toggle,
         Hit::ShotHotkey => l.shot_hotkey,
         Hit::OcrHotkey => l.ocr_hotkey,
+        Hit::GifToggle => l.gif_toggle,
+        Hit::GifFps => l.gif_fps,
+        Hit::GifHotkey => l.gif_hotkey,
         Hit::AutoStart => l.auto_start,
         Hit::Done => l.done,
         _ => return None,
@@ -2036,6 +2217,11 @@ fn toggle_ocr(state: &mut State) {
     crate::apply_ocr_enabled(state.parent, state.ocr_enabled);
 }
 
+fn toggle_gif(state: &mut State) {
+    state.gif_enabled = !state.gif_enabled;
+    crate::apply_gif_enabled(state.parent, state.gif_enabled);
+}
+
 /// 把当前按下的组合键写进对应那一行
 fn accept_hotkey(state: &mut State, vk: u32) {
     let mut mods = 0_u32;
@@ -2062,6 +2248,9 @@ fn accept_hotkey(state: &mut State, vk: u32) {
     if state.capture == 1 {
         state.shot_hotkey = text.clone();
         crate::apply_hotkey(state.parent, false, &text);
+    } else if state.capture == 3 {
+        state.gif_hotkey = text.clone();
+        crate::apply_gif_hotkey(state.parent, &text);
     } else {
         state.ocr_hotkey = text.clone();
         crate::apply_hotkey(state.parent, true, &text);
@@ -2206,7 +2395,10 @@ unsafe extern "system" fn dialog_proc(
             // 鼠标点谁，焦点就落在谁身上（焦点框只在键盘操作时显示）
             let hit = hit_test(state, client, point);
             if state.capture != 0
-                && !matches!(hit, Some(Hit::ShotHotkey) | Some(Hit::OcrHotkey))
+                && !matches!(
+                    hit,
+                    Some(Hit::ShotHotkey) | Some(Hit::OcrHotkey) | Some(Hit::GifHotkey)
+                )
             {
                 state.capture = 0;
             }
@@ -2259,6 +2451,19 @@ unsafe extern "system" fn dialog_proc(
                 }
                 Some(Hit::OcrHotkey) => {
                     state.capture = 2;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::GifToggle) => {
+                    toggle_gif(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::GifFps) => {
+                    state.gif_fps = if state.gif_fps >= 60 { 30 } else { 60 };
+                    crate::apply_gif_fps(state.parent, state.gif_fps);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::GifHotkey) => {
+                    state.capture = 3;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::AutoStart) => {
@@ -2455,6 +2660,12 @@ unsafe extern "system" fn dialog_proc(
                     Hit::OcrToggle => toggle_ocr(state),
                     Hit::ShotHotkey => state.capture = 1,
                     Hit::OcrHotkey => state.capture = 2,
+                    Hit::GifToggle => toggle_gif(state),
+                    Hit::GifFps => {
+                        state.gif_fps = if state.gif_fps >= 60 { 30 } else { 60 };
+                        crate::apply_gif_fps(state.parent, state.gif_fps);
+                    }
+                    Hit::GifHotkey => state.capture = 3,
                     Hit::AutoStart => toggle_auto_start(state),
                     Hit::Done => {
                         DestroyWindow(hwnd);
