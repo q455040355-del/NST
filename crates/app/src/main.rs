@@ -1279,7 +1279,7 @@ fn show_menu(hwnd: HWND) {
     if panel.settings.gif_enabled {
         rows.push(menu::Entry::hotkey(
             ID_GIF,
-            if gifrec::is_recording() { "结束 GIF 录制" } else { "录制区域 GIF…" },
+            if gifrec::is_recording() { "结束 WebP 录制" } else { "录制区域 WebP…" },
             panel.settings.gif_hotkey.clone(),
         ));
     }

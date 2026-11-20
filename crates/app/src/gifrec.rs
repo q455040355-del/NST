@@ -8,8 +8,6 @@
 //!
 //! 采集和编码在同一个后台线程里，边拍边写进内存，不会攒几千张整帧位图。
 
-use std::borrow::Cow;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -228,50 +226,6 @@ unsafe fn paint_stop(dc: HDC) {
 
 // ---------------------------------------------------------------- 采集 + 编码
 
-struct RgbLut {
-    table: Vec<u8>,
-}
-
-impl RgbLut {
-    /// 6 bit/通道 → 调色板下标（262144 项）。比逐像素算最近色的 O(256) 循环快两个数量级。
-    fn build(palette: &[u8]) -> Self {
-        let colors = palette.len() / 3;
-        let mut table = vec![0_u8; 1 << 18];
-        for index in 0..table.len() {
-            let r = ((index >> 12) & 0x3F) as i32;
-            let g = ((index >> 6) & 0x3F) as i32;
-            let b = (index & 0x3F) as i32;
-            let mut best = 0_usize;
-            let mut best_distance = i32::MAX;
-            for color in 0..colors.min(255) {
-                let dr = r * 4 - palette[color * 3] as i32;
-                let dg = g * 4 - palette[color * 3 + 1] as i32;
-                let db = b * 4 - palette[color * 3 + 2] as i32;
-                let distance = dr * dr * 3 + dg * dg * 6 + db * db;
-                if distance < best_distance {
-                    best_distance = distance;
-                    best = color as usize;
-                }
-            }
-            table[index] = best as u8;
-        }
-        Self { table }
-    }
-
-    fn map(&self, bgra: &[u8]) -> Vec<u8> {
-        let pixels = bgra.len() / 4;
-        let mut out = Vec::with_capacity(pixels);
-        for pixel in 0..pixels {
-            let index = pixel * 4;
-            let b = (bgra[index] >> 2) as usize;
-            let g = (bgra[index + 1] >> 2) as usize;
-            let r = (bgra[index + 2] >> 2) as usize;
-            out.push(self.table[(r << 12) | (g << 6) | b]);
-        }
-        out
-    }
-}
-
 /// 一个屏幕区域的采集器（DIB 只建一次）
 struct ScreenGrabber {
     screen: HDC,
@@ -369,15 +323,6 @@ impl Drop for ScreenGrabber {
     }
 }
 
-fn delay_for(fps: u32) -> u16 {
-    // GIF 延迟单位是 10ms：30fps = 3，60fps 只能取 2（20ms，实际约 50fps）
-    if fps >= 60 {
-        2
-    } else {
-        3
-    }
-}
-
 unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, border: usize, button: usize) {
     let (border, button) = (border as HWND, button as HWND);
     // 等遮罩彻底消失、边框画出来（边框在选区外面，不会被录到）
@@ -402,45 +347,17 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         return;
     }
 
-    // 采样：每 3 个像素取 1 个，控制 NeuQuant 的开销
-    let mut samples: Vec<u8> = Vec::new();
-    for shot in &warmup {
-        let pixels = shot.len() / 4;
-        let mut index = 0;
-        while index < pixels {
-            let offset = index * 4;
-            samples.push(shot[offset + 2]);
-            samples.push(shot[offset + 1]);
-            samples.push(shot[offset]);
-            samples.push(255);
-            index += 3;
-        }
-    }
-    let quant = color_quant::NeuQuant::new(10, 256, &samples);
-    let mut palette = quant.color_map_rgb();
-    palette.truncate(255 * 3);
-    palette.extend_from_slice(&[0, 0, 0]);
-    let lut = RgbLut::build(&palette);
-
-    let mut cursor = Cursor::new(Vec::new());
-    let Ok(mut encoder) = gif::Encoder::new(&mut cursor, width as u16, height as u16, &palette) else {
-        finish(border, button);
-        return;
-    };
-    let _ = encoder.set_repeat(gif::Repeat::Infinite);
-
-    let delay = delay_for(fps);
-    let mut previous: Vec<u8> = Vec::new();
+    // 帧先留着，停止后一次性交给 libwebp 的动画编码器（帧间优化它自己做）
+    let mut shots: Vec<Vec<u8>> = Vec::new();
     let mut last_raw: Vec<u8> = Vec::new();
-    let mut pending_delay = 0_u16;
-    let mut first = true;
+    // 内存兜底：整段最多占 600MB
+    let max_frames = ((600 * 1024 * 1024) / (width.max(1) * height.max(1) * 4) as usize).max(30);
+    let delay_ms = if fps >= 60 { 16 } else { 33 };
 
-    // 先把暖身帧写进去
     for shot in &warmup {
-        if !write_frame(&mut encoder, &lut, shot, &mut previous, &mut last_raw, delay, first, (width as u16, height as u16)) {
-            pending_delay = pending_delay.saturating_add(delay);
-        }
-        first = false;
+        shots.push(to_rgba(shot));
+        last_raw.clear();
+        last_raw.extend_from_slice(shot);
     }
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
@@ -448,7 +365,10 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let limit = std::time::Duration::from_secs(120);
     let mut next = std::time::Instant::now();
 
-    while !STOP_REQUEST.load(Ordering::Relaxed) && started.elapsed() < limit {
+    while !STOP_REQUEST.load(Ordering::Relaxed)
+        && started.elapsed() < limit
+        && shots.len() < max_frames
+    {
         next += interval;
         let now = std::time::Instant::now();
         if next > now {
@@ -461,27 +381,15 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             continue;
         }
         if frame == last_raw {
-            // 画面没变：只累加延迟，不写新帧
-            pending_delay = pending_delay.saturating_add(delay);
+            // 画面没变：这一帧直接不要，时间轴照样往前走
             continue;
         }
-
-        if write_frame(
-            &mut encoder,
-            &lut,
-            &frame,
-            &mut previous,
-            &mut last_raw,
-            delay.saturating_add(pending_delay),
-            false,
-            (width as u16, height as u16),
-        ) {
-            pending_delay = 0;
-        }
+        shots.push(to_rgba(&frame));
+        last_raw.clear();
+        last_raw.extend_from_slice(&frame);
     }
 
-    drop(encoder);
-    let bytes = cursor.into_inner();
+    let bytes = encode_webp(width, height, &shots, delay_ms);
     finish(border, button);
 
     if !bytes.is_empty() {
@@ -497,51 +405,41 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     }
 }
 
-/// 写一帧；返回 false 表示这帧和上一帧完全一样（调用方累加延迟）
-fn write_frame<W: std::io::Write>(
-    encoder: &mut gif::Encoder<W>,
-    lut: &RgbLut,
-    bgra: &[u8],
-    previous: &mut Vec<u8>,
-    last_raw: &mut Vec<u8>,
-    delay: u16,
-    first: bool,
-    size: (u16, u16),
-) -> bool {
-    let _pixels = bgra.len() / 4;
-    let indices = lut.map(bgra);
-
-    let mut buffer = indices.clone();
-    let mut changed = 0_usize;
-    if !first && previous.len() == buffer.len() {
-        for index in 0..buffer.len() {
-            if buffer[index] == previous[index] {
-                buffer[index] = 255;
-            } else {
-                changed += 1;
-            }
-        }
-        if changed == 0 {
-            return false;
-        }
+/// BGRA → RGBA（libwebp 的动画编码器只吃 RGB / RGBA）
+fn to_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut out = bgra.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
     }
+    out
+}
 
-    let frame = gif::Frame {
-        width: size.0,
-        height: size.1,
-        buffer: Cow::Owned(buffer),
-        delay: delay.max(1),
-        dispose: gif::DisposalMethod::Keep,
-        transparent: Some(255),
-        ..Default::default()
-    };
-    if encoder.write_frame(&frame).is_err() {
-        return false;
+/// 用 libwebp 的动画编码器出 WebP（帧间优化、重复帧、调色板它自己处理）
+fn encode_webp(width: i32, height: i32, frames: &[Vec<u8>], delay_ms: i32) -> Vec<u8> {
+    if frames.is_empty() {
+        return Vec::new();
     }
-    *previous = indices;
-    last_raw.clear();
-    last_raw.extend_from_slice(bgra);
-    true
+    let mut config = webp::WebPConfig::new().unwrap();
+    config.quality = 72.0;
+    config.method = 4;
+    config.lossless = 0;
+    config.thread_level = 1;
+
+    let mut encoder = webp::AnimEncoder::new(width.max(1) as u32, height.max(1) as u32, &config);
+    encoder.set_loop_count(0);
+    for (index, frame) in frames.iter().enumerate() {
+        let timestamp = index as i32 * delay_ms;
+        encoder.add_frame(webp::AnimFrame::from_rgba(
+            frame,
+            width.max(1) as u32,
+            height.max(1) as u32,
+            timestamp,
+        ));
+    }
+    match encoder.try_encode() {
+        Ok(memory) => memory.to_vec(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn finish(border: HWND, button: HWND) {
@@ -563,14 +461,14 @@ fn finish(border: HWND, button: HWND) {
 /// 录完弹「另存为」，存完给个结果提示
 pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
     let mut name = vec![0u16; 512];
-    let mut filter: Vec<u16> = "GIF 动图\0*.gif\0所有文件\0*.*\0\0".encode_utf16().collect();
-    let mut title = wide("保存 GIF");
-    let mut ext = wide("gif");
+    let mut filter: Vec<u16> = "WebP 动图\0*.webp\0所有文件\0*.*\0\0".encode_utf16().collect();
+    let mut title = wide("保存 WebP");
+    let mut ext = wide("webp");
 
     let mut local: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
     windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut local);
     let default_name = format!(
-        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}.gif",
+        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}.webp",
         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
     );
     let default: Vec<u16> = default_name.encode_utf16().collect();
@@ -597,8 +495,8 @@ pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
     if std::fs::write(&path, &bytes).is_err() {
         MessageBoxW(
             owner,
-            wide("GIF 保存失败：磁盘空间不足、没有写入权限，或路径无效。").as_ptr(),
-            wide("保存 GIF").as_ptr(),
+            wide("WebP 保存失败：磁盘空间不足、没有写入权限，或路径无效。").as_ptr(),
+            wide("保存 WebP").as_ptr(),
             MB_OK | MB_ICONWARNING,
         );
         return;
@@ -609,7 +507,7 @@ pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
     MessageBoxW(
         owner,
         wide(&text).as_ptr(),
-        wide("GIF 已保存").as_ptr(),
+        wide("WebP 已保存").as_ptr(),
         MB_OK | MB_ICONINFORMATION,
     );
 }

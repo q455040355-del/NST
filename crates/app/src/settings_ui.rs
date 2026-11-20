@@ -1229,7 +1229,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         p.text(
-            "截区域为 GIF",
+            "截区域为 WebP",
             state.fonts.label,
             if state.gif_enabled { c.text } else { c.text2 },
             pad + p.s(4.0),
@@ -1239,7 +1239,7 @@ unsafe fn paint(hwnd: HWND) {
             DT_LEFT,
         );
         p.text(
-            "框一块区域录成动图",
+            "框一块区域录成 WebP 动图",
             state.fonts.small,
             c.text3,
             pad + p.s(4.0),
