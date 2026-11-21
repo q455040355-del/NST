@@ -44,8 +44,10 @@ pub struct Settings {
     pub ocr_hotkey: String,
     /// 截区域录 GIF 的开关（关了不注册热键、菜单不出）
     pub gif_enabled: bool,
-    /// GIF 录制帧率（30 / 60）
+    /// GIF 录制帧率（30 / 60 / 120）
     pub gif_fps: i32,
+    /// 录制画质（50 / 65 / 80，对应 libwebp quality；只影响体积和细节，编码耗时几乎不变）
+    pub gif_quality: i32,
     /// GIF 录制热键
     pub gif_hotkey: String,
     /// 编辑窗是否置顶（记住上次的选择）
@@ -79,6 +81,7 @@ impl Default for Settings {
             ocr_hotkey: "Ctrl+Shift+O".to_string(),
             gif_enabled: true,
             gif_fps: 30,
+            gif_quality: 65,
             gif_hotkey: "Ctrl+Shift+G".to_string(),
             shot_topmost: false,
             extra: BTreeMap::new(),
@@ -145,6 +148,9 @@ impl Settings {
                 }
                 "GifEnabled" => settings.gif_enabled = parse_bool(value),
                 "GifFps" => settings.gif_fps = normalize_fps(value.trim().parse().unwrap_or(30)),
+                "GifQuality" => {
+                    settings.gif_quality = normalize_quality(value.trim().parse().unwrap_or(65))
+                }
                 "ShotTopmost" => settings.shot_topmost = parse_bool(value),
                 "GifHotkey" => {
                     if let Some((mods, vk)) = parse_hotkey(value) {
@@ -204,6 +210,7 @@ impl Settings {
         out.push_str(&format!("OcrHotkey={}\n", self.ocr_hotkey));
         out.push_str(&format!("GifEnabled={}\n", self.gif_enabled));
         out.push_str(&format!("GifFps={}\n", self.gif_fps));
+        out.push_str(&format!("GifQuality={}\n", self.gif_quality));
         out.push_str(&format!("GifHotkey={}\n", self.gif_hotkey));
         out.push_str(&format!("ShotTopmost={}\n", self.shot_topmost));
 
@@ -235,6 +242,7 @@ impl Settings {
                     | "OcrHotkey"
                     | "GifEnabled"
                     | "GifFps"
+                    | "GifQuality"
                     | "GifHotkey"
                     | "ShotTopmost"
             ) {
@@ -277,13 +285,27 @@ fn parse_bool(value: &str) -> bool {
 }
 
 /// 录制帧率只认 30 / 60 / 120，别的值回落到 30
-fn normalize_fps(fps: i32) -> i32 {
+pub fn normalize_fps(fps: i32) -> i32 {
     if fps >= 120 {
         120
     } else if fps >= 60 {
         60
     } else {
         30
+    }
+}
+
+/// 录制画质只认 50 / 65 / 80，别的值回落到 65。
+/// 画质对编码耗时几乎没影响（1080p 单帧 25.1 / 25.5 / 25.7ms），影响的是体积（54 / 59 / 62KB）
+pub fn normalize_quality(quality: i32) -> i32 {
+    if quality >= 80 {
+        80
+    } else if quality >= 65 {
+        65
+    } else if quality >= 50 {
+        50
+    } else {
+        65
     }
 }
 
@@ -459,6 +481,17 @@ mod tests {
         assert_eq!(settings.view, "ai");
         settings.cycle_view();
         assert_eq!(settings.view, "speed");
+    }
+
+    #[test]
+    fn recording_fps_and_quality_normalization() {
+        assert_eq!(normalize_fps(120), 120);
+        assert_eq!(normalize_fps(90), 60);
+        assert_eq!(normalize_fps(24), 30);
+        assert_eq!(normalize_quality(80), 80);
+        assert_eq!(normalize_quality(70), 65);
+        assert_eq!(normalize_quality(52), 50);
+        assert_eq!(normalize_quality(0), 65);
     }
 
     #[test]

@@ -89,6 +89,8 @@ static mut MODE: Mode = Mode::Edit;
 /// 录 GIF 时：选区在屏幕上的位置（物理像素）和帧率
 static mut GIF_RECT: (i32, i32, i32, i32) = (0, 0, 0, 0);
 static GIF_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
+/// 录制画质（libwebp quality）：跟着设置走，下一次录制生效
+static GIF_QUALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(65);
 
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
@@ -104,11 +106,12 @@ pub fn request_ocr(panel: HWND) {
 }
 
 /// 框一块区域录成 GIF：复用截图那套遮罩选区，选完直接开录。
-pub fn request_gif(panel: HWND, fps: u32) {
+pub fn request_gif(panel: HWND, fps: u32, quality: u32) {
     if crate::gifrec::is_recording() || ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     GIF_FPS.store(fps.max(1), Ordering::Relaxed);
+    GIF_QUALITY.store(quality.clamp(1, 100), Ordering::Relaxed);
     start(panel, Mode::Gif);
 }
 
@@ -144,7 +147,12 @@ fn start(panel: HWND, mode: Mode) {
 unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
     match MODE {
         Mode::Ocr => crate::ocr::recognize_async(panel, bitmap),
-        Mode::Gif => crate::gifrec::start(panel, GIF_RECT, GIF_FPS.load(Ordering::Relaxed)),
+        Mode::Gif => crate::gifrec::start(
+            panel,
+            GIF_RECT,
+            GIF_FPS.load(Ordering::Relaxed),
+            GIF_QUALITY.load(Ordering::Relaxed),
+        ),
         Mode::Edit => open_editor(panel, bitmap, GIF_RECT),
     }
 }

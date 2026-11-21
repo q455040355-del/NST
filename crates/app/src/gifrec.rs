@@ -8,7 +8,7 @@
 //!
 //! 采集和编码在同一个后台线程里，边拍边写进内存，不会攒几千张整帧位图。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -45,6 +45,9 @@ const BORDER: i32 = 3;
 /// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
 const BAR_W: i32 = 150;
 const BAR_H: i32 = 42;
+/// 录制输出的分辨率上限：最高 1080p（最长边 1920 且总面积不超过 1920×1080）
+const MAX_OUT_SIDE: i32 = 1920;
+const MAX_OUT_PIXELS: i64 = 1920 * 1080;
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 操作条窗口（停止时先收起来）
@@ -53,6 +56,17 @@ static BAR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new
 static STOP_MODE: AtomicU8 = AtomicU8::new(0);
 /// 鼠标悬停在操作条左半（0）还是右半（1）；9 = 没有悬停
 static BAR_HOVER: AtomicI32 = AtomicI32::new(9);
+/// 编码线程实测的单帧耗时（微秒，指数平均）：抓帧线程用它决定下一帧什么时候抓
+static ENCODE_EMA_US: AtomicU32 = AtomicU32::new(0);
+/// 本次录制最慢的一帧（微秒），只用来写日志
+static ENCODE_WORST_US: AtomicU32 = AtomicU32::new(0);
+/// 真正进了编码器的帧数 / 队列满了被丢掉的帧数 / 抓帧循环转了几圈
+static ENCODED_FRAMES: AtomicU32 = AtomicU32::new(0);
+static DROPPED_FRAMES: AtomicU32 = AtomicU32::new(0);
+static CAPTURES: AtomicU32 = AtomicU32::new(0);
+
+/// 抓帧间隔上限（1/2 秒），再慢就说明机器已经跟不上了，继续拉长没有意义
+const MAX_INTERVAL_US: u64 = 500_000;
 
 pub fn is_recording() -> bool {
     RECORDING.load(Ordering::Relaxed)
@@ -136,13 +150,15 @@ pub fn stop_with(mode: u8) {
 }
 
 /// 开始录制一块屏幕区域（物理像素）。只负责开窗口，真正采集在后台线程。
-pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
+pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32, quality: u32) {
     let (x, y, w, h) = rect;
     if w < 16 || h < 16 || RECORDING.swap(true, Ordering::SeqCst) {
         return;
     }
     STOP_MODE.store(0, Ordering::SeqCst);
-    crate::debug_log(&format!("rec start: {x},{y} {w}x{h} fps={fps}"));
+    crate::debug_log(&format!(
+        "rec start: {x},{y} {w}x{h} fps={fps} quality={quality}"
+    ));
     BAR_HOVER.store(9, Ordering::SeqCst);
 
 
@@ -298,7 +314,7 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     let panel = panel as usize;
     let border_raw = border as usize;
     let button_raw = button as usize;
-    std::thread::spawn(move || run(panel, x, y, w, h, fps, border_raw, button_raw));
+    std::thread::spawn(move || run(panel, x, y, w, h, fps, quality, border_raw, button_raw));
 }
 
 unsafe extern "system" fn border_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -782,7 +798,9 @@ impl ScreenGrabber {
     }
 
     /// 抓一帧 BGRA（顺带把鼠标画进去）
-    fn grab(&mut self, x: i32, y: i32, out: &mut Vec<u8>) -> bool {
+    /// 抓一帧到 `out`；如果和 `prev` 一模一样就返回 false，连拷贝都省了。
+    /// 返回 false 也可能是抓屏失败——两种情况在录制循环里处理方式相同（这一帧不要）。
+    fn grab_if_changed(&mut self, x: i32, y: i32, prev: &[u8], out: &mut Vec<u8>) -> bool {
         unsafe {
             // 缩放录制：直接让 GDI 边抓边缩，比抓完再缩快一倍
             let ok = if self.width == self.src_w && self.height == self.src_h {
@@ -845,8 +863,14 @@ impl ScreenGrabber {
             windows_sys::Win32::Graphics::Gdi::GdiFlush();
 
             let len = (self.width * self.height * 4) as usize;
+            // 直接拿 DIB 里的像素和上一帧比：没变化就一次拷贝都不做
+            // （静止画面时这是最省的一条路：一帧只是 BitBlt + 8MB memcmp）
+            let bits = std::slice::from_raw_parts(self.bits, len);
+            if bits == prev {
+                return false;
+            }
             out.clear();
-            out.extend_from_slice(std::slice::from_raw_parts(self.bits, len));
+            out.extend_from_slice(bits);
             true
         }
     }
@@ -862,14 +886,27 @@ impl Drop for ScreenGrabber {
     }
 }
 
-unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, border: usize, button: usize) {
+unsafe fn run(
+    panel: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    fps: u32,
+    quality: u32,
+    border: usize,
+    button: usize,
+) {
     let (border, button) = (border as HWND, button as HWND);
     // 等遮罩彻底消失、边框画出来（边框在选区外面，不会被录到）
     std::thread::sleep(std::time::Duration::from_millis(160));
 
-    // 最长边超过 1920 就等比缩小：像素少一半，编码快一倍（成品分辨率低于原屏，可接受）
-    let longest = width.max(height).max(1) as f32;
-    let out_scale = (1920.0 / longest).min(1.0);
+    // 输出上限：最高 1080p。除了卡最长边，还要卡总面积——2000×2000 这种方形选区
+    // 光卡边长缩完还有 1920×1920（3.7MP），是 1080p 的 1.8 倍，编码和体积都翻倍。
+    let side_scale = MAX_OUT_SIDE as f32 / width.max(height).max(1) as f32;
+    let area_scale =
+        (MAX_OUT_PIXELS as f32 / (width.max(1) as f32 * height.max(1) as f32)).sqrt();
+    let out_scale = side_scale.min(area_scale).min(1.0);
     let out_w = ((width as f32 * out_scale).round() as i32).max(2);
     let out_h = ((height as f32 * out_scale).round() as i32).max(2);
 
@@ -878,16 +915,10 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         return;
     };
 
-    // 先拍几帧用来算全局调色板（开始录制的头 200ms 一般就是画面主体）
-    let mut warmup: Vec<Vec<u8>> = Vec::new();
-    let mut frame = Vec::new();
-    for _ in 0..5 {
-        if grabber.grab(x, y, &mut frame) {
-            warmup.push(frame.clone());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
-    if warmup.is_empty() {
+    // 只拍一帧当动画的底图。以前拍 5 帧是为了算 GIF 的全局调色板——WebP 没有调色板，
+    // 多拍的那 4 帧纯粹是白等 160ms、白编 4 次，还可能把深度 4 的队列提前塞满。
+    let mut first = Vec::new();
+    if !grabber.grab_if_changed(x, y, &[], &mut first) {
         finish(border, button);
         return;
     }
@@ -896,46 +927,67 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     // 队列只放 4 帧，编不过来就丢帧，时间戳照样按真实时间走，所以不会拖长时长。
     let started_at = std::time::Instant::now();
     let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
-    let mut last_raw: Vec<u8> = Vec::new();
     let limit_seconds = 20_u64;
 
-    // 编码成本只跟输出像素数有关：先算好 method 和帧率上限，再起编码线程
     let pixels = (out_w as i64) * (out_h as i64);
     let (method, mpix_per_sec) = pick_method(pixels, fps);
     let fps = fps.min(fps_cap(pixels, mpix_per_sec));
 
+    // 每帧耗时的统计窗口：编码线程写、抓帧线程读
+    ENCODE_EMA_US.store(0, Ordering::Relaxed);
+    ENCODE_WORST_US.store(0, Ordering::Relaxed);
+    ENCODED_FRAMES.store(0, Ordering::Relaxed);
+    DROPPED_FRAMES.store(0, Ordering::Relaxed);
+    CAPTURES.store(0, Ordering::Relaxed);
+
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
+    // 编码线程用完的 Vec 还回来直接复用：8MB 一块，省一次分配就省一次内存抖动
+    let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let encoder = std::thread::spawn(move || {
-        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, 65.0, method) else {
+        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, quality as f32, method) else {
+            crate::debug_log("webp: 编码器创建失败");
             return Vec::new();
         };
         for (frame, timestamp) in receiver {
+            let t = std::time::Instant::now();
             streamer.add(&frame, timestamp);
+            note_encode_time(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
+            ENCODED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            let _ = recycle_tx.send(frame);
         }
         streamer.finish()
     });
 
-    for shot in &warmup {
-        let _ = sender.try_send((shot.clone(), stamp(std::time::Instant::now())));
-        last_raw.clear();
-        last_raw.extend_from_slice(shot);
-    }
+    // 底图以 0ms 进编码器，动画才有第一帧
+    let _ = sender.try_send((first.clone(), 0));
+    let mut prev = first;
 
-    // 帧率上限按实测编码吞吐算，而不是按像素拍三档：
-    //   编码器撑不住的帧不会被"压慢"，而是被 try_send 丢掉，丢的恰好是真有变化的帧，
-    //   所以宁可一开始就少抓几帧，时间轴反而更均匀、CPU 也更省。
     crate::debug_log(&format!(
-        "rec: 实际帧率 {fps}（{pixels} 像素，method {method}，编码约 {:.1}ms/帧）",
+        "rec: 起手 {fps}fps（{pixels} 像素，method {method}，quality {quality}，预测 {:.1}ms/帧）",
         encode_ms_per_frame(pixels, mpix_per_sec)
     ));
 
-    let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
+    let user_interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
+    let mut interval = user_interval;
     let started = std::time::Instant::now();
     let limit = std::time::Duration::from_secs(limit_seconds);
     let mut next = std::time::Instant::now();
+    let mut out: Vec<u8> = recycle_rx.try_recv().unwrap_or_default();
 
     while STOP_MODE.load(Ordering::Relaxed) == 0 && started.elapsed() < limit {
         set_hud(limit_seconds.saturating_sub(started.elapsed().as_secs()));
+        CAPTURES.fetch_add(1, Ordering::Relaxed);
+
+        // 闭环：按编码线程实测的每帧耗时决定抓帧节奏。
+        // 只往慢里调（不会超过用户选的帧率），留 15% 余量，且四分之一拍逼近，避免帧率抖。
+        if let Some(ema) = encode_ema_us() {
+            let want = (ema.saturating_mul(115) / 100)
+                .max(user_interval.as_micros() as u64)
+                .min(MAX_INTERVAL_US);
+            let now = interval.as_micros() as u64;
+            interval = std::time::Duration::from_micros((now * 3 + want) / 4);
+        }
+
         next += interval;
         let now = std::time::Instant::now();
         if next > now {
@@ -944,35 +996,56 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             next = now;
         }
 
-        if !grabber.grab(x, y, &mut frame) {
+        if !grabber.grab_if_changed(x, y, &prev, &mut out) {
+            // 画面没变（或抓屏失败）：这一帧不要，时间轴照样往前走
             continue;
         }
-        if frame == last_raw {
-            // 画面没变：这一帧直接不要，时间轴照样往前走
-            continue;
+        // prev 得留着下一帧做比较（这块拷贝省不掉），送进队列的用另一块
+        prev.clear();
+        prev.extend_from_slice(&out);
+        let buffer = std::mem::take(&mut out);
+        if sender
+            .try_send((buffer, stamp(std::time::Instant::now())))
+            .is_err()
+        {
+            // 编码器还是跟不上（刚起手或画面突然剧烈变化）：立刻把间隔拉长 20%
+            DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            // 这一帧没进队列：把比较基准清掉，下一帧无论如何都再送一次，
+            // 否则画面刚好停在这一帧就会一直"没变化"，这段变化永远补不上
+            prev.clear();
+            interval = std::time::Duration::from_micros(
+                (interval.as_micros() as u64 * 12 / 10).min(MAX_INTERVAL_US),
+            );
         }
-        // 编不过来就丢掉这一帧（try_send 满即失败），不会拖慢抓帧
-        let _ = sender.try_send((frame.clone(), stamp(std::time::Instant::now())));
-        last_raw.clear();
-        last_raw.extend_from_slice(&frame);
+        // 拿回编码线程归还的缓冲；还没还回来就先空着，下一帧现分配
+        out = recycle_rx.try_recv().unwrap_or_default();
     }
 
     // 收尾：把最后那段静止时间也算进时长（再喂一帧同样的内容，时间戳取结束时）
-    if !last_raw.is_empty() {
-        let _ = sender.try_send((last_raw.clone(), stamp(std::time::Instant::now())));
-    }
+    let _ = sender.try_send((prev.clone(), stamp(std::time::Instant::now())));
     drop(sender);
 
     let mode = STOP_MODE.load(Ordering::SeqCst);
     let bytes = encoder.join().unwrap_or_default();
+    let encoded = ENCODED_FRAMES.load(Ordering::Relaxed);
+    let dropped = DROPPED_FRAMES.load(Ordering::Relaxed);
+    let captures = CAPTURES.load(Ordering::Relaxed);
+    let avg_ms = ENCODE_EMA_US.load(Ordering::Relaxed) as f64 / 1000.0;
+    let worst_ms = ENCODE_WORST_US.load(Ordering::Relaxed) as f64 / 1000.0;
+    let secs = started.elapsed().as_secs_f64().max(0.001);
     crate::debug_log(&format!(
-        "rec done: bytes={} size={out_w}x{out_h} (src {width}x{height}) limit={limit_seconds}s",
-        bytes.len()
+        "rec done: bytes={} size={out_w}x{out_h} (src {width}x{height}) 抓 {captures} 次 / 入队 {encoded} 帧 / 丢 {dropped} 帧 \
+         {avg_ms:.1}ms/帧(最差 {worst_ms:.1}ms) {secs:.1}s → 抓帧 {:.1}fps、编码 {:.1}fps",
+        bytes.len(),
+        captures as f64 / secs,
+        encoded as f64 / secs
     ));
     finish(border, button);
 
     if bytes.is_empty() {
         crate::debug_log(&format!("rec empty: mode={mode}"));
+        show_toast("录制失败：编码器没有输出");
+        return;
     }
     if !bytes.is_empty() {
         unsafe {
@@ -993,6 +1066,26 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 //
 // 不再把整段帧攒在内存里：每抓一帧就 WebPAnimEncoderAdd 进去，
 // 内存只占当前这一帧，所以 20 秒 / 60fps / 全屏都扛得住。
+
+/// 编码线程实测的单帧耗时（微秒，指数平均）；0 = 还没测到第一帧
+fn encode_ema_us() -> Option<u64> {
+    match ENCODE_EMA_US.load(Ordering::Relaxed) {
+        0 => None,
+        micros => Some(micros as u64),
+    }
+}
+
+/// 记一帧的编码耗时：EMA 给抓帧线程做闭环，最差值只写日志
+fn note_encode_time(micros: u32) {
+    ENCODE_WORST_US.fetch_max(micros, Ordering::Relaxed);
+    let prev = ENCODE_EMA_US.load(Ordering::Relaxed);
+    let next = if prev == 0 {
+        micros
+    } else {
+        ((prev as u64 * 4 + micros as u64) / 5) as u32
+    };
+    ENCODE_EMA_US.store(next, Ordering::Relaxed);
+}
 
 /// 编码吞吐（百万像素/秒）。i5-12400 实测（libwebp 编译时带 WEBP_USE_THREAD、
 /// thread_level = 1，即"宏块分段分析"多开一个线程）：
@@ -1052,7 +1145,10 @@ impl WebpStreamer {
                 return None;
             }
             options.anim_params.loop_count = 0;
-            options.minimize_size = 1;
+            // minimize_size = 1 是 libwebp 的"多试几种 dispose/blend 组合"，实测纯亏：
+            // 同一段内容编码慢 18~42%（1080p 面板 25.2→22.4ms、整屏滚动 67.6→39.7ms），
+            // 最差帧 46→24ms，而体积几乎一样（0~1.6%）。所以关掉。
+            options.minimize_size = 0;
 
             let encoder = libwebp_sys::WebPAnimEncoderNewInternal(
                 width.max(1),

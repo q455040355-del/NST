@@ -1151,7 +1151,11 @@ unsafe extern "system" fn wnd_proc(
                     if gifrec::is_recording() {
                         gifrec::stop();
                     } else {
-                        shot::request_gif(hwnd, settings.gif_fps.max(30) as u32);
+                        shot::request_gif(
+                            hwnd,
+                            settings.gif_fps.max(30) as u32,
+                            settings.gif_quality as u32,
+                        );
                     }
                 }
                 _ => {}
@@ -1344,7 +1348,8 @@ fn handle_command(hwnd: HWND, command: usize) {
                     gifrec::stop();
                 } else {
                     let fps = panel.settings.gif_fps.max(30) as u32;
-                    shot::request_gif(hwnd, fps);
+                    let quality = panel.settings.gif_quality as u32;
+                    shot::request_gif(hwnd, fps, quality);
                 }
             }
             ID_PANEL_SNAP => {
@@ -1529,10 +1534,11 @@ pub(crate) fn apply_gif_enabled(parent: HWND, enabled: bool) {
     register_hotkeys(parent);
 }
 
-/// 设置里改 GIF 帧率（30 / 60）：下一次录制生效。
+/// 设置里改录制帧率（30 / 60 / 120）：下一次录制生效。
 pub(crate) fn apply_gif_fps(parent: HWND, fps: i32) {
     if let Some(panel) = panel_mut(parent) {
-        panel.settings.gif_fps = if fps >= 60 { 60 } else { 30 };
+        // 以前这里写死成 `if fps >= 60 { 60 } else { 30 }`，设置界面的 120 存不进去
+        panel.settings.gif_fps = netspeed_core::settings::normalize_fps(fps);
         panel.settings.save();
     }
 }
