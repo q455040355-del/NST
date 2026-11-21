@@ -2577,6 +2577,7 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         Action::Topmost => {
             let editor = &mut *editor;
             editor.topmost = !editor.topmost;
+            crate::set_editor_topmost(PANEL, editor.topmost);
             let insert = if editor.topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
             // 置顶要盖过任务栏：先补上 WS_EX_TOPMOST，再插到 topmost 组的最前面
             let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
@@ -3067,7 +3068,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         drag_to: None,
         pen_points: Vec::new(),
         stroke: 1,
-        topmost: false,
+        topmost: crate::editor_topmost(panel),
         text: None,
         buttons: Vec::new(),
         pressed: None,
@@ -3103,4 +3104,20 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
     UpdateWindow(hwnd);
+
+    // 上次选了置顶就沿用
+    let editor = editor_state(hwnd);
+    if !editor.is_null() && (*editor).topmost {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 | WS_EX_TOPMOST;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
 }

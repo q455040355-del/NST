@@ -48,6 +48,8 @@ pub struct Settings {
     pub gif_fps: i32,
     /// GIF 录制热键
     pub gif_hotkey: String,
+    /// 编辑窗是否置顶（记住上次的选择）
+    pub shot_topmost: bool,
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
     extra: BTreeMap<String, String>,
 }
@@ -78,6 +80,7 @@ impl Default for Settings {
             gif_enabled: true,
             gif_fps: 30,
             gif_hotkey: "Ctrl+Shift+G".to_string(),
+            shot_topmost: false,
             extra: BTreeMap::new(),
         }
     }
@@ -142,6 +145,7 @@ impl Settings {
                 }
                 "GifEnabled" => settings.gif_enabled = parse_bool(value),
                 "GifFps" => settings.gif_fps = normalize_fps(value.trim().parse().unwrap_or(30)),
+                "ShotTopmost" => settings.shot_topmost = parse_bool(value),
                 "GifHotkey" => {
                     if let Some((mods, vk)) = parse_hotkey(value) {
                         settings.gif_hotkey = format_hotkey(mods, vk);
@@ -201,6 +205,7 @@ impl Settings {
         out.push_str(&format!("GifEnabled={}\n", self.gif_enabled));
         out.push_str(&format!("GifFps={}\n", self.gif_fps));
         out.push_str(&format!("GifHotkey={}\n", self.gif_hotkey));
+        out.push_str(&format!("ShotTopmost={}\n", self.shot_topmost));
 
         for (key, value) in &self.extra {
             // 上面这些键已经写过，不再重复
@@ -231,6 +236,7 @@ impl Settings {
                     | "GifEnabled"
                     | "GifFps"
                     | "GifHotkey"
+                    | "ShotTopmost"
             ) {
                 continue;
             }

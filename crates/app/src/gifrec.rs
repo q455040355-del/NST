@@ -320,6 +320,15 @@ pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
     windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut stamp);
     let dir = std::env::temp_dir().join("NST");
     let _ = std::fs::create_dir_all(&dir);
+    // 只留最新的一条：剪贴板里放着上一个文件就够了，缓存别越攒越多
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("Rec_") && name.ends_with(".webp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     let path = dir.join(format!(
         "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}_{}.webp",
         stamp.wYear,

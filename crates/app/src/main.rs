@@ -1523,6 +1523,24 @@ pub(crate) fn apply_gif_fps(parent: HWND, fps: i32) {
     }
 }
 
+/// 编辑窗上次是不是置顶（记住用户的选择）
+pub(crate) fn editor_topmost(parent: HWND) -> bool {
+    panel_mut(parent)
+        .map(|panel| panel.settings.shot_topmost)
+        .unwrap_or(false)
+}
+
+/// 编辑窗上点了置顶：存下来，下次沿用
+pub(crate) fn set_editor_topmost(parent: HWND, on: bool) {
+    if parent.is_null() {
+        return;
+    }
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.shot_topmost = on;
+        panel.settings.save();
+    }
+}
+
 /// 设置里改 GIF 热键：立刻重注册。
 pub(crate) fn apply_gif_hotkey(parent: HWND, hotkey: &str) {
     if let Some(panel) = panel_mut(parent) {
