@@ -15,9 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetStockObject, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline, ReleaseDC, SelectObject,
+    GetStockObject, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject,
     ScreenToClient, SetBkColor, SetBkMode, SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchBlt, TextOutW, BITMAPINFO,
     BITMAPINFOHEADER,
     CLEARTYPE_QUALITY, COLORONCOLOR, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
@@ -392,6 +393,8 @@ struct Overlay {
     last_rect: Option<RECT>,
     /// 上一帧「宽 × 高」标签胶囊的区域（同样要恢复，不然会叠字/留残影）
     last_label: Option<RECT>,
+    /// 放大镜取色用的鼠标位置（截图坐标）
+    cursor: POINT,
 }
 
 /// 把整屏画布上某块矩形恢复成「压暗版」像素。
@@ -698,8 +701,195 @@ unsafe fn overlay_paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+    // 放大镜直接画在窗口 DC 上，不去动常驻画布（每帧重画，不会有残影）
+    draw_loupe(hdc, state);
     EndPaint(hwnd, &mut ps);
 }
+
+/// 微信那种放大镜：光标附近放大 8 倍、画格子、标中心像素，下面给坐标和色值
+unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
+    let (cx, cy) = (state.cursor.x, state.cursor.y);
+    if cx < 0 || cy < 0 || cx >= state.shot.width || cy >= state.shot.height {
+        return;
+    }
+
+    let zoom = s(8.0).max(4);
+    let cells = 15;
+    let grid = cells * zoom;
+    let pad = s(1.0);
+    let info_h = s(72.0);
+    let width = (grid + pad * 2).max(s(150.0));
+    let height = grid + pad * 2 + info_h;
+
+    // 默认放鼠标右下，贴边就翻到另一侧
+    let gap = s(26.0);
+    let mut left = cx + gap;
+    if state.start.is_some() {
+        // 已经在拖框了：放大镜挡住选区，收起来
+        return;
+    }
+    let mut top = cy + gap;
+    if left + width > state.shot.width {
+        left = cx - gap - width;
+    }
+    if top + height > state.shot.height {
+        top = cy - gap - height;
+    }
+    let left = left.max(0).min((state.shot.width - width).max(0));
+    let top = top.max(0).min((state.shot.height - height).max(0));
+
+    // 面板：浅色圆角底 + 细边框
+    let panel = 0x00F7_F8FA;
+    let border = 0x00D8_DCE0;
+    let brush = CreateSolidBrush(panel);
+    let pen = CreatePen(0, 1, border);
+    let old_brush = SelectObject(dc, brush as HGDIOBJ);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    windows_sys::Win32::Graphics::Gdi::RoundRect(
+        dc,
+        left,
+        top,
+        left + width,
+        top + height,
+        s(8.0),
+        s(8.0),
+    );
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(brush as *mut _);
+    DeleteObject(pen as *mut _);
+
+    let half = cells / 2;
+    let mut sample = vec![0u8; (cells * cells * 4) as usize];
+    for row in 0..cells {
+        for col in 0..cells {
+            let sx = (cx - half + col).clamp(0, state.shot.width - 1);
+            let sy = (cy - half + row).clamp(0, state.shot.height - 1);
+            let src = ((sy * state.shot.width + sx) as usize) * 4;
+            let dst = ((row * cells + col) as usize) * 4;
+            sample[dst..dst + 4].copy_from_slice(&state.shot.pixels[src..src + 4]);
+        }
+    }
+
+    let screen = GetDC(std::ptr::null_mut());
+    let memory = CreateCompatibleDC(screen);
+    let old_bitmap = SelectObject(
+        memory,
+        CreateBitmap(cells, cells, 1, 32, sample.as_ptr() as *const _) as HGDIOBJ,
+    );
+    let saved = SaveDC(dc);
+    IntersectClipRect(dc, left + pad, top + pad, left + pad + grid, top + pad + grid);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchBlt(
+        dc,
+        left + pad,
+        top + pad,
+        grid,
+        grid,
+        memory,
+        0,
+        0,
+        cells,
+        cells,
+        SRCCOPY,
+    );
+    RestoreDC(dc, saved);
+    let bitmap = SelectObject(memory, old_bitmap);
+    DeleteObject(bitmap as *mut _);
+    DeleteDC(memory);
+    ReleaseDC(std::ptr::null_mut(), screen);
+
+    // 网格线
+    let grid_pen = CreatePen(0, 1, 0x00C8_CDD2);
+    let old = SelectObject(dc, grid_pen as HGDIOBJ);
+    for index in 1..cells {
+        let x = left + pad + index * zoom;
+        MoveToEx(dc, x, top + pad, std::ptr::null_mut());
+        LineTo(dc, x, top + pad + grid);
+        let y = top + pad + index * zoom;
+        MoveToEx(dc, left + pad, y, std::ptr::null_mut());
+        LineTo(dc, left + pad + grid, y);
+    }
+    SelectObject(dc, old);
+    DeleteObject(grid_pen as *mut _);
+
+    // 中心像素：套一个白框，一眼看出取的是哪个点
+    let center = CreatePen(0, s(1.6).max(1), 0x00FF_FFFF);
+    let old = SelectObject(dc, center as HGDIOBJ);
+    let box_left = left + pad + half * zoom;
+    let box_top = top + pad + half * zoom;
+    MoveToEx(dc, box_left, box_top, std::ptr::null_mut());
+    LineTo(dc, box_left + zoom, box_top);
+    LineTo(dc, box_left + zoom, box_top + zoom);
+    LineTo(dc, box_left, box_top + zoom);
+    LineTo(dc, box_left, box_top);
+    SelectObject(dc, old);
+    DeleteObject(center as *mut _);
+
+    // 下面写坐标 / 色值
+    let index = ((cy * state.shot.width + cx) as usize) * 4;
+    let pixel = &state.shot.pixels[index..index + 3];
+    let hex = format!("#{:02X}{:02X}{:02X}", pixel[2], pixel[1], pixel[0]);
+    let screen_x = state.origin.0 + cx;
+    let screen_y = state.origin.1 + cy;
+
+    SetBkMode(dc, TRANSPARENT as i32);
+    SetTextColor(dc, 0x0030_3438);
+    let font = cached_font(9.0, 400);
+    let old_font = SelectObject(dc, font as HGDIOBJ);
+    let line = s(22.0);
+    let mut text_top = top + pad + grid + s(6.0);
+
+    for (label, value) in [
+        ("坐标", format!("{screen_x}, {screen_y}")),
+        ("色值", hex.clone()),
+    ] {
+        let mut rect = RECT {
+            left: left + s(10.0),
+            top: text_top,
+            right: left + width - s(10.0),
+            bottom: text_top + line,
+        };
+        DrawTextW(
+            dc,
+            wide(label).as_ptr(),
+            -1,
+            &mut rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        let mut value_rect = RECT {
+            left: left + s(52.0),
+            ..rect
+        };
+        DrawTextW(
+            dc,
+            wide(&value).as_ptr(),
+            -1,
+            &mut value_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        text_top += line;
+    }
+
+    SetTextColor(dc, 0x0080_868C);
+    let small = cached_font(8.5, 400);
+    SelectObject(dc, small as HGDIOBJ);
+    let mut hint = RECT {
+        left: left + s(10.0),
+        top: text_top,
+        right: left + width - s(10.0),
+        bottom: text_top + line,
+    };
+    DrawTextW(
+        dc,
+        wide("按 Ctrl+C 复制色值").as_ptr(),
+        -1,
+        &mut hint,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+    );
+    SelectObject(dc, old_font);
+}
+
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -747,10 +937,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 } else {
-                    // 没按下：跟着鼠标换高亮窗口
+                    // 没按下：跟着鼠标换高亮窗口，同时让放大镜跟着走
                     let hover = window_rect_under(point)
                         .and_then(|rect| shot_rect(rect, state.origin, state.shot.width, state.shot.height));
-                    if rect_key(hover) != rect_key(state.hover) {
+                    let moved = state.cursor.x != current.x || state.cursor.y != current.y;
+                    state.cursor = current;
+                    if rect_key(hover) != rect_key(state.hover) || moved {
                         state.hover = hover;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
@@ -805,6 +997,27 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 // Esc / 右键 = 取消
                 0x1B => {
                     DestroyWindow(hwnd);
+                }
+                // Ctrl+C = 复制放大镜中心那一点的色值
+                0x43 => {
+                    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Overlay;
+                    if !state.is_null() && GetKeyState(0x11) < 0 {
+                        let state = &*state;
+                        let (cx, cy) = (state.cursor.x, state.cursor.y);
+                        if cx >= 0
+                            && cy >= 0
+                            && cx < state.shot.width
+                            && cy < state.shot.height
+                        {
+                            let index = ((cy * state.shot.width + cx) as usize) * 4;
+                            let pixel = &state.shot.pixels[index..index + 3];
+                            let hex = format!(
+                                "#{:02X}{:02X}{:02X}",
+                                pixel[2], pixel[1], pixel[0]
+                            );
+                            crate::ocr::copy_text(&hex);
+                        }
+                    }
                 }
                 // Enter = 用当前选区
                 0x0D => {
@@ -905,6 +1118,7 @@ pub unsafe fn begin(panel: HWND) {
         canvas: None,
         last_rect: None,
         last_label: None,
+        cursor: POINT { x: vw / 2, y: vh / 2 },
     }));
 
     let hwnd = CreateWindowExW(
@@ -1461,6 +1675,24 @@ unsafe fn editor_paint(hwnd: HWND) {
             (editor.base.height as f32 * editor.scale) as i32,
         );
     }
+
+    // 上下两条工具栏始终铺自己的底色：图片贴到窗口边上时不会从按钮缝里透出来
+    let band = CreateSolidBrush(crate::theme::ui().bg);
+    let top_band = RECT {
+        left: 0,
+        top: 0,
+        right: client.right,
+        bottom: toolbar,
+    };
+    let bottom_band = RECT {
+        left: 0,
+        top: (client.bottom - s(24.0) - toolbar).max(0),
+        right: client.right,
+        bottom: (client.bottom - s(24.0)).max(0),
+    };
+    FillRect(dc, &top_band, band);
+    FillRect(dc, &bottom_band, band);
+    DeleteObject(band as *mut _);
 
     // 图形都在「图片坐标系」里，这里把视口原点挪到图片左上角
     let mut old_origin = POINT { x: 0, y: 0 };
@@ -2684,8 +2916,11 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let image_top = toolbar;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1 - toolbar;
+    let mut image_top = image_top;
     if window_y < work.top {
+        // 上方没地方放工具栏：图片贴住原位，工具栏压在图片顶上（那条有自己的底色）
         window_y = rect.1;
+        image_top = 0;
     }
     if window_x + client_w > work.right {
         window_x = (work.right - client_w).max(work.left);
