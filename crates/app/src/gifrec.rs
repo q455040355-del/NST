@@ -47,6 +47,8 @@ const BAR_W: i32 = 120;
 const BAR_H: i32 = 34;
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
+/// 操作条窗口（停止时先收起来）
+static BAR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// 0 = 还在录，1 = 结束并复制到剪贴板，2 = 结束并另存为
 static STOP_MODE: AtomicU8 = AtomicU8::new(0);
 /// 鼠标悬停在操作条左半（0）还是右半（1）；9 = 没有悬停
@@ -65,6 +67,13 @@ pub fn stop() {
 pub fn stop_with(mode: u8) {
     if is_recording() && STOP_MODE.load(Ordering::SeqCst) == 0 {
         STOP_MODE.store(mode, Ordering::SeqCst);
+        // 先收起操作条：编码要一两秒，不给反馈会像卡死
+        let bar = BAR.load(Ordering::SeqCst) as HWND;
+        if !bar.is_null() {
+            unsafe {
+                ShowWindow(bar, SW_HIDE);
+            }
+        }
     }
 }
 
@@ -170,6 +179,7 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
         std::ptr::null(),
     );
 
+    BAR.store(button as usize, Ordering::SeqCst);
     let panel = panel as usize;
     let border_raw = border as usize;
     let button_raw = button as usize;
@@ -253,8 +263,8 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     let height = BAR_H;
 
     // 卡片底色 + 细边框（不用 UpdateLayeredWindow，圆角用 RoundRect 画）
-    let bg = CreateSolidBrush(0x00FF_FFFF);
-    let border = CreatePen(0, 1, 0x00D8_DCE0);
+    let bg = CreateSolidBrush(0x0022_262B);
+    let border = CreatePen(0, 1, 0x0033_383E);
     let old_brush = SelectObject(dc, bg as HGDIOBJ);
     let old_pen = SelectObject(dc, border as HGDIOBJ);
     RoundRect(dc, 0, 0, width, height, s_round(), s_round());
@@ -263,9 +273,24 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     DeleteObject(border as *mut _);
     DeleteObject(bg as *mut _);
 
+    // 指向选区的小三角（工具条压在选区上方时朝下）
+    {
+        let tri = CreateSolidBrush(0x0022_262B);
+        let old = SelectObject(dc, tri as HGDIOBJ);
+        let center = width / 2;
+        let mut points = [
+            POINT { x: center - 6, y: height - 7 },
+            POINT { x: center + 6, y: height - 7 },
+            POINT { x: center, y: height - 1 },
+        ];
+        windows_sys::Win32::Graphics::Gdi::Polygon(dc, points.as_mut_ptr(), 3);
+        SelectObject(dc, old);
+        DeleteObject(tri as *mut _);
+    }
+
     // 两半分隔线
     let half = width / 2;
-    let divider = CreatePen(0, 1, 0x00E4_E8EC);
+    let divider = CreatePen(0, 1, 0x0040_464D);
     let old = SelectObject(dc, divider as HGDIOBJ);
     MoveToEx(dc, half, 8, std::ptr::null_mut());
     LineTo(dc, half, height - 8);
@@ -276,8 +301,8 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     if hover == 0 || hover == 1 {
         let left = if hover == 0 { 2 } else { half + 1 };
         let right = if hover == 0 { half - 1 } else { width - 2 };
-        let hot = CreateSolidBrush(0x00EE_F2F6);
-        let pen = CreatePen(0, 1, 0x00EE_F2F6);
+        let hot = CreateSolidBrush(0x0038_3F46);
+        let pen = CreatePen(0, 1, 0x0038_3F46);
         let ob = SelectObject(dc, hot as HGDIOBJ);
         let op = SelectObject(dc, pen as HGDIOBJ);
         RoundRect(dc, left, 2, right, height - 2, 8, 8);
@@ -309,7 +334,7 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
 
     for (index, label) in ["保存", "结束"].into_iter().enumerate() {
         let _ = index;
-        SetTextColor(dc, 0x0030_3438);
+        SetTextColor(dc, 0x00F0_F3F6);
         let mut rect = RECT {
             left: index as i32 * half,
             top: 0,
@@ -846,6 +871,7 @@ fn finish(border: HWND, button: HWND) {
         }
     }
     RECORDING.store(false, Ordering::SeqCst);
+    BAR.store(0, Ordering::SeqCst);
     STOP_MODE.store(0, Ordering::SeqCst);
 }
 

@@ -1,0 +1,5 @@
+// 操作条（D 方案）：深色半透明感的小工具条 + 白色线框图标 + 指向选区的小三角
+const BAR_W: i32 = 76;
+const BAR_H: i32 = 34;
+/// 正在编码：操作条改成「生成中…」，别让用户以为卡死了
+static ENCODING: AtomicBool = AtomicBool::new(false);
