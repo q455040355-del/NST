@@ -13,7 +13,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
@@ -534,6 +536,21 @@ unsafe extern "system" fn find_window_under(hwnd: HWND, lparam: LPARAM) -> i32 {
     };
     if GetWindowRect(hwnd, &mut rect) == 0 {
         return 1;
+    }
+
+    // 窗口的实际可见边界（不含那圈看不见的拖拽边框）：
+    // 最大化窗口的 GetWindowRect 会往外多出十几像素，直接用会截偏、还会被屏幕裁掉一截
+    let mut frame: RECT = std::mem::zeroed();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+        &mut frame as *mut RECT as *mut c_void,
+        std::mem::size_of::<RECT>() as u32,
+    ) == 0
+        && frame.right - frame.left >= 16
+        && frame.bottom - frame.top >= 16
+    {
+        rect = frame;
     }
 
     if query.point.x < rect.left
@@ -1873,31 +1890,60 @@ unsafe fn editor_paint(hwnd: HWND) {
         right: close.left - s(4.0),
         bottom: close.bottom,
     };
-    // 「置顶」小图钉：默认关（不进前），开着才盖住别的窗口
+    // 「置顶」开关：画成一个小胶囊，开着是蓝底白字，关着是灰底灰字
     let topmost = RECT {
-        left: minimize.left - s(4.0) - control,
+        left: minimize.left - s(6.0) - s(46.0),
         top: close.top,
-        right: minimize.left - s(4.0),
+        right: minimize.left - s(6.0),
         bottom: close.bottom,
     };
-    if editor.topmost {
-        let on = CreateSolidBrush(crate::theme::ui().accent);
-        let old = SelectObject(dc, on as HGDIOBJ);
-        let pen = CreatePen(0, 1, crate::theme::ui().accent);
+    {
+        let (fill, border, text_color) = if editor.topmost {
+            (
+                crate::theme::ui().accent,
+                crate::theme::ui().accent,
+                crate::theme::ui().bg,
+            )
+        } else {
+            let chip = crate::theme::ui().chip;
+            (chip, chip, crate::theme::ui().text3)
+        };
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(0, 1, border);
+        let old = SelectObject(dc, brush as HGDIOBJ);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         windows_sys::Win32::Graphics::Gdi::RoundRect(
             dc,
             topmost.left,
-            topmost.top,
+            topmost.top + s(2.0),
             topmost.right,
-            topmost.bottom,
-            s(7.0),
-            s(7.0),
+            topmost.bottom - s(2.0),
+            s(11.0),
+            s(11.0),
         );
         SelectObject(dc, old_pen);
         SelectObject(dc, old);
         DeleteObject(pen as *mut _);
-        DeleteObject(on as *mut _);
+        DeleteObject(brush as *mut _);
+
+        let font = cached_font(8.5, 500);
+        let old_font = SelectObject(dc, font as HGDIOBJ);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, text_color);
+        let mut rect = RECT {
+            left: topmost.left,
+            top: topmost.top,
+            right: topmost.right,
+            bottom: topmost.bottom,
+        };
+        DrawTextW(
+            dc,
+            wide(if editor.topmost { "置顶" } else { "不置顶" }).as_ptr(),
+            -1,
+            &mut rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_font);
     }
 
     let icon_color = crate::theme::ui().text2;
@@ -1920,15 +1966,8 @@ unsafe fn editor_paint(hwnd: HWND) {
     MoveToEx(dc, cx - arm, cy + arm, std::ptr::null_mut());
     LineTo(dc, cx + arm, cy - arm);
 
-    // 图钉：一根针 + 底座，表示「置顶」
-    let tx = (topmost.left + topmost.right) / 2;
-    let ty = (topmost.top + topmost.bottom) / 2;
-    MoveToEx(dc, tx, ty - s(6.0), std::ptr::null_mut());
-    LineTo(dc, tx, ty + s(2.0));
-    MoveToEx(dc, tx - s(3.0), ty - s(3.0), std::ptr::null_mut());
-    LineTo(dc, tx + s(3.0), ty - s(3.0));
-    MoveToEx(dc, tx - s(2.0), ty + s(4.0), std::ptr::null_mut());
-    LineTo(dc, tx + s(2.0), ty + s(4.0));
+    // 图钉那格改成文字胶囊了，这里不再画图标
+    let _ = &topmost;
 
     SelectObject(dc, old_pen);
     DeleteObject(pen as *mut _);
@@ -2539,6 +2578,14 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let editor = &mut *editor;
             editor.topmost = !editor.topmost;
             let insert = if editor.topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            // 置顶要盖过任务栏：先补上 WS_EX_TOPMOST，再插到 topmost 组的最前面
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let style = if editor.topmost {
+                style | WS_EX_TOPMOST
+            } else {
+                style & !WS_EX_TOPMOST
+            };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
             SetWindowPos(hwnd, insert, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             SetWindowTextW(
                 hwnd,

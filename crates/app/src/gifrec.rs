@@ -75,6 +75,7 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
         return;
     }
     STOP_MODE.store(0, Ordering::SeqCst);
+    crate::debug_log(&format!("rec start: {x},{y} {w}x{h} fps={fps}"));
     BAR_HOVER.store(9, Ordering::SeqCst);
 
 
@@ -727,6 +728,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 
     let mode = STOP_MODE.load(Ordering::SeqCst);
     let bytes = encode_webp(width, height, &shots, delay_ms);
+    crate::debug_log(&format!("rec done: frames={} bytes={} size={width}x{height}", shots.len(), bytes.len()));
     finish(border, button);
 
     if bytes.is_empty() {
