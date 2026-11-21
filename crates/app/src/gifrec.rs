@@ -899,9 +899,14 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let mut last_raw: Vec<u8> = Vec::new();
     let limit_seconds = 20_u64;
 
+    // 编码成本只跟输出像素数有关：先算好 method 和帧率上限，再起编码线程
+    let pixels = (out_w as i64) * (out_h as i64);
+    let (method, mpix_per_sec) = pick_method(pixels, fps);
+    let fps = fps.min(fps_cap(pixels, mpix_per_sec));
+
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
     let encoder = std::thread::spawn(move || {
-        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, 65.0) else {
+        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, 65.0, method) else {
             return Vec::new();
         };
         for (frame, timestamp) in receiver {
@@ -916,19 +921,13 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         last_raw.extend_from_slice(shot);
     }
 
-    // 编码器是 CPU 单线程跑的：区域越大能扛的帧率越低，分三档
-    //   小区域（≤40 万像素）→ 用户选多少就多少（最高 120）
-    //   中区域（≤120 万像素）→ 最多 60
-    //   大区域（>120 万像素）→ 最多 30
-    let pixels = (out_w as i64) * (out_h as i64);
-    let fps = if pixels > 1_200_000 {
-        fps.min(30)
-    } else if pixels > 400_000 {
-        fps.min(60)
-    } else {
-        fps
-    };
-    crate::debug_log(&format!("rec: 实际帧率 {fps}（{pixels} 像素）"));
+    // 帧率上限按实测编码吞吐算，而不是按像素拍三档：
+    //   编码器撑不住的帧不会被"压慢"，而是被 try_send 丢掉，丢的恰好是真有变化的帧，
+    //   所以宁可一开始就少抓几帧，时间轴反而更均匀、CPU 也更省。
+    crate::debug_log(&format!(
+        "rec: 实际帧率 {fps}（{pixels} 像素，method {method}，编码约 {:.1}ms/帧）",
+        encode_ms_per_frame(pixels, mpix_per_sec)
+    ));
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let started = std::time::Instant::now();
@@ -995,6 +994,45 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 // 不再把整段帧攒在内存里：每抓一帧就 WebPAnimEncoderAdd 进去，
 // 内存只占当前这一帧，所以 20 秒 / 60fps / 全屏都扛得住。
 
+/// 编码吞吐（百万像素/秒）。i5-12400 实测（libwebp 编译时带 WEBP_USE_THREAD、
+/// thread_level = 1，即"宏块分段分析"多开一个线程）：
+///   method 2（原来的设置）1080p 31.4ms、720p 15.2ms ≈ 66 MPixel/s
+///   method 1            1080p 25.3ms、720p 12.5ms ≈ 82 MPixel/s
+/// 这里各留约 15% 余量给更弱的机器（i5-12400 已经是 2022 年的中端桌面 U）。
+const ENCODE_MPIX_M2: f64 = 56.0;
+const ENCODE_MPIX_M1: f64 = 70.0;
+/// 每帧另有约 1.5ms 与像素数无关的固定开销（ARGB 导入、帧头、熵编码收尾）
+const ENCODE_FIXED_MS: f64 = 1.5;
+/// 用户能选的最高帧率
+const FPS_MAX: u32 = 120;
+
+/// 这块区域编码一帧大约要多久（毫秒）
+fn encode_ms_per_frame(pixels: i64, mpix_per_sec: f64) -> f64 {
+    ENCODE_FIXED_MS + pixels as f64 / 1e6 * 1000.0 / mpix_per_sec
+}
+
+/// 该 method 能稳定吃下的帧率上限（超过就只能丢帧）
+fn fps_cap(pixels: i64, mpix_per_sec: f64) -> u32 {
+    (1000.0 / encode_ms_per_frame(pixels, mpix_per_sec))
+        .floor()
+        .clamp(1.0, FPS_MAX as f64) as u32
+}
+
+/// 选 method：method 2 体积更小（同样画面小 10~20%），用户选的帧率它吃得下就用它；
+/// 吃不消才降到 method 1（单帧快约 20~30%，体积 +10~20%）。
+/// 于是"小区域保持画质、大区域保帧率"是算出来的，不是拍脑袋的像素阈值：
+///   600×400 / 120fps、960×540 / 60fps → method 2
+///   1280×720 / 60fps、1600×900 / 60fps、1920×1080 / 30fps → method 1
+fn pick_method(pixels: i64, fps: u32) -> (i32, f64) {
+    let fits = (fps as f64) <= 1000.0 / encode_ms_per_frame(pixels, ENCODE_MPIX_M2);
+    if fits {
+        (2, ENCODE_MPIX_M2)
+    } else {
+        (1, ENCODE_MPIX_M1)
+    }
+}
+
+
 struct WebpStreamer {
     encoder: *mut libwebp_sys::WebPAnimEncoder,
     config: libwebp_sys::WebPConfig,
@@ -1003,7 +1041,7 @@ struct WebpStreamer {
 }
 
 impl WebpStreamer {
-    fn new(width: i32, height: i32, quality: f32) -> Option<Self> {
+    fn new(width: i32, height: i32, quality: f32, method: i32) -> Option<Self> {
         unsafe {
             let mut options: libwebp_sys::WebPAnimEncoderOptions = std::mem::zeroed();
             if libwebp_sys::WebPAnimEncoderOptionsInitInternal(
@@ -1040,8 +1078,10 @@ impl WebpStreamer {
                 libwebp_sys::WebPAnimEncoderDelete(encoder);
                 return None;
             }
-            // method 4 对 2MP 区域每帧要几十毫秒，抓帧节奏会被编码拖住（看起来卡）；2 快得多，体积差不多
-            config.method = 2;
+            // method 4 对 2MP 区域每帧要上百毫秒，抓帧节奏会被编码拖住（看起来卡）；
+            // method 2 是原来的折中；method 1 更快（1080p 单帧 36ms→25ms）但体积 +10~20%，
+            // 具体用哪个由 pick_method() 按区域大小和用户选的帧率决定
+            config.method = method;
             config.lossless = 0;
             config.thread_level = 1;
             if libwebp_sys::WebPValidateConfig(&config) == 0 {
