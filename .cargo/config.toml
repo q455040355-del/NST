@@ -1,0 +1,16 @@
+# libwebp 运行时多线程开关（配合 gifrec.rs 里的 config.thread_level = 1）。
+#
+# libwebp-sys 0.9 没有为 WEBP_USE_THREAD 提供 cargo feature，只能通过给 C 编译器
+# 加宏来激活；cc crate 会读取 CFLAGS 并透传给 cl.exe / clang。
+# 不定义这个宏时，libwebp 里的 WebPGetWorkerInterface() 退回假 worker，
+# thread_level 是空操作，编码严格单线程。
+#
+# 实测（i5-12400，1080p，q=65，8 次取最好）：
+#   method 2  单线程 36.0ms → 双线程 31.4ms（+15%）
+#   method 1  单线程 27.2ms → 双线程 25.3ms（+7%）
+# 只在"宏块分段分析"阶段多开 1 个线程（libwebp 的 MT 上限就是 2 线程）。
+#
+# 回滚：删掉本文件（或把 force 改成 false 并清掉环境里的 CFLAGS），
+# 然后 `cargo clean -p libwebp-sys`，编码就回到单线程。
+[env]
+CFLAGS = { value = "-DWEBP_USE_THREAD", force = true }
