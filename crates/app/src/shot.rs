@@ -1939,7 +1939,10 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         let color = if active {
             ui.bg
         } else if matches!(action, Action::Done) {
-            ui.accent
+            // 微信的「完成」是绿的 #07C160、取消是红的 #FA5151（这里存的是 BGR）
+            0x0060_C107
+        } else if matches!(action, Action::Close) {
+            0x0051_51FA
         } else {
             ui.text2
         };
@@ -2157,20 +2160,23 @@ unsafe fn icon_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, width: i32, col
     DeleteObject(pen as *mut _);
 }
 
-/// 小工具：画一个实心多边形
-unsafe fn icon_fill(dc: HDC, points: &[POINT], color: u32) {
-    let brush = CreateSolidBrush(color);
-    let pen = CreatePen(0, 1, color);
-    let old_brush = SelectObject(dc, brush as HGDIOBJ);
-    let old_pen = SelectObject(dc, pen as HGDIOBJ);
-    Polygon(dc, points.as_ptr(), points.len() as i32);
-    SelectObject(dc, old_pen);
-    SelectObject(dc, old_brush);
+/// 小工具：画一串折线（不闭合）
+unsafe fn icon_polyline(dc: HDC, points: &[POINT], width: i32, color: u32, close: bool) {
+    let pen = CreatePen(0, width.max(1), color);
+    let old = SelectObject(dc, pen as HGDIOBJ);
+    Polyline(dc, points.as_ptr(), points.len() as i32);
+    if close {
+        // GDI 的 Polyline 不闭合，补最后一笔
+        let first = points[0];
+        let last = points[points.len() - 1];
+        MoveToEx(dc, last.x, last.y, std::ptr::null_mut());
+        LineTo(dc, first.x, first.y);
+    }
+    SelectObject(dc, old);
     DeleteObject(pen as *mut _);
-    DeleteObject(brush as *mut _);
 }
 
-/// 小工具：描一个空心形状（矩形 / 圆 / 圆角矩形），用完恢复 NULL_BRUSH
+/// 小工具：描一个圆角矩形 / 圆（空心，细线）
 unsafe fn icon_outline(
     dc: HDC,
     kind: u8,
@@ -2198,8 +2204,8 @@ unsafe fn icon_outline(
                 top,
                 right,
                 bottom,
-                s(3.0),
-                s(3.0),
+                s(4.0),
+                s(4.0),
             );
         }
     }
@@ -2208,7 +2214,20 @@ unsafe fn icon_outline(
     DeleteObject(pen as *mut _);
 }
 
-/// 工具栏按钮的图标：照微信那套形状画（圆角矩形 / 实心箭头 / 扫描框 A / 图钉…）
+/// 小工具：实心小方块（只给马赛克的格子用）
+unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
+    let brush = CreateSolidBrush(color);
+    let pen = CreatePen(0, 1, color);
+    let old_brush = SelectObject(dc, brush as HGDIOBJ);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    windows_sys::Win32::Graphics::Gdi::Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(pen as *mut _);
+    DeleteObject(brush as *mut _);
+}
+
+/// 工具栏按钮的图标：照微信那套画法——**细描边、不填充、该包框的包框**
 fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8) {
     unsafe {
         let w = rect.right - rect.left;
@@ -2216,121 +2235,88 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
         let cx = (rect.left + rect.right) / 2;
         let cy = (rect.top + rect.bottom) / 2;
         let r = (w.min(h) as f32 * 0.30).round().max(3.0) as i32;
-        let thin = s(1.5).max(1);
+        let pen = s(1.4).max(1); // 微信那套是 1.5px 细线
         let rx = cx - r;
-        let ry = cy - (r as f32 * 0.84) as i32;
+        let ry = cy - r;
         let bx = cx + r;
-        let by = cy + (r as f32 * 0.84) as i32;
+        let by = cy + r;
 
         match action {
-            // 微信的矩形是圆角的，比正方的柔和
-            Action::Tool(Tool::Rect) => icon_outline(dc, 2, rx, ry, bx, by, thin, color),
-            // 圆形是正圆，不跟着矩形的扁度走
-            Action::Tool(Tool::Ellipse) => icon_outline(dc, 1, cx - r, cy - r, cx + r, cy + r, thin, color),
+            // ▢ 圆角矩形
+            Action::Tool(Tool::Rect) => icon_outline(dc, 2, rx, ry, bx, by, pen, color),
+            // ◯ 正圆
+            Action::Tool(Tool::Ellipse) => icon_outline(dc, 1, rx, ry, bx, by, pen, color),
+            // ↗ 斜线 + 开口的 V 形箭头（微信不是实心箭头）
             Action::Tool(Tool::Arrow) => {
-                // 一根斜杆 + 实心三角箭头（微信是实心箭头，不是两条边）
-                let (ax, ay) = (cx - r, cy + r - s(1.0));
-                let (tx, ty) = (cx + r, cy - r + s(1.0));
-                let h = s(8.0);
-                icon_line(dc, ax, ay, tx - h / 2, ty + h / 2, thin + 1, color);
-                let head = [
-                    POINT { x: tx, y: ty },
-                    POINT { x: tx - h, y: ty + h / 4 },
-                    POINT { x: tx - h / 4, y: ty + h },
-                ];
-                icon_fill(dc, &head, color);
+                let (ax, ay) = (cx - r, cy + r);
+                let (tx, ty) = (cx + r, cy - r);
+                icon_line(dc, ax, ay, tx - s(1.0), ty + s(1.0), pen, color);
+                let arm = s(7.0);
+                icon_line(dc, tx, ty, tx - arm, ty + s(1.0), pen, color);
+                icon_line(dc, tx, ty, tx - s(1.0), ty + arm, pen, color);
             }
+            // ✎ 空心铅笔：笔杆 + 笔尖
             Action::Tool(Tool::Pen) => {
-                // 斜着的笔：笔杆稍粗 + 左下实心笔尖
-                icon_line(
-                    dc,
-                    cx - r + s(4.0),
-                    cy + r - s(4.0),
-                    cx + r - s(1.0),
-                    cy - r + s(1.0),
-                    thin + 2,
-                    color,
-                );
-                let nib = [
-                    POINT { x: cx - r, y: cy + r },
-                    POINT { x: cx - r + s(2.0), y: cy + r - s(8.0) },
-                    POINT { x: cx - r + s(8.0), y: cy + r - s(2.0) },
+                // 45° 笔杆的「垂直方向」也是 45°，所以两个角点各自 ±(hx, hx)
+                let hx = s(2.6);
+                let (x1, y1) = (cx - r + s(3.0), cy + r - s(3.0)); // 笔尖
+                let (x2, y2) = (cx + r - s(3.0), cy - r + s(3.0)); // 笔尾
+                let body = [
+                    POINT { x: x1, y: y1 },
+                    POINT { x: x1 + hx, y: y1 + hx },
+                    POINT { x: x2 + hx, y: y2 + hx },
+                    POINT { x: x2 - hx, y: y2 - hx },
+                    POINT { x: x1 - hx, y: y1 - hx },
                 ];
-                icon_fill(dc, &nib, color);
+                icon_polyline(dc, &body, pen, color, true);
+                // 笔尖那道分界线
+                icon_line(dc, x1 + hx, y1 + hx, x1 - hx, y1 - hx, pen, color);
             }
+            // ▦ 方框里一个棋盘（微信就是框 + 格子）
             Action::Tool(Tool::Mosaic) => {
-                // 3×3 棋盘：实心格和空格交错，格之间留 1px 缝（微信那种细格）
-                let cell = ((r * 2) as f32 / 3.0).round().max(3.0) as i32;
-                let gap = s(1.0).max(1);
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                let inset = s(3.0);
+                let cell = ((r * 2 - inset * 2) as f32 / 3.0).max(2.0);
+                let cell = cell.round() as i32;
                 for gy in 0..3 {
                     for gx in 0..3 {
-                        let l = cx - r + gx * cell;
-                        let t = cy - r + gy * cell;
-                        let (l, t) = (l + gap / 2, t + gap / 2);
-                        let (rgt, btm) = (l + cell - gap, t + cell - gap);
-                        if (gx + gy) % 2 == 0 {
-                            let brush = CreateSolidBrush(color);
-                            let pen = CreatePen(0, 1, color);
-                            let old_brush = SelectObject(dc, brush as HGDIOBJ);
-                            let old_pen = SelectObject(dc, pen as HGDIOBJ);
-                            windows_sys::Win32::Graphics::Gdi::Rectangle(dc, l, t, rgt, btm);
-                            SelectObject(dc, old_pen);
-                            SelectObject(dc, old_brush);
-                            DeleteObject(pen as *mut _);
-                            DeleteObject(brush as *mut _);
-                        } else {
-                            icon_outline(dc, 0, l, t, rgt, btm, 1, color);
+                        if (gx + gy) % 2 != 0 {
+                            continue;
                         }
+                        let l = cx - r + inset + gx * cell;
+                        let t = cy - r + inset + gy * cell;
+                        icon_dot(dc, l, t, l + cell - s(1.0), t + cell - s(1.0), color);
                     }
                 }
             }
+            // T（外面一个方框，和微信一致）
             Action::Tool(Tool::Text) => {
-                // T：一横一竖，用线画（比字体在小尺寸下更锐利）
-                let bar = (r as f32 * 0.72) as i32;
-                icon_line(dc, cx - r, cy - bar, cx + r, cy - bar, thin + 1, color);
-                icon_line(dc, cx, cy - bar, cx, cy + r, thin + 1, color);
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                let bar = (r as f32 * 0.45) as i32;
+                icon_line(dc, cx - bar, cy - bar, cx + bar, cy - bar, pen, color);
+                icon_line(dc, cx, cy - bar, cx, cy + bar, pen, color);
             }
+            // Ⓐ 方框里一个 A（取字）
             Action::Tool(Tool::Ocr) => {
-                // 「A」+ 四个角的扫描框（微信取字是这种角标，不是一个整框）
-                let arm = (r as f32 * 0.55) as i32;
-                for (sx, sy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
-                    let x = cx + sx * r;
-                    let y = cy + sy * ((r as f32 * 0.9) as i32);
-                    icon_line(dc, x, y, x - sx * arm, y, thin, color);
-                    icon_line(dc, x, y, x, y - sy * arm, thin, color);
-                }
-                draw_glyph(dc, "A", rect, color);
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                draw_glyph_sized(dc, "A", rect, color, 8.0);
             }
+            // ≡ 三条粗细递增的线 + 当前档小圆点（微信没有，保持细线风格）
             Action::Stroke => {
-                // 三条粗细递增的线 + 当前档小圆点
                 let current = stroke.min(2) as usize;
                 for (i, level) in [1i32, 2, 3].iter().enumerate() {
                     let ly = cy - s(6.0) + i as i32 * s(6.0);
-                    icon_line(dc, cx - r, ly, cx + r - s(3.0), ly, (*level * s(1.0)).max(1), color);
+                    icon_line(dc, cx - r, ly, cx + r - s(4.0), ly, (*level * s(1.0)).max(1), color);
                     if i == current {
-                        let dot = s(1.8).max(1);
-                        let brush = CreateSolidBrush(color);
-                        let old = SelectObject(dc, brush as HGDIOBJ);
-                        let pen = CreatePen(0, 1, color);
-                        let old_pen = SelectObject(dc, pen as HGDIOBJ);
-                        windows_sys::Win32::Graphics::Gdi::Ellipse(
-                            dc,
-                            cx + r - dot,
-                            ly - dot,
-                            cx + r + dot,
-                            ly + dot,
-                        );
-                        SelectObject(dc, old_pen);
-                        SelectObject(dc, old);
-                        DeleteObject(pen as *mut _);
-                        DeleteObject(brush as *mut _);
+                        let dot = s(1.6).max(1);
+                        icon_dot(dc, cx + r - dot, ly - dot, cx + r + dot, ly + dot, color);
                     }
                 }
             }
+            // ↶ 上半圈 + 开口箭头
             Action::Undo => {
-                // 上半圈 + 左端实心箭头（↺）
-                let pen = CreatePen(0, (thin + 1).max(2), color);
-                let old = SelectObject(dc, pen as HGDIOBJ);
+                let arc_pen = CreatePen(0, pen, color);
+                let old = SelectObject(dc, arc_pen as HGDIOBJ);
                 windows_sys::Win32::Graphics::Gdi::Arc(
                     dc,
                     cx - r,
@@ -2343,25 +2329,48 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                     cy,
                 );
                 SelectObject(dc, old);
-                DeleteObject(pen as *mut _);
-                let head = [
-                    POINT { x: cx - r - s(1.0), y: cy + s(6.0) },
-                    POINT { x: cx - r - s(5.0), y: cy - s(1.0) },
-                    POINT { x: cx - r + s(4.0), y: cy - s(1.0) },
-                ];
-                icon_fill(dc, &head, color);
+                DeleteObject(arc_pen as *mut _);
+                // 左端向下的开口箭头
+                let arm = s(5.0);
+                icon_line(dc, cx - r, cy, cx - r + s(1.0), cy - arm, pen, color);
+                icon_line(dc, cx - r, cy, cx - r - arm, cy - s(1.0), pen, color);
             }
+            // ⤓ 方框里一个向下的箭头（微信的下载/保存就是这样）
+            Action::Save => {
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                let tip = cy + s(4.0);
+                icon_line(dc, cx, cy - s(5.0), cx, tip, pen, color);
+                let arm = s(4.0);
+                icon_line(dc, cx, tip, cx - arm, tip - arm, pen, color);
+                icon_line(dc, cx, tip, cx + arm, tip - arm, pen, color);
+            }
+            // 📌 空心图钉：梯形头 + 针 + 底座
+            Action::Pin => {
+                let head_w = (r as f32 * 0.62) as i32;
+                let head_h = (r as f32 * 0.95) as i32;
+                let head = [
+                    POINT { x: cx - head_w, y: cy - r },
+                    POINT { x: cx + head_w, y: cy - r },
+                    POINT { x: cx + s(1.5), y: cy - r + head_h },
+                    POINT { x: cx - s(1.5), y: cy - r + head_h },
+                ];
+                icon_polyline(dc, &head, pen, color, true);
+                icon_line(dc, cx, cy - r + head_h, cx, cy + r, pen, color);
+                // 底座那一道横线（微信的图钉有）
+                let base = (r as f32 * 0.45) as i32;
+                icon_line(dc, cx - base, cy + r, cx + base, cy + r, pen, color);
+            }
+            // ⧉ 两张叠起来的方框（复制）
             Action::Copy => {
-                // 两张叠起来的圆角纸
                 let d = (r as f32 * 0.78) as i32;
                 icon_outline(
                     dc,
-                    if true { 2 } else { 2 },
+                    2,
                     cx - d,
                     cy - d + s(3.0),
                     cx + d - s(3.0),
                     cy + d,
-                    thin,
+                    pen,
                     color,
                 );
                 icon_outline(
@@ -2371,96 +2380,35 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                     cy - d,
                     cx + d,
                     cy + d - s(3.0),
-                    thin,
+                    pen,
                     color,
                 );
             }
-            Action::Save => {
-                // 向下箭头 + 底下的托盘（U 形）
-                let tip = cy + (r as f32 * 0.35) as i32;
-                icon_line(dc, cx, cy - r, cx, tip, thin + 1, color);
-                let head = [
-                    POINT { x: cx, y: tip + s(4.0) },
-                    POINT { x: cx - s(4.5), y: tip - s(2.0) },
-                    POINT { x: cx + s(4.5), y: tip - s(2.0) },
-                ];
-                icon_fill(dc, &head, color);
-                let tray = [
-                    POINT { x: cx - r, y: cy + (r as f32 * 0.35) as i32 },
-                    POINT { x: cx - r, y: cy + r },
-                    POINT { x: cx + r, y: cy + r },
-                    POINT { x: cx + r, y: cy + (r as f32 * 0.35) as i32 },
-                ];
-                let pen = CreatePen(0, thin, color);
-                let old = SelectObject(dc, pen as HGDIOBJ);
-                Polyline(dc, tray.as_ptr(), tray.len() as i32);
-                SelectObject(dc, old);
-                DeleteObject(pen as *mut _);
-            }
-            Action::Pin => {
-                // 图钉：实心圆头 + 梯形身子 + 针
-                let head_r = (r as f32 * 0.42) as i32;
-                let brush = CreateSolidBrush(color);
-                let pen = CreatePen(0, 1, color);
-                let old_brush = SelectObject(dc, brush as HGDIOBJ);
-                let old_pen = SelectObject(dc, pen as HGDIOBJ);
-                windows_sys::Win32::Graphics::Gdi::Ellipse(
-                    dc,
-                    cx - head_r,
-                    cy - r,
-                    cx + head_r,
-                    cy - r + head_r * 2,
-                );
-                SelectObject(dc, old_pen);
-                SelectObject(dc, old_brush);
-                DeleteObject(pen as *mut _);
-                DeleteObject(brush as *mut _);
-                let body = [
-                    POINT { x: cx - head_r + s(1.0), y: cy - r + head_r * 2 - s(1.0) },
-                    POINT { x: cx + head_r - s(1.0), y: cy - r + head_r * 2 - s(1.0) },
-                    POINT { x: cx + s(2.0), y: cy + s(3.0) },
-                    POINT { x: cx - s(2.0), y: cy + s(3.0) },
-                ];
-                icon_fill(dc, &body, color);
-                icon_line(dc, cx, cy + s(3.0), cx, cy + r, thin, color);
-            }
+            // 置顶：顶上一横 + 向上箭头（微信没有这个按钮，保持同一套画法）
             Action::Topmost => {
-                // 顶上一条横线 + 向上的箭头：这个窗口要钉在最上面
-                // （别画成「方框+箭头」，那和微信的转发图标撞脸）
-                icon_line(dc, cx - r, cy - r, cx + r, cy - r, thin + 1, color);
-                icon_line(dc, cx, cy + r, cx, cy - r + s(4.0), thin + 1, color);
-                let head = [
-                    POINT { x: cx, y: cy - r + s(1.0) },
-                    POINT { x: cx - s(4.0), y: cy - r + s(6.0) },
-                    POINT { x: cx + s(4.0), y: cy - r + s(6.0) },
-                ];
-                icon_fill(dc, &head, color);
+                icon_line(dc, cx - r, cy - r, cx + r, cy - r, pen, color);
+                icon_line(dc, cx, cy + r, cx, cy - r + s(3.0), pen, color);
+                let arm = s(4.0);
+                icon_line(dc, cx, cy - r + s(3.0), cx - arm, cy - r + s(3.0) + arm, pen, color);
+                icon_line(dc, cx, cy - r + s(3.0), cx + arm, cy - r + s(3.0) + arm, pen, color);
             }
-            Action::Minimize => icon_line(dc, cx - r, cy, cx + r, cy, thin + 1, color),
+            Action::Minimize => icon_line(dc, cx - r, cy, cx + r, cy, pen, color),
+            // × 微信是红的
             Action::Close => {
                 let arm = (r as f32 * 0.85) as i32;
-                icon_line(dc, cx - arm, cy - arm, cx + arm, cy + arm, thin + 1, color);
-                icon_line(dc, cx - arm, cy + arm, cx + arm, cy - arm, thin + 1, color);
+                icon_line(dc, cx - arm, cy - arm, cx + arm, cy + arm, pen + 1, color);
+                icon_line(dc, cx - arm, cy + arm, cx + arm, cy - arm, pen + 1, color);
             }
+            // ✓ 微信是绿的
             Action::Done => {
-                // 对勾：稍粗、带一点弧度
-                let arm = r;
-                icon_line(
-                    dc,
-                    cx - arm,
-                    cy,
-                    cx - s(2.0),
-                    cy + arm - s(2.0),
-                    (thin + 2).max(2),
-                    color,
-                );
+                icon_line(dc, cx - r, cy, cx - s(2.0), cy + r - s(2.0), pen + 2, color);
                 icon_line(
                     dc,
                     cx - s(2.0),
-                    cy + arm - s(2.0),
-                    cx + arm,
-                    cy - arm + s(1.0),
-                    (thin + 2).max(2),
+                    cy + r - s(2.0),
+                    cx + r,
+                    cy - r + s(1.0),
+                    pen + 2,
                     color,
                 );
             }
@@ -2469,15 +2417,14 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
     }
 }
 
-/// 画一个居中的字符（T / A 这种，直接借系统字体，不用自己拼笔画）
-fn draw_glyph(dc: HDC, text: &str, rect: RECT, color: u32) {
+/// 按指定字号画一个居中字符（T / A 用）
+fn draw_glyph_sized(dc: HDC, text: &str, rect: RECT, color: u32, points: f32) {
     unsafe {
-        let font = cached_font(11.0, 700);
+        let font = cached_font(points, 400);
         let old = SelectObject(dc, font as HGDIOBJ);
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, color);
         let mut target = rect;
-        target.top += 1;
         DrawTextW(
             dc,
             wide(text).as_ptr(),
