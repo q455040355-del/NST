@@ -16,9 +16,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    BITMAPINFO, BITMAPINFOHEADER, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ,
-    PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
+    InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
+    SetWindowRgn, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    COLORONCOLOR, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -732,12 +732,17 @@ struct ScreenGrabber {
     memory: HDC,
     dib: HBITMAP,
     bits: *mut u8,
+    /// 输出尺寸（可能比选区小）
     width: i32,
     height: i32,
+    /// 屏幕上的选区尺寸
+    src_w: i32,
+    src_h: i32,
 }
 
 impl ScreenGrabber {
-    fn new(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+    /// `width/height` 是屏幕上的选区大小，`out_w/out_h` 是实际写进 GIF 的尺寸（缩放过）
+    fn new(x: i32, y: i32, width: i32, height: i32, out_w: i32, out_h: i32) -> Option<Self> {
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
             if screen.is_null() {
@@ -746,8 +751,8 @@ impl ScreenGrabber {
             let memory = CreateCompatibleDC(screen);
             let mut info: BITMAPINFO = std::mem::zeroed();
             info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = width;
-            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biWidth = out_w;
+            info.bmiHeader.biHeight = -out_h;
             info.bmiHeader.biPlanes = 1;
             info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = 0;
@@ -768,8 +773,10 @@ impl ScreenGrabber {
                 memory,
                 dib,
                 bits: bits as *mut u8,
-                width,
-                height,
+                width: out_w,
+                height: out_h,
+                src_w: width,
+                src_h: height,
             })
         }
     }
@@ -777,7 +784,25 @@ impl ScreenGrabber {
     /// 抓一帧 BGRA（顺带把鼠标画进去）
     fn grab(&mut self, x: i32, y: i32, out: &mut Vec<u8>) -> bool {
         unsafe {
-            let ok = BitBlt(self.memory, 0, 0, self.width, self.height, self.screen, x, y, SRCCOPY);
+            // 缩放录制：直接让 GDI 边抓边缩，比抓完再缩快一倍
+            let ok = if self.width == self.src_w && self.height == self.src_h {
+                BitBlt(self.memory, 0, 0, self.width, self.height, self.screen, x, y, SRCCOPY)
+            } else {
+                SetStretchBltMode(self.memory, COLORONCOLOR);
+                StretchBlt(
+                    self.memory,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    self.screen,
+                    x,
+                    y,
+                    self.src_w,
+                    self.src_h,
+                    SRCCOPY,
+                )
+            };
             if ok == 0 {
                 return false;
             }
@@ -798,8 +823,10 @@ impl ScreenGrabber {
                         DeleteObject(icon.hbmColor as *mut _);
                     }
                 }
-                let dx = info.ptScreenPos.x - x - hot_x;
-                let dy = info.ptScreenPos.y - y - hot_y;
+                // 光标位置也要按缩放换算
+                let ratio = self.width as f32 / self.src_w.max(1) as f32;
+                let dx = (((info.ptScreenPos.x - x) as f32 - hot_x as f32) * ratio) as i32;
+                let dy = (((info.ptScreenPos.y - y) as f32 - hot_y as f32) * ratio) as i32;
                 if dx > -32 && dy > -32 && dx < self.width && dy < self.height {
                     DrawIconEx(
                         self.memory,
@@ -840,7 +867,13 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     // 等遮罩彻底消失、边框画出来（边框在选区外面，不会被录到）
     std::thread::sleep(std::time::Duration::from_millis(160));
 
-    let Some(mut grabber) = ScreenGrabber::new(x, y, width, height) else {
+    // 最长边超过 1920 就等比缩小：像素少一半，编码快一倍（成品分辨率低于原屏，可接受）
+    let longest = width.max(height).max(1) as f32;
+    let out_scale = (1920.0 / longest).min(1.0);
+    let out_w = ((width as f32 * out_scale).round() as i32).max(2);
+    let out_h = ((height as f32 * out_scale).round() as i32).max(2);
+
+    let Some(mut grabber) = ScreenGrabber::new(x, y, width, height, out_w, out_h) else {
         finish(border, button);
         return;
     };
@@ -868,7 +901,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
     let encoder = std::thread::spawn(move || {
-        let Some(mut streamer) = WebpStreamer::new(width, height, 75.0) else {
+        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, 65.0) else {
             return Vec::new();
         };
         for (frame, timestamp) in receiver {
@@ -884,7 +917,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     }
 
     // 大区域 + 高帧率时编码器会被打满，整机跟着发涩：按像素数把帧率压到能扛的范围
-    let pixels = (width.max(1) as i64) * (height.max(1) as i64);
+    let pixels = (out_w as i64) * (out_h as i64);
     let fps = if pixels > 3_000_000 {
         fps.min(20)
     } else if pixels > 1_200_000 {
@@ -931,7 +964,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let mode = STOP_MODE.load(Ordering::SeqCst);
     let bytes = encoder.join().unwrap_or_default();
     crate::debug_log(&format!(
-        "rec done: bytes={} size={width}x{height} limit={limit_seconds}s",
+        "rec done: bytes={} size={out_w}x{out_h} (src {width}x{height}) limit={limit_seconds}s",
         bytes.len()
     ));
     finish(border, button);
