@@ -127,6 +127,9 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   不拖的时候跟着鼠标有个**放大镜**：光标附近放大 4 倍、带像素网格、白框标出取的是哪个点，
   下面写「坐标 x, y」「色值 #RRGGBB」，`Ctrl+C` 直接把色值复制走（`Esc` / 右键取消）；
   也可以拖拽自由框选，实时显示 `宽 × 高`；`Esc` / 右键取消，`Enter` 确认；
+- **正方形截图**：右键菜单「正方形截图（1:1）…」进的就是强制等比模式——拖的时候宽高始终相等
+  （边长取长边、方向跟鼠标、贴边自动往里挪），点窗口也是以窗口中心截一个正方形；
+  尺寸标签会显示 `600 × 600 · 1:1`。普通截图里随时按 `S` 也能切换这个模式，再按一次关掉；
 - **编辑**：箭头 / 矩形 / 画笔 / 文字 / 马赛克（马赛克按块取平均色），撤销；编辑窗有自己的**最小化 / 关闭**按钮，
   **确认选区后编辑窗直接盖在原来那块位置上**（1:1 原尺寸、同一个屏幕坐标，看着就像截图没动过；
   右上角「不置顶/置顶」胶囊可以切换，**选择会记住**（下次截图沿用，存在 ini 的 `ShotTopmost`）；
@@ -239,6 +242,10 @@ powershell -File scripts\smoke.ps1 -Dark
 ```powershell
 $env:NST_EDITOR_PREVIEW = "$PWD\target\editor.png"; .\target\release\netspeed.exe
 ```
+
+编辑窗的图标优先用 **exe 同目录的 `icons.png`**（13 格 × 176px 的灰度蒙版横向拼图，
+每格一个图标，顺序见 `target/make_icon_sheet.py`），有就贴图、没有就退回代码里自绘的那套。
+这份素材**不在仓库里**（版权原因只在部署目录放），换图标只要替换这个 png，不用重新编译。
 
 CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --workspace` 和
 `cargo check --workspace --all-targets`；界面相关的验证只能本地跑 smoke。

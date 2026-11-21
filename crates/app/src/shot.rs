@@ -20,7 +20,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetStockObject, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline,
+    AlphaBlend, BLENDFUNCTION, GetStockObject, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, Polygon, Polyline,
     ReleaseDC, RestoreDC, SaveDC, SelectObject,
     ScreenToClient, SetBkColor, SetBkMode, SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchBlt, TextOutW, BITMAPINFO,
     BITMAPINFOHEADER,
@@ -96,8 +96,17 @@ static GIF_QUALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// 录制时长上限（秒）
 static GIF_SECONDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
 
+/// 这一次截图要不要强制 1:1（菜单点「正方形截图」时置位，`begin` 取走）
+static SQUARE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
+    start(panel, Mode::Edit);
+}
+
+/// 1:1 正方形截图：选区强制等比（拖的时候宽高始终一样），框完就是正方形。
+pub fn request_square(panel: HWND) {
+    SQUARE_CAPTURE.store(true, Ordering::Relaxed);
     start(panel, Mode::Edit);
 }
 
@@ -411,6 +420,8 @@ struct Overlay {
     last_label: Option<RECT>,
     /// 放大镜取色用的鼠标位置（截图坐标）
     cursor: POINT,
+    /// 选区强制 1:1（正方形截图，或者拖的时候按 S 切换）
+    square: bool,
 }
 
 /// 把整屏画布上某块矩形恢复成「压暗版」像素。
@@ -455,13 +466,60 @@ unsafe fn dim_pixels(shot: &Bitmap) -> Vec<u8> {
 
 fn selection(overlay: &Overlay) -> Option<RECT> {
     // 还没开始拖：用鼠标下自动聚焦的窗口当默认选区（微信那种「点一下截这个窗口」）
-    let Some(start) = overlay.start else {
-        return overlay.hover;
+    let Some(mut start) = overlay.start else {
+        let rect = overlay.hover?;
+        if !overlay.square {
+            return Some(rect);
+        }
+        // 正方形模式点窗口：以窗口中心为心截一个正方形（边长取长边），夹进屏幕
+        let side = (rect.right - rect.left).max(rect.bottom - rect.top);
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let left = (cx - side / 2).clamp(0, (overlay.shot.width - side).max(0));
+        let top = (cy - side / 2).clamp(0, (overlay.shot.height - side).max(0));
+        return Some(RECT {
+            left,
+            top,
+            right: left + side,
+            bottom: top + side,
+        });
     };
-    let left = start.x.min(overlay.current.x).max(0);
-    let top = start.y.min(overlay.current.y).max(0);
-    let right = start.x.max(overlay.current.x).min(overlay.shot.width);
-    let bottom = start.y.max(overlay.current.y).min(overlay.shot.height);
+    let mut current = overlay.current;
+    if overlay.square {
+        // 1:1：边长取长边，方向跟着鼠标；贴边时整块往里挪，保证框还是正方形
+        let dx = current.x - start.x;
+        let dy = current.y - start.y;
+        let side = dx.abs().max(dy.abs());
+        let (ux, uy) = (if dx < 0 { -1 } else { 1 }, if dy < 0 { -1 } else { 1 });
+        let (mut x0, mut y0) = (start.x, start.y);
+        let (mut x1, mut y1) = (start.x + ux * side, start.y + uy * side);
+        if x1 < 0 {
+            let shift = -x1;
+            x0 += shift;
+            x1 += shift;
+        }
+        if y1 < 0 {
+            let shift = -y1;
+            y0 += shift;
+            y1 += shift;
+        }
+        if x1 > overlay.shot.width {
+            let shift = x1 - overlay.shot.width;
+            x0 -= shift;
+            x1 -= shift;
+        }
+        if y1 > overlay.shot.height {
+            let shift = y1 - overlay.shot.height;
+            y0 -= shift;
+            y1 -= shift;
+        }
+        start = POINT { x: x0, y: y0 };
+        current = POINT { x: x1, y: y1 };
+    }
+    let left = start.x.min(current.x).max(0);
+    let top = start.y.min(current.y).max(0);
+    let right = start.x.max(current.x).min(overlay.shot.width);
+    let bottom = start.y.max(current.y).min(overlay.shot.height);
     if right - left < 2 || bottom - top < 2 {
         return None;
     }
@@ -676,7 +734,15 @@ unsafe fn overlay_paint(hwnd: HWND) {
         SelectObject(dc, old_pen);
         DeleteObject(pen as *mut _);
 
-        let label = format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top);
+        let label = if state.square {
+            format!(
+                "{} × {} · 1:1",
+                rect.right - rect.left,
+                rect.bottom - rect.top
+            )
+        } else {
+            format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top)
+        };
         let font = cached_font(9.0, 700);
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let text_w = wide_width(dc, &label);
@@ -909,7 +975,7 @@ unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
     };
     DrawTextW(
         dc,
-        wide("按 Ctrl+C 复制色值").as_ptr(),
+        wide("按 Ctrl+C 复制色值 · 按 S 切 1:1").as_ptr(),
         -1,
         &mut hint,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
@@ -1022,6 +1088,14 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_KEYDOWN => {
             match wparam as u32 {
+                // S：就地切成「1:1 正方形」选区（菜单里的「正方形截图」是直接带着这个状态进来）
+                0x53 => {
+                    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
+                    if !state.is_null() {
+                        (*state).square = !(*state).square;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
                 // Esc / 右键 = 取消
                 0x1B => {
                     DestroyWindow(hwnd);
@@ -1147,6 +1221,7 @@ pub unsafe fn begin(panel: HWND) {
         last_rect: None,
         last_label: None,
         cursor: POINT { x: vw / 2, y: vh / 2 },
+        square: SQUARE_CAPTURE.swap(false, Ordering::Relaxed),
     }));
 
     let hwnd = CreateWindowExW(
@@ -2227,8 +2302,204 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
     DeleteObject(brush as *mut _);
 }
 
+// ---------------------------------------------------------------- 图标素材包
+// exe 同目录下有 icons.png 时，优先用里面抠好的微信图标（蒙版 + 着色），
+// 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
+
+const PACK_CELL: u32 = 176;
+const PACK_COUNT: usize = 13;
+
+struct IconPack {
+    /// 每格 PACK_CELL×PACK_CELL 的灰度蒙版（0=透明，255=实心）
+    masks: Vec<Vec<u8>>,
+}
+
+static PACK: std::sync::OnceLock<Option<IconPack>> = std::sync::OnceLock::new();
+
+fn icon_pack() -> &'static Option<IconPack> {
+    PACK.get_or_init(load_icon_pack)
+}
+
+fn load_icon_pack() -> Option<IconPack> {
+    unsafe {
+        let mut buf = [0u16; 1024];
+        let len = windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        );
+        if len == 0 {
+            return None;
+        }
+        let mut path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+        path.pop();
+        path.push("icons.png");
+        let bytes = std::fs::read(&path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_luma8();
+        let (w, h) = img.dimensions();
+        if h != PACK_CELL || w < PACK_CELL * PACK_COUNT as u32 {
+            return None;
+        }
+        let mut masks = Vec::with_capacity(PACK_COUNT);
+        for i in 0..PACK_COUNT {
+            let mut cell = Vec::with_capacity((PACK_CELL * PACK_CELL) as usize);
+            for y in 0..PACK_CELL {
+                for x in 0..PACK_CELL {
+                    cell.push(img.get_pixel(i as u32 * PACK_CELL + x, y).0[0]);
+                }
+            }
+            // 微信原图里撤销是浅灰的，蒙版直接当透明度会发飘：每格按最黑那点归一化，
+            // 这样所有图标看起来一样实
+            if let Some(max) = cell.iter().copied().max() {
+                if max > 40 && max < 235 {
+                    let gain = 255.0 / max as f32;
+                    for value in cell.iter_mut() {
+                        *value = ((*value as f32) * gain).min(255.0) as u8;
+                    }
+                }
+            }
+            masks.push(cell);
+        }
+        crate::debug_log("editor: 图标用 icons.png（微信那套）");
+        Some(IconPack { masks })
+    }
+}
+
+/// 动作 → 素材包里的第几格（顺序见 target/make_icon_sheet.py）
+fn pack_index(action: Action) -> Option<usize> {
+    Some(match action {
+        Action::Tool(Tool::Rect) => 0,
+        Action::Tool(Tool::Ellipse) => 1,
+        Action::Tool(Tool::Arrow) => 2,
+        Action::Tool(Tool::Pen) => 3,
+        Action::Tool(Tool::Mosaic) => 4,
+        Action::Tool(Tool::Text) => 5,
+        Action::Tool(Tool::Ocr) => 6,
+        Action::Undo => 7,
+        Action::Save => 8,
+        Action::Pin => 9,
+        Action::Close => 11,
+        Action::Done => 12,
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// 着色后的图标位图缓存：key = (格子, 颜色, 宽, 高)
+    static TINTED: RefCell<HashMap<(usize, u32, i32, i32), (HDC, HBITMAP)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 用素材包画一个图标：盒采样到目标尺寸 → 按颜色预乘 → AlphaBlend
+unsafe fn draw_pack_icon(dc: HDC, index: usize, rect: RECT, color: u32) {
+    let Some(pack) = icon_pack() else {
+        return;
+    };
+    let width = (rect.right - rect.left).max(1);
+    let height = (rect.bottom - rect.top).max(1);
+    let key = (index, color, width, height);
+
+    let cached = TINTED.with(|cell| cell.borrow().get(&key).copied());
+    let source = match cached {
+        Some(handle) => handle,
+        None => {
+            let mask = &pack.masks[index];
+            let (mem, dib, bits) = make_dib(width, height);
+            if mem.is_null() || dib.is_null() || bits.is_null() {
+                if !dib.is_null() {
+                    DeleteObject(dib as *mut _);
+                }
+                if !mem.is_null() {
+                    DeleteDC(mem);
+                }
+                return;
+            }
+            // 主题色是 0x00BBGGRR（Win32 COLORREF），低字节是红
+            let (red, green, blue) = (
+                (color & 0xFF) as u32,
+                ((color >> 8) & 0xFF) as u32,
+                ((color >> 16) & 0xFF) as u32,
+            );
+            for y in 0..height {
+                // 目标一行对应源图的哪几行
+                let sy0 = (y as f32 * PACK_CELL as f32 / height as f32) as i32;
+                let sy1 = (((y + 1) as f32 * PACK_CELL as f32 / height as f32).ceil() as i32)
+                    .max(sy0 + 1)
+                    .min(PACK_CELL as i32);
+                for x in 0..width {
+                    let sx0 = (x as f32 * PACK_CELL as f32 / width as f32) as i32;
+                    let sx1 = (((x + 1) as f32 * PACK_CELL as f32 / width as f32).ceil() as i32)
+                        .max(sx0 + 1)
+                        .min(PACK_CELL as i32);
+                    // 盒采样：这个目标像素覆盖的源像素取平均
+                    let mut sum = 0u32;
+                    let mut count = 0u32;
+                    for sy in sy0..sy1 {
+                        for sx in sx0..sx1 {
+                            sum += mask[(sy * PACK_CELL as i32 + sx) as usize] as u32;
+                            count += 1;
+                        }
+                    }
+                    let alpha = if count > 0 { (sum / count) as u8 } else { 0 };
+                    let offset = ((y * width + x) * 4) as usize;
+                    if alpha == 0 {
+                        *bits.add(offset) = 0;
+                        *bits.add(offset + 1) = 0;
+                        *bits.add(offset + 2) = 0;
+                        *bits.add(offset + 3) = 0;
+                    } else {
+                        let a = alpha as u32;
+                        // AlphaBlend 要预乘
+                        *bits.add(offset) = (blue * a / 255) as u8;
+                        *bits.add(offset + 1) = (green * a / 255) as u8;
+                        *bits.add(offset + 2) = (red * a / 255) as u8;
+                        *bits.add(offset + 3) = alpha;
+                    }
+                }
+            }
+            TINTED.with(|cell| cell.borrow_mut().insert(key, (mem, dib)));
+            (mem, dib)
+        }
+    };
+
+    let blend = BLENDFUNCTION {
+        BlendOp: 0, // AC_SRC_OVER
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA
+    };
+    AlphaBlend(
+        dc,
+        rect.left,
+        rect.top,
+        width,
+        height,
+        source.0,
+        0,
+        0,
+        width,
+        height,
+        blend,
+    );
+}
+
 /// 工具栏按钮的图标：照微信那套画法——**细描边、不填充、该包框的包框**
 fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8) {
+    // 有 icons.png 素材包就贴图（微信原图），没有才走下面的自绘
+    if let Some(index) = pack_index(action) {
+        if icon_pack().is_some() {
+            // 素材包每格自带 8% 留白，这里再收一点，视觉大小和自绘图标齐平
+            let inset = s(2.0);
+            let target = RECT {
+                left: rect.left + inset,
+                top: rect.top + inset,
+                right: rect.right - inset,
+                bottom: rect.bottom - inset,
+            };
+            unsafe { draw_pack_icon(dc, index, target, color) };
+            return;
+        }
+    }
     unsafe {
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
@@ -3573,5 +3844,68 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overlay(square: bool, start: (i32, i32), current: (i32, i32)) -> Overlay {
+        Overlay {
+            shot: Bitmap::new(1920, 1080),
+            dimmed: Vec::new(),
+            origin: (0, 0),
+            start: Some(POINT {
+                x: start.0,
+                y: start.1,
+            }),
+            press: None,
+            current: POINT {
+                x: current.0,
+                y: current.1,
+            },
+            hover: None,
+            canvas: None,
+            last_rect: None,
+            last_label: None,
+            cursor: POINT { x: 0, y: 0 },
+            square,
+        }
+    }
+
+    #[test]
+    fn square_selection_uses_long_side() {
+        let state = overlay(true, (100, 100), (400, 250));
+        let rect = selection(&state).expect("应该有选区");
+        assert_eq!(rect.right - rect.left, 300);
+        assert_eq!(rect.bottom - rect.top, 300);
+        assert_eq!((rect.left, rect.top), (100, 100));
+    }
+
+    #[test]
+    fn square_selection_handles_reverse_drag() {
+        let state = overlay(true, (500, 500), (300, 300));
+        let rect = selection(&state).expect("应该有选区");
+        assert_eq!(rect.right - rect.left, 200);
+        assert_eq!(rect.bottom - rect.top, 200);
+        assert_eq!((rect.left, rect.top), (300, 300));
+    }
+
+    #[test]
+    fn square_selection_clamps_at_screen_edge() {
+        let state = overlay(true, (1800, 900), (1920, 1080));
+        let rect = selection(&state).expect("应该有选区");
+        assert_eq!(rect.right - rect.left, rect.bottom - rect.top);
+        assert!(rect.right <= 1920 && rect.bottom <= 1080);
+        assert!(rect.left >= 0 && rect.top >= 0);
+    }
+
+    #[test]
+    fn normal_selection_keeps_free_ratio() {
+        let state = overlay(false, (100, 100), (400, 250));
+        let rect = selection(&state).expect("应该有选区");
+        assert_eq!(rect.right - rect.left, 300);
+        assert_eq!(rect.bottom - rect.top, 150);
     }
 }
