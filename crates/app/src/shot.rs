@@ -2643,7 +2643,8 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
 
     let work = crate::work_area_at(anchor);
     let max_w = ((work.right - work.left) as f32 * 0.85).max(1.0);
-    let max_h = ((work.bottom - work.top) as f32 * 0.8).max(1.0);
+    let chrome = s(44.0) * 2 + s(24.0);
+    let max_h = (((work.bottom - work.top) as f32 * 0.8) as i32 - chrome).max(1) as f32;
     let scale = (max_w / editor.base.width as f32)
         .min(max_h / editor.base.height as f32)
         .min(1.0);
@@ -3020,7 +3021,9 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     use_scale_at(cursor);
     let work = crate::work_area_at(cursor);
     let max_w = ((work.right - work.left) as f32 * 0.85) as i32;
-    let max_h = ((work.bottom - work.top) as f32 * 0.8) as i32;
+    // 上下两条工具栏 + 底部提示也要占高度，算缩放时先扣掉，否则窗口比屏幕高、底部会被裁掉
+    let chrome = s(44.0) * 2 + s(24.0);
+    let max_h = ((work.bottom - work.top) as f32 * 0.8) as i32 - chrome;
 
     let scale = (max_w as f32 / bitmap.width as f32)
         .min(max_h as f32 / bitmap.height as f32)

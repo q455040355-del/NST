@@ -1464,6 +1464,19 @@ unsafe fn paint(hwnd: HWND) {
             DT_CENTER_ALIGN,
         );
 
+        // 当前版本号，放在页脚最左边
+        let auto = l.auto_start;
+        p.text(
+            &format!("v{}", env!("CARGO_PKG_VERSION")),
+            state.fonts.small,
+            c.text3,
+            auto.left,
+            auto.top,
+            auto.left + p.s(66.0),
+            auto.bottom,
+            DT_LEFT,
+        );
+
         let hovered = state.hover == Some(Hit::AutoStart);
         let sw_w = p.s(38.0);
         let sw_h = p.s(22.0);
@@ -1476,7 +1489,7 @@ unsafe fn paint(hwnd: HWND) {
             "开机自启",
             state.fonts.value,
             if hovered { c.text } else { c.text2 },
-            area.left,
+            area.left + p.s(66.0),
             area.top,
             sx - p.s(10.0),
             area.bottom,
