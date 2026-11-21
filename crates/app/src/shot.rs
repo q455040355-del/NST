@@ -713,8 +713,8 @@ unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
         return;
     }
 
-    let zoom = s(8.0).max(4);
-    let cells = 15;
+    let zoom = s(4.0).max(3);
+    let cells = 19;
     let grid = cells * zoom;
     let pad = s(1.0);
     let info_h = s(72.0);
@@ -1209,6 +1209,8 @@ fn mosaic_block(scale: f32, stroke: u8) -> i32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
+    /// 置顶开关（默认关）
+    Topmost,
     /// 描边浓淡切换（细 / 中 / 粗）
     Stroke,
     Tool(Tool),
@@ -1245,6 +1247,8 @@ struct Editor {
     pressed: Option<Action>,
     /// 底部小提示（复制成功之类），带出现时间
     toast: Option<(String, std::time::Instant)>,
+    /// 是否置顶（默认关，截图完不挡别的窗口）
+    topmost: bool,
     /// 原图只拷进内存 DC 一次，之后每帧直接 blit
     source: Option<(HDC, HBITMAP)>,
     /// 客户区双缓冲（尺寸变了才重建）
@@ -1292,6 +1296,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Copy => "复制",
         Action::Save => "保存",
         Action::Stroke => "中",
+        Action::Topmost => "置顶",
         Action::Pin => "贴图",
         Action::Minimize => "最小化",
         Action::Close => "关闭",
@@ -1868,6 +1873,32 @@ unsafe fn editor_paint(hwnd: HWND) {
         right: close.left - s(4.0),
         bottom: close.bottom,
     };
+    // 「置顶」小图钉：默认关（不进前），开着才盖住别的窗口
+    let topmost = RECT {
+        left: minimize.left - s(4.0) - control,
+        top: close.top,
+        right: minimize.left - s(4.0),
+        bottom: close.bottom,
+    };
+    if editor.topmost {
+        let on = CreateSolidBrush(crate::theme::ui().accent);
+        let old = SelectObject(dc, on as HGDIOBJ);
+        let pen = CreatePen(0, 1, crate::theme::ui().accent);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        windows_sys::Win32::Graphics::Gdi::RoundRect(
+            dc,
+            topmost.left,
+            topmost.top,
+            topmost.right,
+            topmost.bottom,
+            s(7.0),
+            s(7.0),
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
+        DeleteObject(on as *mut _);
+    }
 
     let icon_color = crate::theme::ui().text2;
     let pen = CreatePen(0, s(1.4).max(1), icon_color);
@@ -1889,8 +1920,19 @@ unsafe fn editor_paint(hwnd: HWND) {
     MoveToEx(dc, cx - arm, cy + arm, std::ptr::null_mut());
     LineTo(dc, cx + arm, cy - arm);
 
+    // 图钉：一根针 + 底座，表示「置顶」
+    let tx = (topmost.left + topmost.right) / 2;
+    let ty = (topmost.top + topmost.bottom) / 2;
+    MoveToEx(dc, tx, ty - s(6.0), std::ptr::null_mut());
+    LineTo(dc, tx, ty + s(2.0));
+    MoveToEx(dc, tx - s(3.0), ty - s(3.0), std::ptr::null_mut());
+    LineTo(dc, tx + s(3.0), ty - s(3.0));
+    MoveToEx(dc, tx - s(2.0), ty + s(4.0), std::ptr::null_mut());
+    LineTo(dc, tx + s(2.0), ty + s(4.0));
+
     SelectObject(dc, old_pen);
     DeleteObject(pen as *mut _);
+    editor.buttons.push((topmost, Action::Topmost));
     editor.buttons.push((minimize, Action::Minimize));
     editor.buttons.push((close, Action::Close));
 
@@ -2069,6 +2111,7 @@ impl Editor {
             pen_points: Vec::new(),
             text: None,
             stroke: 1,
+            topmost: self.topmost,
             buttons: Vec::new(),
             pressed: None,
             toast: None,
@@ -2491,6 +2534,22 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let editor = &*editor;
             let bitmap = composite(editor);
             open_pin(bitmap);
+        }
+        Action::Topmost => {
+            let editor = &mut *editor;
+            editor.topmost = !editor.topmost;
+            let insert = if editor.topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            SetWindowPos(hwnd, insert, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowTextW(
+                hwnd,
+                wide(if editor.topmost {
+                    "截图编辑 · 已置顶"
+                } else {
+                    "截图编辑 · 不置顶"
+                })
+                .as_ptr(),
+            );
+            show_toast(hwnd, if editor.topmost { "已置顶" } else { "已取消置顶" });
         }
         Action::Minimize => {
             ShowWindow(hwnd, SW_MINIMIZE);
@@ -2940,6 +2999,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         drag_to: None,
         pen_points: Vec::new(),
         stroke: 1,
+        topmost: false,
         text: None,
         buttons: Vec::new(),
         pressed: None,
