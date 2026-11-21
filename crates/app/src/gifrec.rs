@@ -43,8 +43,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 边框画在选区**外面**这么多像素（不然会被录进 GIF）
 const BORDER: i32 = 3;
 /// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
-const BAR_W: i32 = 120;
-const BAR_H: i32 = 34;
+const BAR_W: i32 = 150;
+const BAR_H: i32 = 42;
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 操作条窗口（停止时先收起来）
@@ -180,6 +180,18 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     );
 
     BAR.store(button as usize, Ordering::SeqCst);
+    // 圆角用窗口区域切出来：否则圆角外面会露出窗口底色的黑点
+    let rgn = windows_sys::Win32::Graphics::Gdi::CreateRoundRectRgn(
+        0,
+        0,
+        BAR_W + 1,
+        BAR_H + 1,
+        s_round() * 2,
+        s_round() * 2,
+    );
+    if !rgn.is_null() {
+        SetWindowRgn(button, rgn, 1);
+    }
     let panel = panel as usize;
     let border_raw = border as usize;
     let button_raw = button as usize;
@@ -263,8 +275,8 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     let height = BAR_H;
 
     // 卡片底色 + 细边框（不用 UpdateLayeredWindow，圆角用 RoundRect 画）
-    let bg = CreateSolidBrush(0x0022_262B);
-    let border = CreatePen(0, 1, 0x0033_383E);
+    let bg = CreateSolidBrush(0x00FF_FFFF);
+    let border = CreatePen(0, 1, 0x00D8_DCE0);
     let old_brush = SelectObject(dc, bg as HGDIOBJ);
     let old_pen = SelectObject(dc, border as HGDIOBJ);
     RoundRect(dc, 0, 0, width, height, s_round(), s_round());
@@ -273,24 +285,9 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     DeleteObject(border as *mut _);
     DeleteObject(bg as *mut _);
 
-    // 指向选区的小三角（工具条压在选区上方时朝下）
-    {
-        let tri = CreateSolidBrush(0x0022_262B);
-        let old = SelectObject(dc, tri as HGDIOBJ);
-        let center = width / 2;
-        let mut points = [
-            POINT { x: center - 6, y: height - 7 },
-            POINT { x: center + 6, y: height - 7 },
-            POINT { x: center, y: height - 1 },
-        ];
-        windows_sys::Win32::Graphics::Gdi::Polygon(dc, points.as_mut_ptr(), 3);
-        SelectObject(dc, old);
-        DeleteObject(tri as *mut _);
-    }
-
     // 两半分隔线
     let half = width / 2;
-    let divider = CreatePen(0, 1, 0x0040_464D);
+    let divider = CreatePen(0, 1, 0x00E4_E8EC);
     let old = SelectObject(dc, divider as HGDIOBJ);
     MoveToEx(dc, half, 8, std::ptr::null_mut());
     LineTo(dc, half, height - 8);
@@ -301,8 +298,8 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     if hover == 0 || hover == 1 {
         let left = if hover == 0 { 2 } else { half + 1 };
         let right = if hover == 0 { half - 1 } else { width - 2 };
-        let hot = CreateSolidBrush(0x0038_3F46);
-        let pen = CreatePen(0, 1, 0x0038_3F46);
+        let hot = CreateSolidBrush(0x00EE_F2F6);
+        let pen = CreatePen(0, 1, 0x00EE_F2F6);
         let ob = SelectObject(dc, hot as HGDIOBJ);
         let op = SelectObject(dc, pen as HGDIOBJ);
         RoundRect(dc, left, 2, right, height - 2, 8, 8);
@@ -314,7 +311,7 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
 
     // 文字比手绘图标清楚：「保存」/「结束」
     let font = CreateFontW(
-        -12,
+        -16,
         0,
         0,
         0,
@@ -334,7 +331,7 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
 
     for (index, label) in ["保存", "结束"].into_iter().enumerate() {
         let _ = index;
-        SetTextColor(dc, 0x00F0_F3F6);
+        SetTextColor(dc, 0x0030_3438);
         let mut rect = RECT {
             left: index as i32 * half,
             top: 0,
@@ -352,10 +349,9 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     SelectObject(dc, old_font);
     DeleteObject(font as *mut _);
 }
-
 /// 操作条的圆角半径（固定 10px，跟着系统缩放走）
 fn s_round() -> i32 {
-    10
+    12
 }
 
 /// 录完复制到剪贴板：CF_DIB（首帧静态图）+ 文件（动画本体，能贴进聊天窗口）
