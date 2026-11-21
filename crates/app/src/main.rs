@@ -135,10 +135,22 @@ fn main() {
     install_panic_hook();
     unsafe {
         // 必须在任何窗口/坐标计算之前：否则进程是 DPI 不感知的，
-        // 系统会把坐标和尺寸按 150% 缩放虚拟化（面板位置/大小全错）
-        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
-            windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        // 系统会把坐标和尺寸按 150% 缩放虚拟化（面板位置/大小全错）。
+        // Win10 1703+ 才有 SetProcessDpiAwarenessContext，老系统动态取，取不到退回系统 DPI 感知。
+        let user32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(wide("user32.dll").as_ptr());
+        let proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            user32,
+            b"SetProcessDpiAwarenessContext\0".as_ptr(),
         );
+        let mut applied = false;
+        if let Some(function) = proc {
+            let function: unsafe extern "system" fn(isize) -> i32 = std::mem::transmute(function);
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            applied = function(-4) != 0;
+        }
+        if !applied {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+        }
 
         // 通用对话框（另存为）需要 COM 单元，不开的话 GetSaveFileNameW 会直接失败
         windows_sys::Win32::System::Com::CoInitializeEx(
@@ -1633,4 +1645,4 @@ mod tests {
         assert!(!is_remote_client_exe(r"C:\Tools\GameViewerHelper\foo.exe"));
         assert!(!is_remote_client_exe(""));
     }
-}
+}

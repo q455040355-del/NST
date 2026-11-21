@@ -9,12 +9,13 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetDC, LineTo, MoveToEx, ReleaseDC, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DT_CALCRECT, DT_SINGLELINE, HBITMAP, HDC, HFONT, HGDIOBJ,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, LineTo, MoveToEx,
+    ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, BITMAPINFO,
+    BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CALCRECT, DT_SINGLELINE, HBITMAP, HDC,
+    HFONT, HGDIOBJ,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SetCursor;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetCursor};
 
 use crate::theme::wide;
 
@@ -111,18 +112,40 @@ pub fn set_hand_cursor() {
 }
 
 
-/// Win11 圆角（Win10 上调用失败，无所谓）
+/// 窗口圆角：Win11 交给 DWM；Win10 没有这个特性，就自己把窗口切成圆角区域
 pub fn round_corners(hwnd: HWND) {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: i32 = 2;
     let value = DWMWCP_ROUND;
+    let done;
     unsafe {
-        DwmSetWindowAttribute(
+        done = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &value as *const i32 as *const _,
             std::mem::size_of::<i32>() as u32,
-        );
+        ) == 0;
+    }
+    if done {
+        return;
+    }
+
+    // Win10：按窗口大小切一个圆角区域（这些窗口都是固定尺寸，切一次就够）
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let radius = (14.0 * crate::screen_scale()).round() as i32;
+        let rgn = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+        if !rgn.is_null() {
+            SetWindowRgn(hwnd, rgn, 1);
+        }
     }
 }
 
