@@ -175,40 +175,34 @@ fn is_newer(latest: &str, current: &str) -> bool {
     parse(latest) > parse(current)
 }
 
-/// 新 exe 落到临时目录，写个批处理等本进程退出后替换并重启
+/// 新 exe 落到 exe 同目录，写个全 ASCII 的批处理等本进程退出后替换并重启
 fn replace_and_restart(bytes: &[u8]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let dir = std::env::temp_dir().join("NST");
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    // 关键：批处理里不放任何非 ASCII 路径。cmd 按 OEM 代码页读 .bat，
+    // 而这里用 UTF-8 写，路径带中文（比如 OneDrive\桌面）就会被读成乱码，
+    // move 永远失败 → 程序退出了却没更新。改成「同目录 + 相对文件名」。
+    let dir = exe.parent().ok_or("找不到程序所在目录")?.to_path_buf();
     let fresh = dir.join("netspeed-new.exe");
     std::fs::write(&fresh, bytes).map_err(|error| error.to_string())?;
 
     let bat = dir.join("update.bat");
-    // 只用 cmd 内建命令：tasklist / find 会被 PATH 里的 MSYS 工具劫持（find 是 GNU 的），
-    // 之前那版会弹个 cmd 窗口报 "find: 'I:/': No such file or directory"。
-    // 等进程退出改成「move 失败就重试」，目标被占用时 move 本来就会失败。
-    let script = format!(
-        "@echo off\r\n\
-         setlocal\r\n\
-         set \"NEW={}\"\r\n\
-         set \"EXE={}\"\r\n\
+    let script = "@echo off\r\n\
+         cd /d \"%~dp0\"\r\n\
          :retry\r\n\
-         move /y \"%NEW%\" \"%EXE%\" > nul 2>&1\r\n\
-         if exist \"%NEW%\" (\r\n\
-           timeout /t 1 /nobreak > nul\r\n\
-           goto retry\r\n\
-         )\r\n\
-         start \"\" \"%EXE%\"\r\n",
-        fresh.display(),
-        exe.display()
-    );
+         move /y \"netspeed-new.exe\" \"netspeed.exe\" > nul 2>&1\r\n\
+         if not exist \"netspeed-new.exe\" goto done\r\n\
+         timeout /t 1 /nobreak > nul\r\n\
+         goto retry\r\n\
+         :done\r\n\
+         start \"\" \"netspeed.exe\"\r\n";
     std::fs::write(&bat, script).map_err(|error| error.to_string())?;
 
     // CREATE_NO_WINDOW：不弹黑框
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("cmd")
-        .args(["/C", &bat.to_string_lossy()])
+        .args(["/C", "update.bat"])
+        .current_dir(&dir)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| error.to_string())?;
