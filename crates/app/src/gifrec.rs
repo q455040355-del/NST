@@ -8,7 +8,7 @@
 //!
 //! 采集和编码在同一个后台线程里，边拍边写进内存，不会攒几千张整帧位图。
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -61,6 +61,64 @@ pub fn is_recording() -> bool {
 /// 结束录制并复制到剪贴板（热键 / ✔ 都走这里）
 pub fn stop() {
     stop_with(1);
+}
+
+/// 倒计时窗口
+static HUD: AtomicUsize = AtomicUsize::new(0);
+static HUD_SECONDS: AtomicI32 = AtomicI32::new(-1);
+
+/// 更新倒计时（没变化就不重绘）
+fn set_hud(seconds: u64) {
+    let seconds = seconds as i32;
+    if HUD_SECONDS.swap(seconds, Ordering::Relaxed) == seconds {
+        return;
+    }
+    let hud = HUD.load(Ordering::SeqCst) as HWND;
+    if !hud.is_null() {
+        unsafe {
+            InvalidateRect(hud, std::ptr::null(), 0);
+            windows_sys::Win32::Graphics::Gdi::UpdateWindow(hud);
+        }
+    }
+}
+
+unsafe extern "system" fn hud_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            let bg = CreateSolidBrush(0x00C8_2323);
+            let pen = CreateSolidBrush(0x00C8_2323);
+            let ob = SelectObject(dc, bg as HGDIOBJ);
+            let op = SelectObject(dc, pen as HGDIOBJ);
+            let h = client.bottom;
+            RoundRect(dc, 0, 0, client.right, client.bottom, h, h);
+            SelectObject(dc, op);
+            SelectObject(dc, ob);
+            DeleteObject(pen as *mut _);
+            DeleteObject(bg as *mut _);
+
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, 0x00FF_FFFF);
+            let font = CreateFontW(-13, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, wide("Microsoft YaHei UI").as_ptr());
+            let old = SelectObject(dc, font as HGDIOBJ);
+            let seconds = HUD_SECONDS.load(Ordering::Relaxed);
+            let text = format!("● {}s", seconds.max(0));
+            let mut rect = client;
+            DrawTextW(dc, wide(&text).as_ptr(), -1, &mut rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(dc, old);
+            DeleteObject(font as *mut _);
+            EndPaint(hwnd, &mut ps);
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 /// `1` = 复制到剪贴板，`2` = 弹另存为
@@ -192,6 +250,51 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     if !rgn.is_null() {
         SetWindowRgn(button, rgn, 1);
     }
+
+    // 倒计时：放在选区外侧（上方中间），不挡画面也不会被录进去
+    let hud_class = wide("NetSpeedTaskbarRs.RecHud");
+    let hud_wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(hud_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: instance,
+        hIcon: std::ptr::null_mut(),
+        hCursor: std::ptr::null_mut(),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: hud_class.as_ptr(),
+    };
+    RegisterClassW(&hud_wc);
+    let hud_w = 84;
+    let hud_h = 26;
+    let mut hud_x = x + (w - hud_w) / 2;
+    let mut hud_y = y - hud_h - BORDER - 4;
+    if hud_y < vy {
+        hud_y = y + h + BORDER + 4;
+    }
+    if hud_x < vx {
+        hud_x = vx;
+    }
+    if hud_x + hud_w > vx + vw {
+        hud_x = vx + vw - hud_w;
+    }
+    let hud = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        hud_class.as_ptr(),
+        wide("录制倒计时").as_ptr(),
+        WS_POPUP | WS_VISIBLE,
+        hud_x,
+        hud_y,
+        hud_w,
+        hud_h,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    HUD.store(hud as usize, Ordering::SeqCst);
+    HUD_SECONDS.store(20, Ordering::SeqCst);
     let panel = panel as usize;
     let border_raw = border as usize;
     let button_raw = button as usize;
@@ -775,13 +878,23 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let started = std::time::Instant::now();
-    let limit = std::time::Duration::from_secs(20);
+    // 20 秒上限；但内存兜底可能先到（大区域帧太占内存），以更紧的那个为准，
+    // 并且把真实上限显示在倒计时上，避免「以为录了 20 秒其实只录了 1 秒」
+    let memory_seconds = (max_frames as f32 / fps.max(1) as f32).floor() as u64;
+    let limit_seconds = memory_seconds.clamp(1, 20);
+    let limit = std::time::Duration::from_secs(limit_seconds);
     let mut next = std::time::Instant::now();
+    if memory_seconds < 20 {
+        crate::debug_log(&format!(
+            "rec: 区域太大，按内存上限只能录 {memory_seconds} 秒（fps={fps}）"
+        ));
+    }
 
     while STOP_MODE.load(Ordering::Relaxed) == 0
         && started.elapsed() < limit
         && shots.len() < max_frames
     {
+        set_hud(limit_seconds.saturating_sub(started.elapsed().as_secs()));
         next += interval;
         let now = std::time::Instant::now();
         if next > now {
@@ -885,7 +998,13 @@ fn finish(border: HWND, button: HWND) {
         if !button.is_null() {
             PostMessageW(button, WM_CLOSE, 0, 0);
         }
+        let hud = HUD.load(Ordering::SeqCst) as HWND;
+        if !hud.is_null() {
+            PostMessageW(hud, WM_CLOSE, 0, 0);
+        }
     }
+    HUD.store(0, Ordering::SeqCst);
+    HUD_SECONDS.store(-1, Ordering::SeqCst);
     RECORDING.store(false, Ordering::SeqCst);
     BAR.store(0, Ordering::SeqCst);
     STOP_MODE.store(0, Ordering::SeqCst);
