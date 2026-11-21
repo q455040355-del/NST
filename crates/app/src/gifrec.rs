@@ -150,7 +150,13 @@ pub fn stop_with(mode: u8) {
 }
 
 /// 开始录制一块屏幕区域（物理像素）。只负责开窗口，真正采集在后台线程。
-pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32, quality: u32) {
+pub unsafe fn start(
+    panel: HWND,
+    rect: (i32, i32, i32, i32),
+    fps: u32,
+    quality: u32,
+    seconds: u32,
+) {
     let (x, y, w, h) = rect;
     if w < 16 || h < 16 || RECORDING.swap(true, Ordering::SeqCst) {
         return;
@@ -310,11 +316,12 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32, quality: 
         std::ptr::null(),
     );
     HUD.store(hud as usize, Ordering::SeqCst);
-    HUD_SECONDS.store(20, Ordering::SeqCst);
+    let seconds = seconds.clamp(5, 60);
+    HUD_SECONDS.store(seconds as i32, Ordering::SeqCst);
     let panel = panel as usize;
     let border_raw = border as usize;
     let button_raw = button as usize;
-    std::thread::spawn(move || run(panel, x, y, w, h, fps, quality, border_raw, button_raw));
+    std::thread::spawn(move || run(panel, x, y, w, h, fps, quality, seconds as u64, border_raw, button_raw));
 }
 
 unsafe extern "system" fn border_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -780,6 +787,17 @@ struct ScreenGrabber {
     /// 屏幕上的选区尺寸
     src_w: i32,
     src_h: i32,
+    /// DXGI 复制会话：建得起来就走显卡那条路（1080p 抓一帧约 4~7ms，GDI 要 12ms）
+    dxgi: Option<crate::dxgi::Duplicator>,
+    /// DXGI 路的中间 DIB：选区**原生**尺寸，GPU 回读的像素先落这里，再用 GDI 缩到输出尺寸
+    crop_dc: HDC,
+    crop_dib: HBITMAP,
+    crop_bits: *mut u8,
+    crop_w: i32,
+    crop_h: i32,
+    /// 鼠标热点按光标句柄缓存：GetIconInfo 每次都会新建两张位图，没必要每帧都问一遍
+    cursor: HCURSOR,
+    cursor_hot: (i32, i32),
 }
 
 impl ScreenGrabber {
@@ -809,7 +827,63 @@ impl ScreenGrabber {
                 return None;
             }
             SelectObject(memory, dib as HGDIOBJ);
-            let _ = (x, y);
+
+            // 先试试 DXGI：区域完整落在一个显示器里才能建复制会话，失败就纯 GDI
+            let mut dxgi = crate::dxgi::Duplicator::new(x, y, width, height);
+            let mut crop_dc: HDC = std::ptr::null_mut();
+            let mut crop_dib: HBITMAP = std::ptr::null_mut();
+            let mut crop_bits: *mut u8 = std::ptr::null_mut();
+            let (mut crop_w, mut crop_h) = (0, 0);
+            if let Some(duplicator) = &dxgi {
+                let (cw, ch) = (duplicator.width(), duplicator.height());
+                let mut crop_info: BITMAPINFO = std::mem::zeroed();
+                crop_info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                crop_info.bmiHeader.biWidth = cw;
+                // 负高度 = 行序自顶向下，正好和 DXGI 回读的行序一致
+                crop_info.bmiHeader.biHeight = -ch;
+                crop_info.bmiHeader.biPlanes = 1;
+                crop_info.bmiHeader.biBitCount = 32;
+                crop_info.bmiHeader.biCompression = 0;
+                let mut crop_cbits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let crop_dc_new = CreateCompatibleDC(screen);
+                let crop_dib_new = CreateDIBSection(
+                    screen,
+                    &crop_info,
+                    0,
+                    &mut crop_cbits,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if !crop_dc_new.is_null()
+                    && !crop_dib_new.is_null()
+                    && !crop_cbits.is_null()
+                {
+                    SelectObject(crop_dc_new, crop_dib_new as HGDIOBJ);
+                    crop_dc = crop_dc_new;
+                    crop_dib = crop_dib_new;
+                    crop_bits = crop_cbits as *mut u8;
+                    crop_w = cw;
+                    crop_h = ch;
+                } else {
+                    if !crop_dib_new.is_null() {
+                        DeleteObject(crop_dib_new as *mut _);
+                    }
+                    if !crop_dc_new.is_null() {
+                        DeleteDC(crop_dc_new);
+                    }
+                    dxgi = None;
+                }
+            }
+            if dxgi.is_some() {
+                crate::debug_log(&format!(
+                    "rec: DXGI 采集 {width}x{height} → 输出 {out_w}x{out_h}"
+                ));
+            } else {
+                crate::debug_log(&format!(
+                    "rec: GDI 采集 {width}x{height} → 输出 {out_w}x{out_h}"
+                ));
+            }
+
             Some(Self {
                 screen,
                 memory,
@@ -819,18 +893,54 @@ impl ScreenGrabber {
                 height: out_h,
                 src_w: width,
                 src_h: height,
+                dxgi,
+                crop_dc,
+                crop_dib,
+                crop_bits,
+                crop_w,
+                crop_h,
+                cursor: std::ptr::null_mut(),
+                cursor_hot: (0, 0),
             })
         }
     }
 
-    /// 抓一帧 BGRA（顺带把鼠标画进去）
     /// 抓一帧到 `out`；如果和 `prev` 一模一样就返回 false，连拷贝都省了。
     /// 返回 false 也可能是抓屏失败——两种情况在录制循环里处理方式相同（这一帧不要）。
     fn grab_if_changed(&mut self, x: i32, y: i32, prev: &[u8], out: &mut Vec<u8>) -> bool {
         unsafe {
+            // 源：DXGI（已经回读到 crop DIB）或屏幕 DC
+            let mut lost = false;
+            let (origin, src_dc, sx, sy, sw, sh) = if let Some(duplicator) = self.dxgi.as_mut() {
+                let stride = (self.crop_w * 4) as usize;
+                match duplicator.grab(self.crop_bits, stride) {
+                    // 会话断了（切分辨率 / 全屏 / 远程桌面）：这帧不要，之后回落 GDI
+                    crate::dxgi::Grabbed::Lost => {
+                        lost = true;
+                        ((0, 0), self.crop_dc, 0, 0, self.crop_w, self.crop_h)
+                    }
+                    // 没新画面或这一帧读失败：crop DIB 里还是上一帧，照常重画光标后再比对
+                    _ => (
+                        duplicator.origin(),
+                        self.crop_dc,
+                        0,
+                        0,
+                        self.crop_w,
+                        self.crop_h,
+                    ),
+                }
+            } else {
+                ((x, y), self.screen, x, y, self.src_w, self.src_h)
+            };
+            if lost {
+                crate::debug_log("rec: DXGI 会话失效，回落 GDI 采集");
+                self.dxgi = None;
+                return false;
+            }
+
             // 缩放录制：直接让 GDI 边抓边缩，比抓完再缩快一倍
-            let ok = if self.width == self.src_w && self.height == self.src_h {
-                BitBlt(self.memory, 0, 0, self.width, self.height, self.screen, x, y, SRCCOPY)
+            let ok = if self.width == sw && self.height == sh {
+                BitBlt(self.memory, 0, 0, self.width, self.height, src_dc, sx, sy, SRCCOPY)
             } else {
                 SetStretchBltMode(self.memory, COLORONCOLOR);
                 StretchBlt(
@@ -839,11 +949,11 @@ impl ScreenGrabber {
                     0,
                     self.width,
                     self.height,
-                    self.screen,
-                    x,
-                    y,
-                    self.src_w,
-                    self.src_h,
+                    src_dc,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
                     SRCCOPY,
                 )
             };
@@ -855,22 +965,25 @@ impl ScreenGrabber {
             let mut info: CURSORINFO = std::mem::zeroed();
             info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
             if GetCursorInfo(&mut info) != 0 && info.flags & CURSOR_SHOWING != 0 {
-                let mut icon: ICONINFO = std::mem::zeroed();
-                let (mut hot_x, mut hot_y) = (0, 0);
-                if GetIconInfo(info.hCursor, &mut icon) != 0 {
-                    hot_x = icon.xHotspot as i32;
-                    hot_y = icon.yHotspot as i32;
-                    if !icon.hbmMask.is_null() {
-                        DeleteObject(icon.hbmMask as *mut _);
-                    }
-                    if !icon.hbmColor.is_null() {
-                        DeleteObject(icon.hbmColor as *mut _);
+                // 只有光标样子变了才去问热点（图标 / I 形 / 手形之间切换）
+                if info.hCursor != self.cursor {
+                    let mut icon: ICONINFO = std::mem::zeroed();
+                    if GetIconInfo(info.hCursor, &mut icon) != 0 {
+                        self.cursor = info.hCursor;
+                        self.cursor_hot = (icon.xHotspot as i32, icon.yHotspot as i32);
+                        if !icon.hbmMask.is_null() {
+                            DeleteObject(icon.hbmMask as *mut _);
+                        }
+                        if !icon.hbmColor.is_null() {
+                            DeleteObject(icon.hbmColor as *mut _);
+                        }
                     }
                 }
+                let (hot_x, hot_y) = self.cursor_hot;
                 // 光标位置也要按缩放换算
-                let ratio = self.width as f32 / self.src_w.max(1) as f32;
-                let dx = (((info.ptScreenPos.x - x) as f32 - hot_x as f32) * ratio) as i32;
-                let dy = (((info.ptScreenPos.y - y) as f32 - hot_y as f32) * ratio) as i32;
+                let ratio = self.width as f32 / sw.max(1) as f32;
+                let dx = (((info.ptScreenPos.x - origin.0) as f32 - hot_x as f32) * ratio) as i32;
+                let dy = (((info.ptScreenPos.y - origin.1) as f32 - hot_y as f32) * ratio) as i32;
                 if dx > -32 && dy > -32 && dx < self.width && dy < self.height {
                     DrawIconEx(
                         self.memory,
@@ -907,6 +1020,12 @@ impl Drop for ScreenGrabber {
         unsafe {
             DeleteObject(self.dib as *mut _);
             DeleteDC(self.memory);
+            if !self.crop_dib.is_null() {
+                DeleteObject(self.crop_dib as *mut _);
+            }
+            if !self.crop_dc.is_null() {
+                DeleteDC(self.crop_dc);
+            }
             ReleaseDC(std::ptr::null_mut(), self.screen);
         }
     }
@@ -920,6 +1039,7 @@ unsafe fn run(
     height: i32,
     fps: u32,
     quality: u32,
+    limit_seconds: u64,
     border: usize,
     button: usize,
 ) {
@@ -953,8 +1073,9 @@ unsafe fn run(
     // 队列只放 4 帧，编不过来就丢帧，时间戳照样按真实时间走，所以不会拖长时长。
     let started_at = std::time::Instant::now();
     let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
-    let limit_seconds = 20_u64;
 
+    // fps = 0 表示「自动」：交给下面的吞吐上限 + 闭环自己去收敛
+    let fps = if fps == 0 { FPS_MAX } else { fps };
     let pixels = (out_w as i64) * (out_h as i64);
     let (method, mpix_per_sec) = pick_method(pixels, fps);
     let fps = fps.min(fps_cap(pixels, mpix_per_sec));

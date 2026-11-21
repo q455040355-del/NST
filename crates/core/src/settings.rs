@@ -48,6 +48,8 @@ pub struct Settings {
     pub gif_fps: i32,
     /// 录制画质（50 / 65 / 80，对应 libwebp quality；只影响体积和细节，编码耗时几乎不变）
     pub gif_quality: i32,
+    /// 录制时长上限（秒）：10 / 20 / 30
+    pub gif_seconds: i32,
     /// GIF 录制热键
     pub gif_hotkey: String,
     /// 编辑窗是否置顶（记住上次的选择）
@@ -82,6 +84,7 @@ impl Default for Settings {
             gif_enabled: true,
             gif_fps: 30,
             gif_quality: 65,
+            gif_seconds: 20,
             gif_hotkey: "Ctrl+Shift+G".to_string(),
             shot_topmost: false,
             extra: BTreeMap::new(),
@@ -151,6 +154,9 @@ impl Settings {
                 "GifQuality" => {
                     settings.gif_quality = normalize_quality(value.trim().parse().unwrap_or(65))
                 }
+                "GifSeconds" => {
+                    settings.gif_seconds = normalize_seconds(value.trim().parse().unwrap_or(20))
+                }
                 "ShotTopmost" => settings.shot_topmost = parse_bool(value),
                 "GifHotkey" => {
                     if let Some((mods, vk)) = parse_hotkey(value) {
@@ -211,6 +217,7 @@ impl Settings {
         out.push_str(&format!("GifEnabled={}\n", self.gif_enabled));
         out.push_str(&format!("GifFps={}\n", self.gif_fps));
         out.push_str(&format!("GifQuality={}\n", self.gif_quality));
+        out.push_str(&format!("GifSeconds={}\n", self.gif_seconds));
         out.push_str(&format!("GifHotkey={}\n", self.gif_hotkey));
         out.push_str(&format!("ShotTopmost={}\n", self.shot_topmost));
 
@@ -243,6 +250,7 @@ impl Settings {
                     | "GifEnabled"
                     | "GifFps"
                     | "GifQuality"
+                    | "GifSeconds"
                     | "GifHotkey"
                     | "ShotTopmost"
             ) {
@@ -284,14 +292,29 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
-/// 录制帧率只认 30 / 60 / 120，别的值回落到 30
+/// 录制帧率只认 0（自动）/ 30 / 60 / 120，别的值回落到 30
 pub fn normalize_fps(fps: i32) -> i32 {
-    if fps >= 120 {
+    if fps <= 0 {
+        0
+    } else if fps >= 120 {
         120
     } else if fps >= 60 {
         60
     } else {
         30
+    }
+}
+
+/// 录制时长只认 10 / 20 / 30 秒，别的值回落到 20
+pub fn normalize_seconds(seconds: i32) -> i32 {
+    if seconds >= 30 {
+        30
+    } else if seconds >= 20 {
+        20
+    } else if seconds >= 10 {
+        10
+    } else {
+        20
     }
 }
 
@@ -488,10 +511,17 @@ mod tests {
         assert_eq!(normalize_fps(120), 120);
         assert_eq!(normalize_fps(90), 60);
         assert_eq!(normalize_fps(24), 30);
+        // 0 = 自动（交给录制时的吞吐上限 + 闭环）
+        assert_eq!(normalize_fps(0), 0);
+        assert_eq!(normalize_fps(-5), 0);
         assert_eq!(normalize_quality(80), 80);
         assert_eq!(normalize_quality(70), 65);
         assert_eq!(normalize_quality(52), 50);
         assert_eq!(normalize_quality(0), 65);
+        assert_eq!(normalize_seconds(30), 30);
+        assert_eq!(normalize_seconds(21), 20);
+        assert_eq!(normalize_seconds(9), 20);
+        assert_eq!(normalize_seconds(15), 10);
     }
 
     #[test]

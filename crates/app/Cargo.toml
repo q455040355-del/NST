@@ -34,3 +34,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 simd-paddle-ocr-rs = { git = "https://github.com/mg-chao/simd-paddle-ocr-rs.git", rev = "43aba513b661e48eacb04d19f1ff071649116ddf" }
 
 libwebp-sys = "0.14"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+]

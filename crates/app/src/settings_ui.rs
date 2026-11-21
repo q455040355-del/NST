@@ -83,6 +83,7 @@ const SHOT_TITLE_TOP: f32 = 602.0; // 「截图与取字」小标题
 const SHOT_FIRST_TOP: f32 = 626.0; // 截图行
 const SHOT_OCR_TOP: f32 = 674.0; // 取字行
 const SHOT_GIF_TOP: f32 = 722.0; // 录 GIF 行
+const SHOT_REC_TOP: f32 = 768.0; // 录制参数行（画质 / 时长 / 帧率）
 const SHOT_ROW_H: f32 = 44.0;
 
 /// 可滚动内容区：分隔线往下到页脚分割线往上
@@ -106,6 +107,8 @@ enum Hit {
     OcrHotkey,
     GifToggle,
     GifFps,
+    GifQuality,
+    GifSeconds,
     GifHotkey,
     Scrollbar,
     AutoStart,
@@ -350,6 +353,8 @@ struct State {
     ocr_enabled: bool,
     gif_enabled: bool,
     gif_fps: i32,
+    gif_quality: i32,
+    gif_seconds: i32,
     shot_hotkey: String,
     ocr_hotkey: String,
     gif_hotkey: String,
@@ -382,7 +387,9 @@ struct Layout {
     shot_toggle: RECT,
     ocr_toggle: RECT,
     gif_toggle: RECT,
-    /// GIF 行左边的帧率胶囊
+    /// 「录制」行三颗胶囊：画质 / 时长 / 帧率
+    gif_quality: RECT,
+    gif_seconds: RECT,
     gif_fps: RECT,
     shot_hotkey: RECT,
     ocr_hotkey: RECT,
@@ -456,9 +463,20 @@ fn layout(state: &State, client: RECT) -> Layout {
     let hotkey_h = s(26.0, scale);
     let hotkey_right = right - switcher_w - s(10.0, scale);
     let hotkey_left = hotkey_right - hotkey_w;
-    let fps_w = s(66.0, scale);
-    let fps_right = hotkey_left - s(8.0, scale);
-    let fps_left = fps_right - fps_w;
+    // 「录制」行的三颗胶囊（画质 / 时长 / 帧率），单独占一行
+    let rec_top = s(SHOT_REC_TOP, scale);
+    let pill_w = s(74.0, scale);
+    let pill_gap = s(8.0, scale);
+    let pill_h = s(26.0, scale);
+    let pill_x = pad + s(44.0, scale);
+    let pill_y = rec_top + (row_h - pill_h) / 2;
+    let pill = |index: i32| RECT {
+        left: pill_x + index * (pill_w + pill_gap),
+        right: pill_x + index * (pill_w + pill_gap) + pill_w,
+        top: pill_y,
+        bottom: pill_y + pill_h,
+    };
+    let (quality_pill, seconds_pill, fps_pill) = (pill(0), pill(1), pill(2));
 
     Layout {
         close,
@@ -502,12 +520,9 @@ fn layout(state: &State, client: RECT) -> Layout {
             right,
             bottom: gif_top + row_h,
         },
-        gif_fps: RECT {
-            left: fps_left,
-            top: gif_top + (row_h - hotkey_h) / 2,
-            right: fps_right,
-            bottom: gif_top + (row_h - hotkey_h) / 2 + hotkey_h,
-        },
+        gif_fps: fps_pill,
+        gif_quality: quality_pill,
+        gif_seconds: seconds_pill,
         gif_hotkey: RECT {
             left: hotkey_left,
             top: gif_top + (row_h - hotkey_h) / 2,
@@ -1224,7 +1239,7 @@ unsafe fn paint(hwnd: HWND) {
         let mid = (row.top + row.bottom) / 2;
         let hovered = matches!(
             state.hover,
-            Some(Hit::GifToggle) | Some(Hit::GifFps) | Some(Hit::GifHotkey)
+            Some(Hit::GifToggle) | Some(Hit::GifHotkey)
         );
         if hovered {
             p.round(
@@ -1244,7 +1259,7 @@ unsafe fn paint(hwnd: HWND) {
             if state.gif_enabled { c.text } else { c.text2 },
             pad + p.s(4.0),
             row.top + p.s(2.0),
-            l.gif_fps.left - p.s(10.0),
+            l.gif_hotkey.left - p.s(10.0),
             row.top + p.s(24.0),
             DT_LEFT,
         );
@@ -1254,26 +1269,12 @@ unsafe fn paint(hwnd: HWND) {
             c.text3,
             pad + p.s(4.0),
             mid,
-            l.gif_fps.left - p.s(10.0),
+            l.gif_hotkey.left - p.s(10.0),
             row.bottom,
             DT_LEFT,
         );
 
-        // 帧率胶囊：点一下 30 ↔ 60
-        let fps = l.gif_fps;
-        let fps_hover = state.hover == Some(Hit::GifFps);
-        let fps_fill = if fps_hover { c.chip_hover } else { c.chip };
-        p.round(fps.left, fps.top, fps.right, fps.bottom, p.s(8.0), fps_fill, fps_fill);
-        p.text(
-            &format!("{} fps", state.gif_fps),
-            state.fonts.small,
-            if state.gif_enabled { c.text } else { c.text3 },
-            fps.left + p.s(5.0),
-            fps.top,
-            fps.right - p.s(5.0),
-            fps.bottom,
-            DT_CENTER,
-        );
+        // 帧率胶囊搬到了下一行（和画质、时长排一起），这里只保留热键 + 开关
 
         // 热键胶囊
         let hotkey = l.gif_hotkey;
@@ -1344,6 +1345,49 @@ unsafe fn paint(hwnd: HWND) {
                 sw_h / 2 - p.s(3.0),
                 KNOB,
                 mix_white(c.border, 0.05),
+            );
+        }
+
+        // 「录制」行：画质 / 时长 / 帧率，三颗胶囊各自循环
+        let rec_pills: [(RECT, Hit, String); 3] = [
+            (l.gif_quality, Hit::GifQuality, format!("画质 {}", state.gif_quality)),
+            (l.gif_seconds, Hit::GifSeconds, format!("{} 秒", state.gif_seconds)),
+            (
+                l.gif_fps,
+                Hit::GifFps,
+                if state.gif_fps == 0 {
+                    "帧率 自动".to_string()
+                } else {
+                    format!("帧率 {}", state.gif_fps)
+                },
+            ),
+        ];
+        p.text(
+            "录制",
+            state.fonts.small,
+            c.text3,
+            pad + p.s(4.0),
+            rec_pills[0].0.top,
+            rec_pills[0].0.left - p.s(6.0),
+            rec_pills[0].0.bottom,
+            DT_LEFT,
+        );
+        for (rect, hit, label) in rec_pills {
+            let fill = if state.hover == Some(hit) {
+                c.chip_hover
+            } else {
+                c.chip
+            };
+            p.round(rect.left, rect.top, rect.right, rect.bottom, p.s(8.0), fill, fill);
+            p.text(
+                &label,
+                state.fonts.small,
+                if state.gif_enabled { c.text2 } else { c.text3 },
+                rect.left + p.s(4.0),
+                rect.top,
+                rect.right - p.s(4.0),
+                rect.bottom,
+                DT_CENTER,
             );
         }
     }
@@ -1928,7 +1972,7 @@ pub fn open(parent: HWND, settings: &Settings) {
         // 窗口开在鼠标那块屏上：缩放按那块屏算（多屏缩放不同也对）
         let scale = crate::cursor_scale();
         let width_px = s(440.0, scale);
-        let mut height_px = s(836.0, scale);
+        let mut height_px = s(884.0, scale);
 
         let screen = crate::work_area();
 
@@ -1993,6 +2037,8 @@ pub fn open(parent: HWND, settings: &Settings) {
             ocr_enabled: settings.ocr_enabled,
             gif_enabled: settings.gif_enabled,
             gif_fps: settings.gif_fps,
+            gif_quality: settings.gif_quality,
+            gif_seconds: settings.gif_seconds,
             shot_hotkey: settings.shot_hotkey.clone(),
             ocr_hotkey: settings.ocr_hotkey.clone(),
             gif_hotkey: settings.gif_hotkey.clone(),
@@ -2129,6 +2175,16 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.gif_toggle, point) {
         return Some(Hit::GifToggle);
     }
+    // 「录制」行三颗胶囊在 gif 行下沿，先判它们再判整行热区
+    for (rect, hit) in [
+        (l.gif_quality, Hit::GifQuality),
+        (l.gif_seconds, Hit::GifSeconds),
+        (l.gif_fps, Hit::GifFps),
+    ] {
+        if contains(&rect, point) {
+            return Some(hit);
+        }
+    }
     if contains(&l.ai_toggle, point) {
         return Some(Hit::AiToggle);
     }
@@ -2160,6 +2216,8 @@ fn nav_items(state: &State) -> Vec<Hit> {
     items.push(Hit::OcrToggle);
     items.push(Hit::OcrHotkey);
     items.push(Hit::GifToggle);
+    items.push(Hit::GifQuality);
+    items.push(Hit::GifSeconds);
     items.push(Hit::GifFps);
     items.push(Hit::GifHotkey);
     items.push(Hit::AutoStart);
@@ -2180,6 +2238,8 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
         Hit::ShotHotkey => l.shot_hotkey,
         Hit::OcrHotkey => l.ocr_hotkey,
         Hit::GifToggle => l.gif_toggle,
+        Hit::GifQuality => l.gif_quality,
+        Hit::GifSeconds => l.gif_seconds,
         Hit::GifFps => l.gif_fps,
         Hit::GifHotkey => l.gif_hotkey,
         Hit::AutoStart => l.auto_start,
@@ -2275,6 +2335,37 @@ fn toggle_ocr(state: &mut State) {
 fn toggle_gif(state: &mut State) {
     state.gif_enabled = !state.gif_enabled;
     crate::apply_gif_enabled(state.parent, state.gif_enabled);
+}
+
+/// 帧率胶囊：30 → 60 → 120 → 自动 → 30
+fn cycle_gif_fps(state: &mut State) {
+    state.gif_fps = match state.gif_fps {
+        0 => 30,
+        30 => 60,
+        60 => 120,
+        _ => 0,
+    };
+    crate::apply_gif_fps(state.parent, state.gif_fps);
+}
+
+/// 画质胶囊：50 → 65 → 80 → 50
+fn cycle_gif_quality(state: &mut State) {
+    state.gif_quality = match state.gif_quality {
+        50 => 65,
+        65 => 80,
+        _ => 50,
+    };
+    crate::apply_gif_quality(state.parent, state.gif_quality);
+}
+
+/// 时长胶囊：10 → 20 → 30 → 10 秒
+fn cycle_gif_seconds(state: &mut State) {
+    state.gif_seconds = match state.gif_seconds {
+        10 => 20,
+        20 => 30,
+        _ => 10,
+    };
+    crate::apply_gif_seconds(state.parent, state.gif_seconds);
 }
 
 /// 把当前按下的组合键写进对应那一行
@@ -2513,8 +2604,15 @@ unsafe extern "system" fn dialog_proc(
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::GifFps) => {
-                    state.gif_fps = match state.gif_fps { 30 => 60, 60 => 120, _ => 30 };
-                    crate::apply_gif_fps(state.parent, state.gif_fps);
+                    cycle_gif_fps(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::GifQuality) => {
+                    cycle_gif_quality(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::GifSeconds) => {
+                    cycle_gif_seconds(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::GifHotkey) => {
@@ -2605,7 +2703,7 @@ unsafe extern "system" fn dialog_proc(
                 (*state).scroll = 0;
 
                 let width = s(440.0, scale);
-                let mut height = s(790.0, scale);
+                let mut height = s(884.0, scale);
                 let suggested = lparam as *const RECT;
                 let (left, top) = if suggested.is_null() {
                     let mut rect = RECT {
@@ -2720,10 +2818,9 @@ unsafe extern "system" fn dialog_proc(
                     Hit::ShotHotkey => state.capture = 1,
                     Hit::OcrHotkey => state.capture = 2,
                     Hit::GifToggle => toggle_gif(state),
-                    Hit::GifFps => {
-                        state.gif_fps = match state.gif_fps { 30 => 60, 60 => 120, _ => 30 };
-                        crate::apply_gif_fps(state.parent, state.gif_fps);
-                    }
+                    Hit::GifFps => cycle_gif_fps(state),
+                    Hit::GifQuality => cycle_gif_quality(state),
+                    Hit::GifSeconds => cycle_gif_seconds(state),
                     Hit::GifHotkey => state.capture = 3,
                     Hit::AutoStart => toggle_auto_start(state),
                     Hit::Done => {

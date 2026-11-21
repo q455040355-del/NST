@@ -5,6 +5,7 @@
 #![windows_subsystem = "windows"]
 
 mod dialog;
+mod dxgi;
 mod gifrec;
 mod history_ui;
 mod hint;
@@ -1153,8 +1154,9 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         shot::request_gif(
                             hwnd,
-                            settings.gif_fps.max(30) as u32,
+                            settings.gif_fps.max(0) as u32,
                             settings.gif_quality as u32,
+                            settings.gif_seconds as u32,
                         );
                     }
                 }
@@ -1347,9 +1349,10 @@ fn handle_command(hwnd: HWND, command: usize) {
                 if gifrec::is_recording() {
                     gifrec::stop();
                 } else {
-                    let fps = panel.settings.gif_fps.max(30) as u32;
+                    let fps = panel.settings.gif_fps.max(0) as u32;
                     let quality = panel.settings.gif_quality as u32;
-                    shot::request_gif(hwnd, fps, quality);
+                    let seconds = panel.settings.gif_seconds as u32;
+                    shot::request_gif(hwnd, fps, quality, seconds);
                 }
             }
             ID_PANEL_SNAP => {
@@ -1534,11 +1537,27 @@ pub(crate) fn apply_gif_enabled(parent: HWND, enabled: bool) {
     register_hotkeys(parent);
 }
 
-/// 设置里改录制帧率（30 / 60 / 120）：下一次录制生效。
+/// 设置里改录制帧率（自动 / 30 / 60 / 120）：下一次录制生效。
 pub(crate) fn apply_gif_fps(parent: HWND, fps: i32) {
     if let Some(panel) = panel_mut(parent) {
         // 以前这里写死成 `if fps >= 60 { 60 } else { 30 }`，设置界面的 120 存不进去
         panel.settings.gif_fps = netspeed_core::settings::normalize_fps(fps);
+        panel.settings.save();
+    }
+}
+
+/// 设置里改录制画质（50 / 65 / 80）：下一次录制生效。
+pub(crate) fn apply_gif_quality(parent: HWND, quality: i32) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.gif_quality = netspeed_core::settings::normalize_quality(quality);
+        panel.settings.save();
+    }
+}
+
+/// 设置里改录制时长上限（10 / 20 / 30 秒）：下一次录制生效。
+pub(crate) fn apply_gif_seconds(parent: HWND, seconds: i32) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.gif_seconds = netspeed_core::settings::normalize_seconds(seconds);
         panel.settings.save();
     }
 }

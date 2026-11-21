@@ -438,6 +438,7 @@ dependencies = [
  "libwebp-sys",
  "netspeed-core",
  "simd-paddle-ocr-rs",
+ "windows",
  "windows-sys",
 ]
 
