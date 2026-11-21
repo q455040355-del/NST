@@ -43,8 +43,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 边框画在选区**外面**这么多像素（不然会被录进 GIF）
 const BORDER: i32 = 3;
 /// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
-const BAR_W: i32 = 84;
-const BAR_H: i32 = 38;
+const BAR_W: i32 = 120;
+const BAR_H: i32 = 34;
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 0 = 还在录，1 = 结束并复制到剪贴板，2 = 结束并另存为
@@ -263,12 +263,19 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     DeleteObject(border as *mut _);
     DeleteObject(bg as *mut _);
 
-    let icon = 0x0030_3438;
+    // 两半分隔线
+    let half = width / 2;
+    let divider = CreatePen(0, 1, 0x00E4_E8EC);
+    let old = SelectObject(dc, divider as HGDIOBJ);
+    MoveToEx(dc, half, 8, std::ptr::null_mut());
+    LineTo(dc, half, height - 8);
+    SelectObject(dc, old);
+    DeleteObject(divider as *mut _);
+
     // 悬停的那一半铺一层浅灰
     if hover == 0 || hover == 1 {
-        let half = width / 2;
-        let left = if hover == 0 { 2 } else { half };
-        let right = if hover == 0 { half } else { width - 2 };
+        let left = if hover == 0 { 2 } else { half + 1 };
+        let right = if hover == 0 { half - 1 } else { width - 2 };
         let hot = CreateSolidBrush(0x00EE_F2F6);
         let pen = CreatePen(0, 1, 0x00EE_F2F6);
         let ob = SelectObject(dc, hot as HGDIOBJ);
@@ -280,28 +287,45 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
         DeleteObject(hot as *mut _);
     }
 
-    let pen = CreatePen(0, 2, icon);
-    let old = SelectObject(dc, pen as HGDIOBJ);
+    // 文字比手绘图标清楚：「保存」/「结束」
+    let font = CreateFontW(
+        -12,
+        0,
+        0,
+        0,
+        500,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        5,
+        0,
+        wide("Microsoft YaHei UI").as_ptr(),
+    );
+    let old_font = SelectObject(dc, font as HGDIOBJ);
+    SetBkMode(dc, TRANSPARENT as i32);
 
-    // 左：向下的箭头 + 托盘 = 保存
-    let cx = width / 4;
-    let cy = height / 2;
-    MoveToEx(dc, cx, cy - 8, std::ptr::null_mut());
-    LineTo(dc, cx, cy + 2);
-    MoveToEx(dc, cx - 4, cy - 2, std::ptr::null_mut());
-    LineTo(dc, cx, cy + 2);
-    LineTo(dc, cx + 4, cy - 2);
-    MoveToEx(dc, cx - 7, cy + 8, std::ptr::null_mut());
-    LineTo(dc, cx + 7, cy + 8);
-
-    // 右：对勾 = 结束并复制
-    let cx = width * 3 / 4;
-    MoveToEx(dc, cx - 6, cy, std::ptr::null_mut());
-    LineTo(dc, cx - 2, cy + 5);
-    LineTo(dc, cx + 7, cy - 6);
-
-    SelectObject(dc, old);
-    DeleteObject(pen as *mut _);
+    for (index, label) in ["保存", "结束"].into_iter().enumerate() {
+        let _ = index;
+        SetTextColor(dc, 0x0030_3438);
+        let mut rect = RECT {
+            left: index as i32 * half,
+            top: 0,
+            right: (index as i32 + 1) * half,
+            bottom: height,
+        };
+        DrawTextW(
+            dc,
+            wide(label).as_ptr(),
+            -1,
+            &mut rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+    SelectObject(dc, old_font);
+    DeleteObject(font as *mut _);
 }
 
 /// 操作条的圆角半径（固定 10px，跟着系统缩放走）
