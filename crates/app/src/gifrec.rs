@@ -916,12 +916,15 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         last_raw.extend_from_slice(shot);
     }
 
-    // 大区域 + 高帧率时编码器会被打满，整机跟着发涩：按像素数把帧率压到能扛的范围
+    // 编码器是 CPU 单线程跑的：区域越大能扛的帧率越低，分三档
+    //   小区域（≤40 万像素）→ 用户选多少就多少（最高 120）
+    //   中区域（≤120 万像素）→ 最多 60
+    //   大区域（>120 万像素）→ 最多 30
     let pixels = (out_w as i64) * (out_h as i64);
-    let fps = if pixels > 3_000_000 {
-        fps.min(20)
-    } else if pixels > 1_200_000 {
+    let fps = if pixels > 1_200_000 {
         fps.min(30)
+    } else if pixels > 400_000 {
+        fps.min(60)
     } else {
         fps
     };

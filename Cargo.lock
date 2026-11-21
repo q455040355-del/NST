@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-app"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "image",
  "libwebp-sys",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-core"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "rusqlite",
  "ruzstd",
