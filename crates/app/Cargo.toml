@@ -33,3 +33,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # PaddleOCR 推理（Apache-2.0，纯 Rust，无 ONNX Runtime）；上游锁 nightly-2026-09-08
 simd-paddle-ocr-rs = { git = "https://github.com/mg-chao/simd-paddle-ocr-rs.git", rev = "43aba513b661e48eacb04d19f1ff071649116ddf" }
 webp = "0.3"
+libwebp-sys = "0.9"

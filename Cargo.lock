@@ -431,9 +431,10 @@ dependencies = [
 
 [[package]]
 name = "netspeed-app"
-version = "0.1.40"
+version = "0.1.42"
 dependencies = [
  "image",
+ "libwebp-sys",
  "netspeed-core",
  "simd-paddle-ocr-rs",
  "webp",
@@ -442,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-core"
-version = "0.1.40"
+version = "0.1.42"
 dependencies = [
  "rusqlite",
  "ruzstd",

@@ -860,40 +860,28 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     }
 
     // 帧先留着，停止后一次性交给 libwebp 的动画编码器（帧间优化它自己做）
-    // (RGBA 帧, 真实经过的毫秒)：丢掉重复帧后时间戳仍按真实时间走，否则时长会被压缩
-    let mut shots: Vec<(Vec<u8>, i32)> = Vec::new();
+    // 流式编码：抓一帧喂一帧，内存里不攒整段
+    let mut streamer = WebpStreamer::new(width, height, 60.0);
     let started_at = std::time::Instant::now();
     let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
     let mut last_raw: Vec<u8> = Vec::new();
-    // 内存兜底：整段最多占 600MB
-    // 内存兜底：整段最多占 900MB（120fps 下比 30fps 时限短得多）
-    let max_frames = ((900 * 1024 * 1024) / (width.max(1) * height.max(1) * 4) as usize).max(30);
-    // WebP 动画的时间戳是毫秒：120fps 取 8ms（≈125fps），60 取 16，30 取 33
+    // 20 秒上限（流式编码不占内存，这里就是唯一的限制）
+    let limit_seconds = 20_u64;
 
     for shot in &warmup {
-        shots.push((to_rgba(shot), stamp(std::time::Instant::now())));
+        if let Some(streamer) = streamer.as_mut() {
+            streamer.add(shot, stamp(std::time::Instant::now()));
+        }
         last_raw.clear();
         last_raw.extend_from_slice(shot);
     }
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let started = std::time::Instant::now();
-    // 20 秒上限；但内存兜底可能先到（大区域帧太占内存），以更紧的那个为准，
-    // 并且把真实上限显示在倒计时上，避免「以为录了 20 秒其实只录了 1 秒」
-    let memory_seconds = (max_frames as f32 / fps.max(1) as f32).floor() as u64;
-    let limit_seconds = memory_seconds.clamp(1, 20);
     let limit = std::time::Duration::from_secs(limit_seconds);
     let mut next = std::time::Instant::now();
-    if memory_seconds < 20 {
-        crate::debug_log(&format!(
-            "rec: 区域太大，按内存上限只能录 {memory_seconds} 秒（fps={fps}）"
-        ));
-    }
 
-    while STOP_MODE.load(Ordering::Relaxed) == 0
-        && started.elapsed() < limit
-        && shots.len() < max_frames
-    {
+    while STOP_MODE.load(Ordering::Relaxed) == 0 && started.elapsed() < limit {
         set_hud(limit_seconds.saturating_sub(started.elapsed().as_secs()));
         next += interval;
         let now = std::time::Instant::now();
@@ -910,23 +898,33 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             // 画面没变：这一帧直接不要，时间轴照样往前走
             continue;
         }
-        shots.push((to_rgba(&frame), stamp(std::time::Instant::now())));
+        if let Some(streamer) = streamer.as_mut() {
+            streamer.add(&frame, stamp(std::time::Instant::now()));
+        }
         last_raw.clear();
         last_raw.extend_from_slice(&frame);
     }
 
-    // 收尾：画面最后静止的那一段也要算进时长，补一帧（内容同上、时间戳取结束时）
-    if let Some((frame, _)) = shots.last().cloned() {
-        shots.push((frame, stamp(std::time::Instant::now())));
+    // 收尾：把最后那段静止时间也算进时长（再喂一帧同样的内容，时间戳取结束时）
+    if let Some(streamer) = streamer.as_mut() {
+        if !last_raw.is_empty() {
+            streamer.add(&last_raw, stamp(std::time::Instant::now()));
+        }
     }
 
     let mode = STOP_MODE.load(Ordering::SeqCst);
-    let bytes = encode_webp(width, height, &shots, (1000 / fps.max(1) as i32).max(1));
-    crate::debug_log(&format!("rec done: frames={} bytes={} size={width}x{height}", shots.len(), bytes.len()));
+    let bytes = match streamer {
+        Some(streamer) => streamer.finish(),
+        None => Vec::new(),
+    };
+    crate::debug_log(&format!(
+        "rec done: bytes={} size={width}x{height} limit={limit_seconds}s",
+        bytes.len()
+    ));
     finish(border, button);
 
     if bytes.is_empty() {
-        crate::debug_log(&format!("rec empty: frames={} mode={mode}", shots.len()));
+        crate::debug_log(&format!("rec empty: mode={mode}"));
     }
     if !bytes.is_empty() {
         unsafe {
@@ -943,51 +941,144 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 }
 
 /// BGRA → RGBA（libwebp 的动画编码器只吃 RGB / RGBA）
-fn to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut out = bgra.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    out
+// ---------------------------------------------------------------- 流式 WebP 编码
+//
+// 不再把整段帧攒在内存里：每抓一帧就 WebPAnimEncoderAdd 进去，
+// 内存只占当前这一帧，所以 20 秒 / 60fps / 全屏都扛得住。
+
+struct WebpStreamer {
+    encoder: *mut libwebp_sys::WebPAnimEncoder,
+    config: libwebp_sys::WebPConfig,
+    width: i32,
+    height: i32,
 }
 
-/// 用 libwebp 的动画编码器出 WebP（帧间优化、重复帧、调色板它自己处理）
-fn encode_webp(width: i32, height: i32, frames: &[(Vec<u8>, i32)], delay_ms: i32) -> Vec<u8> {
-    if frames.is_empty() {
-        return Vec::new();
-    }
-    let mut config = webp::WebPConfig::new().unwrap();
-    config.quality = 60.0;
-    config.method = 4;
-    config.lossless = 0;
-    config.thread_level = 1;
+impl WebpStreamer {
+    fn new(width: i32, height: i32, quality: f32) -> Option<Self> {
+        unsafe {
+            let mut options: libwebp_sys::WebPAnimEncoderOptions = std::mem::zeroed();
+            if libwebp_sys::WebPAnimEncoderOptionsInitInternal(
+                &mut options,
+                libwebp_sys::WEBP_MUX_ABI_VERSION as i32,
+            ) == 0
+            {
+                return None;
+            }
+            options.anim_params.loop_count = 0;
+            options.minimize_size = 1;
 
-    let mut encoder = webp::AnimEncoder::new(width.max(1) as u32, height.max(1) as u32, &config);
-    encoder.set_loop_count(0);
-    // 时间戳必须是递增的真实时间：中间丢掉重复帧后不能拿序号乘帧间隔，否则时长会变短
-    let mut previous_ts = -1;
-    for (frame, ts) in frames {
-        let mut timestamp = (*ts).max(previous_ts + 1).max(0);
-        if false && previous_ts >= 0 {
-            // 长时间不变（比如录屏时画面静止）：留一点真实等待，但不要超长
-            timestamp = previous_ts + delay_ms * 8;
+            let encoder = libwebp_sys::WebPAnimEncoderNewInternal(
+                width.max(1),
+                height.max(1),
+                &options,
+                // 这个参数要的是 mux 的 ABI 版本，不是 encoder 的（传错会直接返回空）
+                libwebp_sys::WEBP_MUX_ABI_VERSION as i32,
+            );
+            if encoder.is_null() {
+                crate::debug_log("webp: NewInternal 返回空");
+                return None;
+            }
+
+            let mut config: libwebp_sys::WebPConfig = std::mem::zeroed();
+            if libwebp_sys::WebPConfigInitInternal(
+                &mut config,
+                libwebp_sys::WebPPreset::WEBP_PRESET_DEFAULT,
+                quality,
+                libwebp_sys::WEBP_ENCODER_ABI_VERSION as i32,
+            ) == 0
+            {
+                crate::debug_log("webp: ConfigInit 失败");
+                libwebp_sys::WebPAnimEncoderDelete(encoder);
+                return None;
+            }
+            config.method = 4;
+            config.lossless = 0;
+            config.thread_level = 1;
+            if libwebp_sys::WebPValidateConfig(&config) == 0 {
+                crate::debug_log("webp: 配置校验失败");
+            }
+
+            Some(Self {
+                encoder,
+                config,
+                width: width.max(1),
+                height: height.max(1),
+            })
         }
-        previous_ts = timestamp;
-        encoder.add_frame(webp::AnimFrame::from_rgba(
-            frame,
-            width.max(1) as u32,
-            height.max(1) as u32,
-            timestamp,
-        ));
     }
-    match encoder.try_encode() {
-        Ok(memory) => memory.to_vec(),
-        Err(error) => {
-            crate::debug_log(&format!("webp encode failed: {error:?} frames={}", frames.len()));
-            Vec::new()
+
+    /// 喂一帧（BGRA，行序自顶向下），timestamp 是毫秒
+    fn add(&mut self, bgra: &[u8], timestamp_ms: i32) -> bool {
+        unsafe {
+            let mut picture: libwebp_sys::WebPPicture = std::mem::zeroed();
+            if libwebp_sys::WebPPictureInitInternal(
+                &mut picture,
+                libwebp_sys::WEBP_ENCODER_ABI_VERSION as i32,
+            ) == 0
+            {
+                return false;
+            }
+            picture.use_argb = 1;
+            picture.width = self.width;
+            picture.height = self.height;
+            if libwebp_sys::WebPPictureImportBGRA(
+                &mut picture,
+                bgra.as_ptr(),
+                self.width * 4,
+            ) == 0
+            {
+                libwebp_sys::WebPPictureFree(&mut picture);
+                return false;
+            }
+            let ok = libwebp_sys::WebPAnimEncoderAdd(
+                self.encoder,
+                &mut picture,
+                timestamp_ms,
+                &self.config,
+            ) != 0;
+            if !ok {
+                let message = libwebp_sys::WebPAnimEncoderGetError(self.encoder);
+                let text = if message.is_null() {
+                    "?".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(message).to_string_lossy().to_string()
+                };
+                crate::debug_log(&format!("webp: Add 失败 ts={timestamp_ms}: {text}"));
+            }
+            libwebp_sys::WebPPictureFree(&mut picture);
+            ok
+        }
+    }
+
+    /// 收尾：拿到完整 WebP 字节
+    fn finish(self) -> Vec<u8> {
+        unsafe {
+            let mut data = libwebp_sys::WebPData {
+                bytes: std::ptr::null(),
+                size: 0,
+            };
+            let mut out = Vec::new();
+            if libwebp_sys::WebPAnimEncoderAssemble(self.encoder, &mut data) != 0
+                && !data.bytes.is_null()
+                && data.size > 0
+            {
+                out.extend_from_slice(std::slice::from_raw_parts(data.bytes, data.size));
+            } else {
+                crate::debug_log(&format!(
+                    "webp: Assemble 失败 size={} ptr_null={}",
+                    data.size,
+                    data.bytes.is_null()
+                ));
+            }
+            if !data.bytes.is_null() {
+                libwebp_sys::WebPFree(data.bytes as *mut std::ffi::c_void);
+            }
+            libwebp_sys::WebPAnimEncoderDelete(self.encoder);
+            out
         }
     }
 }
+
 
 fn finish(border: HWND, button: HWND) {
     unsafe {
