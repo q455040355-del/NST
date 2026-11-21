@@ -8,15 +8,23 @@
 //!
 //! 采集和编码在同一个后台线程里，边拍边写进内存，不会攒几千张整帧位图。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, ReleaseDC, SelectObject,
-    SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, RGN_DIFF, SRCCOPY,
-    LineTo, MoveToEx,
+use windows_sys::Win32::Foundation::{
+    HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+    BITMAPINFO, BITMAPINFOHEADER, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ,
+    LineTo, MoveToEx, PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
+};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -27,23 +35,36 @@ use crate::theme::wide;
 
 const BORDER_CLASS: &str = "NetSpeedTaskbarRs.GifBorder";
 const STOP_CLASS: &str = "NetSpeedTaskbarRs.GifStop";
+const TOAST_CLASS: &str = "NetSpeedTaskbarRs.RecToast";
+const CF_DIB: u32 = 8;
+const CF_HDROP: u32 = 15;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// 边框画在选区**外面**这么多像素（不然会被录进 GIF）
 const BORDER: i32 = 3;
-const STOP_SIZE: i32 = 34;
+/// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
+const BAR_W: i32 = 84;
+const BAR_H: i32 = 38;
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
-static STOP_REQUEST: AtomicBool = AtomicBool::new(false);
-
+/// 0 = 还在录，1 = 结束并复制到剪贴板，2 = 结束并另存为
+static STOP_MODE: AtomicU8 = AtomicU8::new(0);
+/// 鼠标悬停在操作条左半（0）还是右半（1）；9 = 没有悬停
+static BAR_HOVER: AtomicI32 = AtomicI32::new(9);
 
 pub fn is_recording() -> bool {
     RECORDING.load(Ordering::Relaxed)
 }
 
-/// 让录制停下来（热键 / 点 ✔ 都走这里）
+/// 结束录制并复制到剪贴板（热键 / ✔ 都走这里）
 pub fn stop() {
-    if is_recording() {
-        STOP_REQUEST.store(true, Ordering::SeqCst);
+    stop_with(1);
+}
+
+/// `1` = 复制到剪贴板，`2` = 弹另存为
+pub fn stop_with(mode: u8) {
+    if is_recording() && STOP_MODE.load(Ordering::SeqCst) == 0 {
+        STOP_MODE.store(mode, Ordering::SeqCst);
     }
 }
 
@@ -53,7 +74,8 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     if w < 16 || h < 16 || RECORDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    STOP_REQUEST.store(false, Ordering::SeqCst);
+    STOP_MODE.store(0, Ordering::SeqCst);
+    BAR_HOVER.store(9, Ordering::SeqCst);
 
 
     let instance = GetModuleHandleW(std::ptr::null());
@@ -115,20 +137,18 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     };
     RegisterClassW(&stop_wc);
 
-    // ✔ 结束按钮：优先放在选区右上角**外侧**（不会被录进去）；
+    // 操作条：优先放在选区右上角**外侧**（不会被录进去）；
     // 贴着屏幕上沿/右沿时依次尝试右侧、下方，实在没地方才压进选区里
     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    let fits = |bx: i32, by: i32| {
-        bx >= vx && by >= vy && bx + STOP_SIZE <= vx + vw && by + STOP_SIZE <= vy + vh
-    };
+    let fits = |bx: i32, by: i32| bx >= vx && by >= vy && bx + BAR_W <= vx + vw && by + BAR_H <= vy + vh;
     let candidates = [
-        (x + w - STOP_SIZE, y - STOP_SIZE - BORDER - 2),
+        (x + w - BAR_W, y - BAR_H - BORDER - 2),
         (x + w + BORDER + 4, y),
-        (x + w - STOP_SIZE, y + h + BORDER + 4),
-        (x + w - STOP_SIZE, y + 2),
+        (x + w - BAR_W, y + h + BORDER + 4),
+        (x + w - BAR_W, y + 2),
     ];
     let (button_x, button_y) = candidates
         .into_iter()
@@ -137,12 +157,12 @@ pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
     let button = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         stop_class.as_ptr(),
-        wide("结束录制").as_ptr(),
+        wide("录制操作").as_ptr(),
         WS_POPUP | WS_VISIBLE,
         button_x,
         button_y,
-        STOP_SIZE,
-        STOP_SIZE,
+        BAR_W,
+        BAR_H,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         instance,
@@ -182,12 +202,34 @@ unsafe extern "system" fn stop_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
-            paint_stop(dc);
+            let hover = BAR_HOVER.load(Ordering::Relaxed);
+            paint_bar(hwnd, dc, hover);
             EndPaint(hwnd, &mut ps);
             0
         }
+        WM_MOUSEMOVE => {
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let hover = if x < BAR_W / 2 { 0 } else { 1 };
+            if BAR_HOVER.swap(hover, Ordering::SeqCst) != hover {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                // 鼠标移出窗口时要收回高亮
+                let mut track: TRACKMOUSEEVENT = std::mem::zeroed();
+                track.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                TrackMouseEvent(&mut track);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            BAR_HOVER.store(9, Ordering::SeqCst);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_LBUTTONUP => {
-            stop();
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            // 左半 = 保存，右半 = ✔（结束并复制到剪贴板）
+            stop_with(if x < BAR_W / 2 { 2 } else { 1 });
             0
         }
         WM_CLOSE => {
@@ -202,26 +244,308 @@ unsafe extern "system" fn stop_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
 }
 
-/// ✔ 按钮：深色圆角底 + 白色对勾
-unsafe fn paint_stop(dc: HDC) {
-    let size = STOP_SIZE;
-    let brush = CreateSolidBrush(0x0026_1C18);
-    let pen = CreatePen(0, 2, 0x00FF_FFFF);
-    let old_brush = SelectObject(dc, brush as HGDIOBJ);
-    let old_pen = SelectObject(dc, pen as HGDIOBJ);
-    windows_sys::Win32::Graphics::Gdi::Ellipse(dc, 0, 0, size, size);
+/// 操作条：白色圆角卡片，左边下载图标（保存），右边对勾（结束并复制）
+unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    let width = BAR_W;
+    let height = BAR_H;
+
+    // 卡片底色 + 细边框（不用 UpdateLayeredWindow，圆角用 RoundRect 画）
+    let bg = CreateSolidBrush(0x00FF_FFFF);
+    let border = CreatePen(0, 1, 0x00D8_DCE0);
+    let old_brush = SelectObject(dc, bg as HGDIOBJ);
+    let old_pen = SelectObject(dc, border as HGDIOBJ);
+    RoundRect(dc, 0, 0, width, height, s_round(), s_round());
     SelectObject(dc, old_pen);
     SelectObject(dc, old_brush);
-    DeleteObject(pen as *mut _);
-    DeleteObject(brush as *mut _);
+    DeleteObject(border as *mut _);
+    DeleteObject(bg as *mut _);
 
-    let pen = CreatePen(0, 3, 0x00FF_FFFF);
+    let icon = 0x0030_3438;
+    // 悬停的那一半铺一层浅灰
+    if hover == 0 || hover == 1 {
+        let half = width / 2;
+        let left = if hover == 0 { 2 } else { half };
+        let right = if hover == 0 { half } else { width - 2 };
+        let hot = CreateSolidBrush(0x00EE_F2F6);
+        let pen = CreatePen(0, 1, 0x00EE_F2F6);
+        let ob = SelectObject(dc, hot as HGDIOBJ);
+        let op = SelectObject(dc, pen as HGDIOBJ);
+        RoundRect(dc, left, 2, right, height - 2, 8, 8);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(pen as *mut _);
+        DeleteObject(hot as *mut _);
+    }
+
+    let pen = CreatePen(0, 2, icon);
     let old = SelectObject(dc, pen as HGDIOBJ);
-    MoveToEx(dc, size / 4, size / 2, std::ptr::null_mut());
-    LineTo(dc, size * 5 / 12, size * 3 / 4);
-    LineTo(dc, size * 3 / 4, size / 3);
+
+    // 左：向下的箭头 + 托盘 = 保存
+    let cx = width / 4;
+    let cy = height / 2;
+    MoveToEx(dc, cx, cy - 8, std::ptr::null_mut());
+    LineTo(dc, cx, cy + 2);
+    MoveToEx(dc, cx - 4, cy - 2, std::ptr::null_mut());
+    LineTo(dc, cx, cy + 2);
+    LineTo(dc, cx + 4, cy - 2);
+    MoveToEx(dc, cx - 7, cy + 8, std::ptr::null_mut());
+    LineTo(dc, cx + 7, cy + 8);
+
+    // 右：对勾 = 结束并复制
+    let cx = width * 3 / 4;
+    MoveToEx(dc, cx - 6, cy, std::ptr::null_mut());
+    LineTo(dc, cx - 2, cy + 5);
+    LineTo(dc, cx + 7, cy - 6);
+
     SelectObject(dc, old);
     DeleteObject(pen as *mut _);
+}
+
+/// 操作条的圆角半径（固定 10px，跟着系统缩放走）
+fn s_round() -> i32 {
+    10
+}
+
+/// 录完复制到剪贴板：CF_DIB（首帧静态图）+ 文件（动画本体，能贴进聊天窗口）
+pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    // 动画 WebP 先落到临时文件，剪贴板里放文件路径，微信/QQ/浏览器都认
+    let mut stamp: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
+    windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut stamp);
+    let dir = std::env::temp_dir().join("NST");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!(
+        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}_{}.webp",
+        stamp.wYear,
+        stamp.wMonth,
+        stamp.wDay,
+        stamp.wHour,
+        stamp.wMinute,
+        stamp.wSecond,
+        stamp.wMilliseconds
+    ));
+    if std::fs::write(&path, &bytes).is_err() {
+        return;
+    }
+
+    // 首帧解出来放 CF_DIB：不支持文件拖放的编辑器也能直接粘贴
+    let dib = webp::AnimDecoder::new(&bytes)
+        .decode()
+        .ok()
+        .and_then(|frames| frames.get_frame(0).and_then(|frame| rgba_to_dib(&frame)))
+        ;
+
+    if OpenClipboard(owner) == 0 {
+        return;
+    }
+    EmptyClipboard();
+
+    if let Some((data, len)) = dib {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, len);
+        if !handle.is_null() {
+            let lock = GlobalLock(handle) as *mut u8;
+            if !lock.is_null() {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), lock, len);
+                GlobalUnlock(handle);
+                SetClipboardData(CF_DIB, handle as *mut _);
+            }
+        }
+    }
+
+    // CF_HDROP：一个文件路径
+    let wide_path: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let header = std::mem::size_of::<u32>() * 5; // DROPFILES
+    let size = header + wide_path.len() * 2 + 2;
+    let handle = GlobalAlloc(GMEM_MOVEABLE, size);
+    if !handle.is_null() {
+        let lock = GlobalLock(handle) as *mut u8;
+        if !lock.is_null() {
+            let drop = lock as *mut DropFiles;
+            (*drop).pFiles = header as u32;
+            (*drop).fWide = 1;
+            let dest = lock.add(header) as *mut u16;
+            std::ptr::copy_nonoverlapping(wide_path.as_ptr(), dest, wide_path.len());
+            *dest.add(wide_path.len()) = 0;
+            GlobalUnlock(handle);
+            SetClipboardData(CF_HDROP, handle as *mut _);
+        }
+    }
+
+    // 自定义格式：浏览器 / Electron 里能直接当图片粘
+    let format = RegisterClipboardFormatW(wide("image/webp").as_ptr());
+    if format != 0 {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+        if !handle.is_null() {
+            let lock = GlobalLock(handle) as *mut u8;
+            if !lock.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), lock, bytes.len());
+                GlobalUnlock(handle);
+                SetClipboardData(format, handle as *mut _);
+            }
+        }
+    }
+
+    CloseClipboard();
+    show_toast("已复制到剪贴板");
+}
+
+/// CF_HDROP 的 DROPFILES 头（字段名沿用 Win32）
+#[repr(C)]
+#[allow(non_snake_case)]
+struct DropFiles {
+    pFiles: u32,
+    pt: [i32; 2],
+    fNC: i32,
+    fWide: i32,
+}
+
+/// RGBA 帧 → CF_DIB（32 位、行序自下而上）
+fn rgba_to_dib(frame: &webp::AnimFrame) -> Option<(Vec<u8>, usize)> {
+    let w = frame.width() as usize;
+    let h = frame.height() as usize;
+    let src = frame.get_image();
+    if w == 0 || h == 0 || src.len() < w * h * 4 {
+        return None;
+    }
+    let size = 40 + w * h * 4;
+    let mut out = vec![0u8; size];
+    out[0..4].copy_from_slice(&40u32.to_le_bytes());
+    out[4..8].copy_from_slice(&(w as i32).to_le_bytes());
+    out[8..12].copy_from_slice(&(h as i32).to_le_bytes());
+    out[12..14].copy_from_slice(&1u16.to_le_bytes());
+    out[14..16].copy_from_slice(&32u16.to_le_bytes());
+    for row in 0..h {
+        let src_row = h - 1 - row;
+        let src_offset = src_row * w * 4;
+        let dst_offset = 40 + row * w * 4;
+        for x in 0..w {
+            let s = src_offset + x * 4;
+            let d = dst_offset + x * 4;
+            out[d] = src[s + 2];
+            out[d + 1] = src[s + 1];
+            out[d + 2] = src[s];
+            out[d + 3] = src[s + 3];
+        }
+    }
+    Some((out, size))
+}
+
+/// 复制成功的小提示：屏幕中上方一个深色胶囊，1.3 秒后自己消失
+pub unsafe fn show_toast(text: &str) {
+    let class = wide(TOAST_CLASS);
+    let instance = GetModuleHandleW(std::ptr::null());
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(toast_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: instance,
+        hIcon: std::ptr::null_mut(),
+        hCursor: std::ptr::null_mut(),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: class.as_ptr(),
+    };
+    RegisterClassW(&wc);
+
+    let text_w = text.chars().count() as i32 * 14 + 40;
+    let w = text_w.max(150);
+    let h = 40;
+    let mut cursor: POINT = std::mem::zeroed();
+    GetCursorPos(&mut cursor);
+    let x = cursor.x - w / 2;
+    let y = cursor.y + 48;
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        class.as_ptr(),
+        wide("提示").as_ptr(),
+        WS_POPUP | WS_VISIBLE,
+        x,
+        y,
+        w,
+        h,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        return;
+    }
+    SetWindowTextW(hwnd, wide(text).as_ptr());
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+    windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+    let raw = hwnd as usize;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        PostMessageW(raw as HWND, WM_CLOSE, 0, 0);
+    });
+}
+
+unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            let bg = CreateSolidBrush(0x0022_2629);
+            let pen = CreatePen(0, 1, 0x0022_2629);
+            let ob = SelectObject(dc, bg as HGDIOBJ);
+            let op = SelectObject(dc, pen as HGDIOBJ);
+            RoundRect(dc, 0, 0, client.right, client.bottom, client.bottom, client.bottom);
+            SelectObject(dc, op);
+            SelectObject(dc, ob);
+            DeleteObject(pen as *mut _);
+            DeleteObject(bg as *mut _);
+
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, 0x00F5_F7F9);
+            let font = CreateFontW(
+                -14,
+                0,
+                0,
+                0,
+                500,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                5,
+                0,
+                wide("Microsoft YaHei UI").as_ptr(),
+            );
+            let old_font = SelectObject(dc, font as HGDIOBJ);
+            let mut rect = client;
+            DrawTextW(
+                dc,
+                wide("已复制到剪贴板").as_ptr(),
+                -1,
+                &mut rect,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+            );
+            SelectObject(dc, old_font);
+            DeleteObject(font as *mut _);
+            EndPaint(hwnd, &mut ps);
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 // ---------------------------------------------------------------- 采集 + 编码
@@ -367,7 +691,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let limit = std::time::Duration::from_secs(20);
     let mut next = std::time::Instant::now();
 
-    while !STOP_REQUEST.load(Ordering::Relaxed)
+    while STOP_MODE.load(Ordering::Relaxed) == 0
         && started.elapsed() < limit
         && shots.len() < max_frames
     {
@@ -391,6 +715,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         last_raw.extend_from_slice(&frame);
     }
 
+    let mode = STOP_MODE.load(Ordering::SeqCst);
     let bytes = encode_webp(width, height, &shots, delay_ms);
     finish(border, button);
 
@@ -399,7 +724,8 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             let pointer = Box::into_raw(Box::new(bytes));
             let target = panel as HWND;
             if !target.is_null() {
-                PostMessageW(target, crate::WM_APP_GIF_DONE, pointer as WPARAM, 0);
+                // lparam 告诉主窗口：1 = 复制到剪贴板，2 = 另存为
+                PostMessageW(target, crate::WM_APP_GIF_DONE, pointer as WPARAM, mode as LPARAM);
             } else {
                 drop(Box::from_raw(pointer));
             }
@@ -455,7 +781,7 @@ fn finish(border: HWND, button: HWND) {
         }
     }
     RECORDING.store(false, Ordering::SeqCst);
-    STOP_REQUEST.store(false, Ordering::SeqCst);
+    STOP_MODE.store(0, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------- 保存

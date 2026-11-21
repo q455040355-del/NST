@@ -1,0 +1,33 @@
+// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
+const BAR_W: i32 = 84;
+const BAR_H: i32 = 38;
+
+/// 0 = 还在录，1 = 结束并复制到剪贴板，2 = 结束并另存为
+static STOP_MODE: AtomicU8 = AtomicU8::new(0);
+/// 鼠标悬停在操作条左半（0）还是右半（1）；9 = 没有悬停
+static BAR_HOVER: AtomicI32 = AtomicI32::new(9);
+
+pub fn is_recording() -> bool {
+    RECORDING.load(Ordering::Relaxed)
+}
+
+/// 结束录制并复制到剪贴板（热键 / ✔ 都走这里）
+pub fn stop() {
+    stop_with(1);
+}
+
+/// `1` = 复制到剪贴板，`2` = 弹另存为
+pub fn stop_with(mode: u8) {
+    if is_recording() && STOP_MODE.load(Ordering::SeqCst) == 0 {
+        STOP_MODE.store(mode, Ordering::SeqCst);
+    }
+}
+
+/// 开始录制一块屏幕区域（物理像素）。只负责开窗口，真正采集在后台线程。
+pub unsafe fn start(panel: HWND, rect: (i32, i32, i32, i32), fps: u32) {
+    let (x, y, w, h) = rect;
+    if w < 16 || h < 16 || RECORDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    STOP_MODE.store(0, Ordering::SeqCst);
+    BAR_HOVER.store(9, Ordering::SeqCst);

@@ -1148,7 +1148,12 @@ unsafe extern "system" fn wnd_proc(
             let pointer = wparam as *mut Vec<u8>;
             if !pointer.is_null() {
                 let bytes = *Box::from_raw(pointer);
-                gifrec::save_and_notify(hwnd, bytes);
+                // 1 = 复制到剪贴板（默认），2 = 另存为
+                if lparam == 2 {
+                    gifrec::save_and_notify(hwnd, bytes);
+                } else {
+                    gifrec::copy_to_clipboard(hwnd, bytes);
+                }
             }
             0
         }
