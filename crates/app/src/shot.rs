@@ -2307,7 +2307,7 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
 // 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
 
 const PACK_CELL: u32 = 176;
-const PACK_COUNT: usize = 13;
+const PACK_COUNT: usize = 16;
 
 struct IconPack {
     /// 每格 PACK_CELL×PACK_CELL 的灰度蒙版（0=透明，255=实心）
@@ -2365,21 +2365,21 @@ fn load_icon_pack() -> Option<IconPack> {
     }
 }
 
-/// 动作 → 素材包里的第几格（顺序见 target/make_icon_sheet.py）
+/// 动作 → 素材包里的第几格（顺序照设计稿 01..16，见 target/make_design_sheet.py）
 fn pack_index(action: Action) -> Option<usize> {
     Some(match action {
         Action::Tool(Tool::Rect) => 0,
         Action::Tool(Tool::Ellipse) => 1,
-        Action::Tool(Tool::Arrow) => 2,
-        Action::Tool(Tool::Pen) => 3,
-        Action::Tool(Tool::Mosaic) => 4,
-        Action::Tool(Tool::Text) => 5,
-        Action::Tool(Tool::Ocr) => 6,
-        Action::Undo => 7,
-        Action::Save => 8,
-        Action::Pin => 9,
-        Action::Close => 11,
-        Action::Done => 12,
+        Action::Tool(Tool::Arrow) => 3,
+        Action::Tool(Tool::Pen) => 4,
+        Action::Tool(Tool::Mosaic) => 5,
+        Action::Tool(Tool::Text) => 6,
+        Action::Tool(Tool::Ocr) => 8,
+        Action::Undo => 10,
+        Action::Save => 11,
+        Action::Pin => 12,
+        Action::Close => 14,
+        Action::Done => 15,
         _ => return None,
     })
 }

@@ -243,9 +243,11 @@ powershell -File scripts\smoke.ps1 -Dark
 $env:NST_EDITOR_PREVIEW = "$PWD\target\editor.png"; .\target\release\netspeed.exe
 ```
 
-编辑窗的图标优先用 **exe 同目录的 `icons.png`**（13 格 × 176px 的灰度蒙版横向拼图，
-每格一个图标，顺序见 `target/make_icon_sheet.py`），有就贴图、没有就退回代码里自绘的那套。
+编辑窗的图标优先用 **exe 同目录的 `icons.png`**（16 格 × 176px 的灰度蒙版横向拼图，
+顺序就是设计稿的 01..16：矩形/圆形/表情/箭头/画笔/马赛克/文本/翻译/识图/滚动/撤销/保存/图钉/转发/取消/完成），
+有就贴图、没有就退回代码里自绘的那套。
 这份素材**不在仓库里**（版权原因只在部署目录放），换图标只要替换这个 png，不用重新编译。
+素材是从 `截图工具栏矢量图标设计稿.pdf` 的矢量预览格子渲染出来的（`target/make_design_sheet.py`，900 DPI）。
 
 CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --workspace` 和
 `cargo check --workspace --all-targets`；界面相关的验证只能本地跑 smoke。
