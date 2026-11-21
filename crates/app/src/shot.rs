@@ -741,10 +741,6 @@ unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
     // 默认放鼠标右下，贴边就翻到另一侧
     let gap = s(26.0);
     let mut left = cx + gap;
-    if state.start.is_some() {
-        // 已经在拖框了：放大镜挡住选区，收起来
-        return;
-    }
     let mut top = cy + gap;
     if left + width > state.shot.width {
         left = cx - gap - width;
@@ -951,6 +947,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     }
                     if state.start.is_some() {
                         state.current = current;
+                        state.cursor = current;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 } else {

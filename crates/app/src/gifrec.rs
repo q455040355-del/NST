@@ -698,9 +698,21 @@ impl ScreenGrabber {
                 let dx = info.ptScreenPos.x - x - hot_x;
                 let dy = info.ptScreenPos.y - y - hot_y;
                 if dx > -32 && dy > -32 && dx < self.width && dy < self.height {
-                    DrawIconEx(self.memory, dx, dy, info.hCursor, 0, 0, 0, std::ptr::null_mut(), DI_NORMAL);
+                    DrawIconEx(
+                        self.memory,
+                        dx,
+                        dy,
+                        info.hCursor,
+                        0,
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        DI_NORMAL,
+                    );
                 }
             }
+            // GDI 是批处理的：不刷一次，读出来的 DIB 里可能还没有鼠标
+            windows_sys::Win32::Graphics::Gdi::GdiFlush();
 
             let len = (self.width * self.height * 4) as usize;
             out.clear();
