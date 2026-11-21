@@ -40,6 +40,19 @@ jobs:
           }
           Copy-Item -Recurse models $dir
 
+          # 把这次构建的身份写进包里，省得看 exe 时间戳猜是不是最新：
+          # exe 的时间就是「构建完成时间」，一定比 checkout 出来的源码新
+          $exe = Get-Item target/release/netspeed.exe
+          $info = @(
+            "tag         : $tag"
+            "commit      : ${{ github.sha }}"
+            "built at    : $($exe.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+            "exe size    : $($exe.Length) bytes"
+            "exe md5     : $((Get-FileHash $exe -Algorithm MD5).Hash)"
+            "rustc       : $((rustc --version))"
+          )
+          $info | Set-Content -Path (Join-Path $dir "build-info.txt") -Encoding UTF8
+
           Compress-Archive -Path $dir -DestinationPath "netspeed-$tag-win64.zip" -Force
           Get-ChildItem "netspeed-$tag-win64.zip" | Select-Object Name, Length
 
