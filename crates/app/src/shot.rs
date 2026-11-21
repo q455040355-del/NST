@@ -3023,32 +3023,49 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let max_w = ((work.right - work.left) as f32 * 0.85) as i32;
     // 上下两条工具栏 + 底部提示也要占高度，算缩放时先扣掉，否则窗口比屏幕高、底部会被裁掉
     let chrome = s(44.0) * 2 + s(24.0);
-    let max_h = ((work.bottom - work.top) as f32 * 0.8) as i32 - chrome;
+    let work_w = work.right - work.left;
+    let work_h = work.bottom - work.top;
+    let max_h = (work_h as f32 * 0.8) as i32 - chrome;
 
-    let scale = (max_w as f32 / bitmap.width as f32)
+    let mut scale = (max_w as f32 / bitmap.width as f32)
         .min(max_h as f32 / bitmap.height as f32)
         .min(1.0);
+
+    let toolbar = s(44.0);
+    let hint = s(24.0);
+
+    // 原位摆放装不下（比如整窗最大化，顶部没有地方放工具栏）就缩一点，
+    // 保证「整张图 + 上下两条工具栏」都在屏幕里 —— 宁可稍微缩小，也不能把图裁掉
+    let fits_in_place = |scale: f32| {
+        let height = toolbar + (bitmap.height as f32 * scale) as i32 + toolbar + hint;
+        rect.1 - toolbar >= work.top && rect.1 - toolbar + height <= work.bottom
+    };
+    if !fits_in_place(scale) {
+        let fit_h = ((work_h - chrome) as f32 / bitmap.height as f32).min(1.0);
+        let fit_w = ((work_w - s(24.0)) as f32 / bitmap.width as f32).min(1.0);
+        scale = scale.min(fit_h).min(fit_w);
+    }
 
     let image_w = (bitmap.width as f32 * scale) as i32;
     let image_h = (bitmap.height as f32 * scale) as i32;
 
-    let toolbar = s(44.0);
-    let hint = s(24.0);
     let client_w = image_w.max(s(600.0));
-    // 图片比工具栏还窄时，工具那一组要多占一条（放图片下面）
+    // 上下两条工具栏 + 底部提示，始终在图片外面
     let client_h = toolbar + image_h + toolbar + hint;
 
-    // 图片尽量盖在原来截下来的那块位置上：顶部工具栏摆在图片上方，
-    // 上方贴边放不下时窗口往下挪，图片整体下移一个工具栏的高度
     let image_left = (client_w - image_w) / 2;
-    let image_top = toolbar;
+    let mut image_top = toolbar;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1 - toolbar;
-    let mut image_top = image_top;
-    if window_y < work.top {
-        // 上方没地方放工具栏：图片贴住原位，工具栏压在图片顶上（那条有自己的底色）
-        window_y = rect.1;
-        image_top = 0;
+    if !fits_in_place(scale) {
+        // 原位放不下：整窗居中，图片完整显示（不裁切）
+        window_y = work.top + ((work_h - client_h) / 2).max(0);
+        image_top = toolbar;
+    } else if window_y < work.top {
+        window_y = work.top;
+    }
+    if window_y + client_h > work.bottom {
+        window_y = (work.bottom - client_h).max(work.top);
     }
     // 整窗必须装得下：否则底部（图片下半截）会被屏幕切掉
     if client_h <= work.bottom - work.top && window_y + client_h > work.bottom {
