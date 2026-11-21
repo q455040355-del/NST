@@ -516,11 +516,7 @@ pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
     }
 
     // 首帧解出来放 CF_DIB：不支持文件拖放的编辑器也能直接粘贴
-    let dib = webp::AnimDecoder::new(&bytes)
-        .decode()
-        .ok()
-        .and_then(|frames| frames.get_frame(0).and_then(|frame| rgba_to_dib(&frame)))
-        ;
+    let dib = first_frame_dib(&bytes);
 
     // 剪贴板可能被别的程序占着，重试几次
     let mut opened = 0;
@@ -600,35 +596,65 @@ struct DropFiles {
     fWide: i32,
 }
 
-/// RGBA 帧 → CF_DIB（32 位、行序自下而上）
-fn rgba_to_dib(frame: &webp::AnimFrame) -> Option<(Vec<u8>, usize)> {
-    let w = frame.width() as usize;
-    let h = frame.height() as usize;
-    let src = frame.get_image();
-    if w == 0 || h == 0 || src.len() < w * h * 4 {
-        return None;
-    }
-    let size = 40 + w * h * 4;
-    let mut out = vec![0u8; size];
-    out[0..4].copy_from_slice(&40u32.to_le_bytes());
-    out[4..8].copy_from_slice(&(w as i32).to_le_bytes());
-    out[8..12].copy_from_slice(&(h as i32).to_le_bytes());
-    out[12..14].copy_from_slice(&1u16.to_le_bytes());
-    out[14..16].copy_from_slice(&32u16.to_le_bytes());
-    for row in 0..h {
-        let src_row = h - 1 - row;
-        let src_offset = src_row * w * 4;
-        let dst_offset = 40 + row * w * 4;
-        for x in 0..w {
-            let s = src_offset + x * 4;
-            let d = dst_offset + x * 4;
-            out[d] = src[s + 2];
-            out[d + 1] = src[s + 1];
-            out[d + 2] = src[s];
-            out[d + 3] = src[s + 3];
+/// 解出动画的第一帧，直接拼成 CF_DIB（32 位、行序自下而上）。
+/// 解码器给的是 BGRA + 行序自顶向下，正好是 DIB 的字节序，只需要按行倒过来拷。
+fn first_frame_dib(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    unsafe {
+        let mut options: libwebp_sys::WebPAnimDecoderOptions = std::mem::zeroed();
+        if libwebp_sys::WebPAnimDecoderOptionsInitInternal(
+            &mut options,
+            libwebp_sys::WEBP_DEMUX_ABI_VERSION as i32,
+        ) == 0
+        {
+            return None;
         }
+        options.color_mode = libwebp_sys::WEBP_CSP_MODE::MODE_BGRA;
+        options.use_threads = 0;
+        let data = libwebp_sys::WebPData {
+            bytes: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let decoder = libwebp_sys::WebPAnimDecoderNewInternal(
+            &data,
+            &options,
+            libwebp_sys::WEBP_DEMUX_ABI_VERSION as i32,
+        );
+        if decoder.is_null() {
+            crate::debug_log("webp: 解码器创建失败（首帧 DIB 跳过）");
+            return None;
+        }
+
+        let mut info: libwebp_sys::WebPAnimInfo = std::mem::zeroed();
+        let mut frame: *mut u8 = std::ptr::null_mut();
+        let mut timestamp = 0i32;
+        let ok = libwebp_sys::WebPAnimDecoderGetInfo(decoder, &mut info) != 0
+            && libwebp_sys::WebPAnimDecoderGetNext(decoder, &mut frame, &mut timestamp) != 0
+            && !frame.is_null();
+        let mut dib = None;
+        if ok {
+            let w = info.canvas_width as usize;
+            let h = info.canvas_height as usize;
+            if w > 0 && h > 0 {
+                let stride = w * 4;
+                let size = 40 + stride * h;
+                let src = std::slice::from_raw_parts(frame, stride * h);
+                let mut out = vec![0u8; size];
+                out[0..4].copy_from_slice(&40u32.to_le_bytes());
+                out[4..8].copy_from_slice(&(w as i32).to_le_bytes());
+                out[8..12].copy_from_slice(&(h as i32).to_le_bytes());
+                out[12..14].copy_from_slice(&1u16.to_le_bytes());
+                out[14..16].copy_from_slice(&(32u16).to_le_bytes());
+                for row in 0..h {
+                    let src_row = (h - 1 - row) * stride;
+                    let dst = 40 + row * stride;
+                    out[dst..dst + stride].copy_from_slice(&src[src_row..src_row + stride]);
+                }
+                dib = Some((out, size));
+            }
+        }
+        libwebp_sys::WebPAnimDecoderDelete(decoder);
+        dib
     }
-    Some((out, size))
 }
 
 /// 复制成功的小提示：屏幕中上方一个深色胶囊，1.3 秒后自己消失
