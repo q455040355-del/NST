@@ -3050,6 +3050,10 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         window_y = rect.1;
         image_top = 0;
     }
+    // 整窗必须装得下：否则底部（图片下半截）会被屏幕切掉
+    if client_h <= work.bottom - work.top && window_y + client_h > work.bottom {
+        window_y = (work.bottom - client_h).max(work.top);
+    }
     if window_x + client_w > work.right {
         window_x = (work.right - client_w).max(work.left);
     }

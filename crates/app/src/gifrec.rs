@@ -859,19 +859,26 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         return;
     }
 
-    // 帧先留着，停止后一次性交给 libwebp 的动画编码器（帧间优化它自己做）
-    // 流式编码：抓一帧喂一帧，内存里不攒整段
-    let mut streamer = WebpStreamer::new(width, height, 60.0);
+    // 编码放到单独线程：libwebp 编一帧要十几到几十毫秒，留在抓帧线程里会把节奏拖垮（看着卡）。
+    // 队列只放 4 帧，编不过来就丢帧，时间戳照样按真实时间走，所以不会拖长时长。
     let started_at = std::time::Instant::now();
     let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
     let mut last_raw: Vec<u8> = Vec::new();
-    // 20 秒上限（流式编码不占内存，这里就是唯一的限制）
     let limit_seconds = 20_u64;
 
-    for shot in &warmup {
-        if let Some(streamer) = streamer.as_mut() {
-            streamer.add(shot, stamp(std::time::Instant::now()));
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
+    let encoder = std::thread::spawn(move || {
+        let Some(mut streamer) = WebpStreamer::new(width, height, 60.0) else {
+            return Vec::new();
+        };
+        for (frame, timestamp) in receiver {
+            streamer.add(&frame, timestamp);
         }
+        streamer.finish()
+    });
+
+    for shot in &warmup {
+        let _ = sender.try_send((shot.clone(), stamp(std::time::Instant::now())));
         last_raw.clear();
         last_raw.extend_from_slice(shot);
     }
@@ -898,25 +905,20 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             // 画面没变：这一帧直接不要，时间轴照样往前走
             continue;
         }
-        if let Some(streamer) = streamer.as_mut() {
-            streamer.add(&frame, stamp(std::time::Instant::now()));
-        }
+        // 编不过来就丢掉这一帧（try_send 满即失败），不会拖慢抓帧
+        let _ = sender.try_send((frame.clone(), stamp(std::time::Instant::now())));
         last_raw.clear();
         last_raw.extend_from_slice(&frame);
     }
 
     // 收尾：把最后那段静止时间也算进时长（再喂一帧同样的内容，时间戳取结束时）
-    if let Some(streamer) = streamer.as_mut() {
-        if !last_raw.is_empty() {
-            streamer.add(&last_raw, stamp(std::time::Instant::now()));
-        }
+    if !last_raw.is_empty() {
+        let _ = sender.try_send((last_raw.clone(), stamp(std::time::Instant::now())));
     }
+    drop(sender);
 
     let mode = STOP_MODE.load(Ordering::SeqCst);
-    let bytes = match streamer {
-        Some(streamer) => streamer.finish(),
-        None => Vec::new(),
-    };
+    let bytes = encoder.join().unwrap_or_default();
     crate::debug_log(&format!(
         "rec done: bytes={} size={width}x{height} limit={limit_seconds}s",
         bytes.len()
@@ -991,7 +993,8 @@ impl WebpStreamer {
                 libwebp_sys::WebPAnimEncoderDelete(encoder);
                 return None;
             }
-            config.method = 4;
+            // method 4 对 2MP 区域每帧要几十毫秒，抓帧节奏会被编码拖住（看起来卡）；2 快得多，体积差不多
+            config.method = 2;
             config.lossless = 0;
             config.thread_level = 1;
             if libwebp_sys::WebPValidateConfig(&config) == 0 {
