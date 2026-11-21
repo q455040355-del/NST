@@ -868,7 +868,7 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
     let encoder = std::thread::spawn(move || {
-        let Some(mut streamer) = WebpStreamer::new(width, height, 60.0) else {
+        let Some(mut streamer) = WebpStreamer::new(width, height, 75.0) else {
             return Vec::new();
         };
         for (frame, timestamp) in receiver {
@@ -882,6 +882,17 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
         last_raw.clear();
         last_raw.extend_from_slice(shot);
     }
+
+    // 大区域 + 高帧率时编码器会被打满，整机跟着发涩：按像素数把帧率压到能扛的范围
+    let pixels = (width.max(1) as i64) * (height.max(1) as i64);
+    let fps = if pixels > 3_000_000 {
+        fps.min(20)
+    } else if pixels > 1_200_000 {
+        fps.min(30)
+    } else {
+        fps
+    };
+    crate::debug_log(&format!("rec: 实际帧率 {fps}（{pixels} 像素）"));
 
     let interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let started = std::time::Instant::now();
