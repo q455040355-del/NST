@@ -788,7 +788,7 @@ struct ScreenGrabber {
     src_w: i32,
     src_h: i32,
     /// DXGI 复制会话：建得起来就走显卡那条路（1080p 抓一帧约 4~7ms，GDI 要 12ms）
-    dxgi: Option<crate::dxgi::Duplicator>,
+    dxgi: Option<crate::dxgi::DesktopDuplicator>,
     /// DXGI 路的中间 DIB：选区**原生**尺寸，GPU 回读的像素先落这里，再用 GDI 缩到输出尺寸
     crop_dc: HDC,
     crop_dib: HBITMAP,
@@ -798,6 +798,8 @@ struct ScreenGrabber {
     /// 鼠标热点按光标句柄缓存：GetIconInfo 每次都会新建两张位图，没必要每帧都问一遍
     cursor: HCURSOR,
     cursor_hot: (i32, i32),
+    /// 上一帧的光标状态（句柄 + 位置）：桌面没变时用它判断能不能整帧跳过
+    last_cursor: (usize, i32, i32),
 }
 
 impl ScreenGrabber {
@@ -829,7 +831,7 @@ impl ScreenGrabber {
             SelectObject(memory, dib as HGDIOBJ);
 
             // 先试试 DXGI：区域完整落在一个显示器里才能建复制会话，失败就纯 GDI
-            let mut dxgi = crate::dxgi::Duplicator::new(x, y, width, height);
+            let mut dxgi = crate::dxgi::DesktopDuplicator::new(x, y, width, height);
             let mut crop_dc: HDC = std::ptr::null_mut();
             let mut crop_dib: HBITMAP = std::ptr::null_mut();
             let mut crop_bits: *mut u8 = std::ptr::null_mut();
@@ -875,8 +877,9 @@ impl ScreenGrabber {
                 }
             }
             if dxgi.is_some() {
+                let screens = dxgi.as_ref().map(|d| d.output_count()).unwrap_or(0);
                 crate::debug_log(&format!(
-                    "rec: DXGI 采集 {width}x{height} → 输出 {out_w}x{out_h}"
+                    "rec: DXGI 采集 {width}x{height}（{screens} 块屏）→ 输出 {out_w}x{out_h}"
                 ));
             } else {
                 crate::debug_log(&format!(
@@ -900,6 +903,7 @@ impl ScreenGrabber {
                 crop_w,
                 crop_h,
                 cursor: std::ptr::null_mut(),
+                last_cursor: (0, 0, 0),
                 cursor_hot: (0, 0),
             })
         }
@@ -909,8 +913,23 @@ impl ScreenGrabber {
     /// 返回 false 也可能是抓屏失败——两种情况在录制循环里处理方式相同（这一帧不要）。
     fn grab_if_changed(&mut self, x: i32, y: i32, prev: &[u8], out: &mut Vec<u8>) -> bool {
         unsafe {
+            // 光标状态先取：静态画面时要用它决定能不能整帧跳过
+            let mut info: CURSORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+            let cursor_shown = GetCursorInfo(&mut info) != 0 && info.flags & CURSOR_SHOWING != 0;
+            let cursor_key = if cursor_shown {
+                (
+                    info.hCursor as usize,
+                    info.ptScreenPos.x,
+                    info.ptScreenPos.y,
+                )
+            } else {
+                (0, 0, 0)
+            };
+
             // 源：DXGI（已经回读到 crop DIB）或屏幕 DC
             let mut lost = false;
+            let mut fresh = true;
             let (origin, src_dc, sx, sy, sw, sh) = if let Some(duplicator) = self.dxgi.as_mut() {
                 let stride = (self.crop_w * 4) as usize;
                 match duplicator.grab(self.crop_bits, stride) {
@@ -919,8 +938,7 @@ impl ScreenGrabber {
                         lost = true;
                         ((0, 0), self.crop_dc, 0, 0, self.crop_w, self.crop_h)
                     }
-                    // 没新画面或这一帧读失败：crop DIB 里还是上一帧，照常重画光标后再比对
-                    _ => (
+                    crate::dxgi::Grabbed::New => (
                         duplicator.origin(),
                         self.crop_dc,
                         0,
@@ -928,6 +946,18 @@ impl ScreenGrabber {
                         self.crop_w,
                         self.crop_h,
                     ),
+                    // 桌面这一帧没变：crop DIB 里还是上一帧，光标也没动的话整帧跳过
+                    _ => {
+                        fresh = false;
+                        (
+                            duplicator.origin(),
+                            self.crop_dc,
+                            0,
+                            0,
+                            self.crop_w,
+                            self.crop_h,
+                        )
+                    }
                 }
             } else {
                 ((x, y), self.screen, x, y, self.src_w, self.src_h)
@@ -937,6 +967,11 @@ impl ScreenGrabber {
                 self.dxgi = None;
                 return false;
             }
+            // 桌面没变 + 光标没动：连 BitBlt/StretchBlt 和 8MB memcmp 都不用做
+            if !fresh && !prev.is_empty() && cursor_key == self.last_cursor {
+                return false;
+            }
+            self.last_cursor = cursor_key;
 
             // 缩放录制：直接让 GDI 边抓边缩，比抓完再缩快一倍
             let ok = if self.width == sw && self.height == sh {
@@ -962,9 +997,7 @@ impl ScreenGrabber {
             }
 
             // 鼠标指针也算「区域内的动态」
-            let mut info: CURSORINFO = std::mem::zeroed();
-            info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
-            if GetCursorInfo(&mut info) != 0 && info.flags & CURSOR_SHOWING != 0 {
+            if cursor_shown {
                 // 只有光标样子变了才去问热点（图标 / I 形 / 手形之间切换）
                 if info.hCursor != self.cursor {
                     let mut icon: ICONINFO = std::mem::zeroed();
