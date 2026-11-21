@@ -153,6 +153,18 @@ fn main() {
             windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
         }
 
+        // 调试用：把截图编辑窗（含一条底栏）离屏画成 PNG，不弹窗、不进托盘。
+        // 改工具栏 / 图标时用：NST_EDITOR_PREVIEW=D:\tmp\editor.png netspeed.exe
+        if let Some(path) = std::env::var_os("NST_EDITOR_PREVIEW") {
+            let ok = shot::preview_png(&path.to_string_lossy());
+            crate::debug_log(&format!(
+                "editor preview -> {} ({})",
+                path.to_string_lossy(),
+                if ok { "ok" } else { "failed" }
+            ));
+            return;
+        }
+
         // 通用对话框（另存为）需要 COM 单元，不开的话 GetSaveFileNameW 会直接失败
         windows_sys::Win32::System::Com::CoInitializeEx(
             std::ptr::null(),

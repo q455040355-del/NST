@@ -3,7 +3,8 @@
 //! 交互参考 Snow Shot，但代码全部自己写，不引入其 GPL-3.0 实现：
 //!   Ctrl+Shift+A / 右键菜单「截图…」
 //!   → 全屏遮罩选区（带尺寸提示）
-//!   → 编辑窗（箭头 / 矩形 / 画笔 / 文字 / 马赛克，撤销、复制、保存、贴图）
+//!   → 编辑窗（椭圆 / 箭头 / 矩形 / 画笔 / 文字 / 马赛克 / OCR，撤销、复制、保存、贴图；
+//!     工具栏是微信那种一条图标底栏）
 //!
 //! 画面全部走 GDI 双缓冲；贴图窗口是置顶无边框窗口。
 
@@ -28,7 +29,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     UpdateWindow,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -45,6 +46,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::theme::wide;
 
 const DT_NOPREFIX: u32 = 0x0800;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const CF_DIB: u32 = 8;
 const CAPTUREBLT: u32 = 0x4000_0000;
 
@@ -1184,6 +1186,8 @@ enum Tool {
     None,
     Arrow,
     Rect,
+    /// 空心椭圆（微信那排第一个）
+    Ellipse,
     Pen,
     Text,
     Mosaic,
@@ -1199,6 +1203,11 @@ enum Shape {
         stroke: u8,
     },
     Rect {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+    Ellipse {
         a: (i32, i32),
         b: (i32, i32),
         stroke: u8,
@@ -1244,6 +1253,8 @@ enum Action {
     Copy,
     Save,
     Pin,
+    /// 完成：复制到剪贴板 + 关窗（微信那条栏最右边的 ✓）
+    Done,
     Minimize,
     Close,
 }
@@ -1271,6 +1282,8 @@ struct Editor {
     buttons: Vec<(RECT, Action)>,
     /// 正按着哪个按钮（按下高亮、松开才执行）
     pressed: Option<Action>,
+    /// 鼠标停在哪个按钮上（图标没有文字，靠它弹小标签）
+    hover: Option<Action>,
     /// 底部小提示（复制成功之类），带出现时间
     toast: Option<(String, std::time::Instant)>,
     /// 是否置顶（默认关，截图完不挡别的窗口）
@@ -1314,6 +1327,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::None) => "",
         Action::Tool(Tool::Arrow) => "箭头",
         Action::Tool(Tool::Rect) => "矩形",
+        Action::Tool(Tool::Ellipse) => "椭圆",
         Action::Tool(Tool::Pen) => "画笔",
         Action::Tool(Tool::Text) => "文字",
         Action::Tool(Tool::Mosaic) => "马赛克",
@@ -1321,11 +1335,12 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Undo => "撤销",
         Action::Copy => "复制",
         Action::Save => "保存",
-        Action::Stroke => "中",
+        Action::Stroke => "浓淡",
         Action::Topmost => "置顶",
         Action::Pin => "贴图",
+        Action::Done => "完成",
         Action::Minimize => "最小化",
-        Action::Close => "关闭",
+        Action::Close => "取消",
     }
 }
 
@@ -1394,8 +1409,27 @@ fn draw_rect(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
     }
 }
 
-fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {
-    if points.len() < 2 {
+fn draw_ellipse(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
+    let (a, b) = (scaled(a, scale), scaled(b, scale));
+    unsafe {
+        let pen = CreatePen(0, width, ANNOT);
+        let old = SelectObject(dc, pen as HGDIOBJ);
+        let brush = GetStockObject(NULL_BRUSH);
+        let old_brush = SelectObject(dc, brush);
+        windows_sys::Win32::Graphics::Gdi::Ellipse(
+            dc,
+            a.0.min(b.0),
+            a.1.min(b.1),
+            a.0.max(b.0),
+            a.1.max(b.1),
+        );
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
+    }
+}
+
+fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {    if points.len() < 2 {
         return;
     }
     unsafe {
@@ -1588,6 +1622,7 @@ fn hint_for(tool: Tool) -> &'static str {
     match tool {
         Tool::None => "选一个工具再画 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 关闭",
         Tool::Text => "拖出文字位置后直接输入 · Enter 提交 · Esc 取消",
+        Tool::Ellipse => "拖出椭圆 · Esc 取消",
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
         _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
@@ -1603,6 +1638,9 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
             }
             Shape::Rect { a, b, stroke } => {
                 draw_rect(dc, *a, *b, stroke_width(scale, *stroke), scale)
+            }
+            Shape::Ellipse { a, b, stroke } => {
+                draw_ellipse(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
             Shape::Pen { points, stroke } => {
                 draw_pen(dc, points, stroke_width(scale, *stroke), scale)
@@ -1653,12 +1691,6 @@ unsafe fn editor_paint(hwnd: HWND) {
         return;
     }
 
-    // 原图只拷一次
-    if editor.source.is_none() {
-        editor.source = source_dc(&editor.base);
-    }
-
-    // 双缓冲：尺寸没变就复用，别每帧重新建 5 MB 的 DIB
     let (dc, dib) = match editor.back {
         Some((dc, dib, w, h)) if w == client.right && h == client.bottom => (dc, dib),
         _ => {
@@ -1682,6 +1714,22 @@ unsafe fn editor_paint(hwnd: HWND) {
     };
     let _ = dib;
 
+    editor_draw(dc, editor, client);
+
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    EndPaint(hwnd, &mut ps);
+
+    // 拖拽时每帧都走这里，超过一帧（16ms）就记一笔，方便以后查回归
+    let cost_us = started.elapsed().as_micros();
+    if cost_us > 16_000 {
+        crate::debug_log(&format!("editor paint={cost_us}us"));
+    }
+}
+
+/// 把编辑窗画进任意 DC（窗口用背缓冲，预览用离屏 DIB）
+unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let toolbar = s(44.0);
     let bg = CreateSolidBrush(crate::theme::ui().bg);
     let all = RECT {
@@ -1692,6 +1740,11 @@ unsafe fn editor_paint(hwnd: HWND) {
     };
     FillRect(dc, &all, bg);
     DeleteObject(bg as *mut _);
+
+    // 原图只拷一次
+    if editor.source.is_none() {
+        editor.source = source_dc(&editor.base);
+    }
 
     // 图片（从常驻 DC 直接贴，不再每帧分配 + 拷整张图）
     if let Some((source, _)) = editor.source {
@@ -1707,22 +1760,17 @@ unsafe fn editor_paint(hwnd: HWND) {
         );
     }
 
-    // 上下两条工具栏始终铺自己的底色：图片贴到窗口边上时不会从按钮缝里透出来
+    // 图片下面那条（工具栏 + 提示）铺底色：图片贴到窗口边上时不会从按钮缝里透出来
     let band = CreateSolidBrush(crate::theme::ui().bg);
-    let top_band = RECT {
+    let image_bottom =
+        editor.image_top + (editor.base.height as f32 * editor.scale) as i32;
+    let below = RECT {
         left: 0,
-        top: 0,
+        top: image_bottom.max(0),
         right: client.right,
-        bottom: toolbar,
+        bottom: client.bottom,
     };
-    let bottom_band = RECT {
-        left: 0,
-        top: (client.bottom - s(24.0) - toolbar).max(0),
-        right: client.right,
-        bottom: (client.bottom - s(24.0)).max(0),
-    };
-    FillRect(dc, &top_band, band);
-    FillRect(dc, &bottom_band, band);
+    FillRect(dc, &below, band);
     DeleteObject(band as *mut _);
 
     // 图形都在「图片坐标系」里，这里把视口原点挪到图片左上角
@@ -1738,6 +1786,7 @@ unsafe fn editor_paint(hwnd: HWND) {
         match editor.tool {
             Tool::Arrow => draw_arrow(dc, from, to, width, editor.scale),
             Tool::Rect => draw_rect(dc, from, to, width, editor.scale),
+            Tool::Ellipse => draw_ellipse(dc, from, to, width, editor.scale),
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
                 let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
@@ -1771,220 +1820,141 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     SetViewportOrgEx(dc, old_origin.x, old_origin.y, std::ptr::null_mut());
 
-    // 工具栏
+    // 工具栏：微信那种一条圆角底栏，纯图标（文字靠 hover 小标签提示）
     editor.buttons.clear();
-    let font = cached_font(9.0, 400);
-    let old_font = SelectObject(dc, font as HGDIOBJ);
-    SetBkMode(dc, TRANSPARENT as i32);
-
-    let height = s(26.0);
+    let ui = crate::theme::ui();
     let image_h = (editor.base.height as f32 * editor.scale) as i32;
-    // 固定的两行布局：顶部一行是浓淡 + 撤销 / 复制 / 保存 / 贴图，
-    // 底部一行是工具（箭头 / 矩形 / 画笔 / 文字 / 马赛克 / OCR），都居中
-    let bar_top = s(9.0);
-    let tools_y = editor.image_top + image_h + s(9.0);
+    let bar_h = s(38.0);
+    let bar_top = editor.image_top + image_h + s(3.0);
+    let bar_bottom = bar_top + bar_h;
+    let item = s(30.0);
+    let gap = s(2.0);
+    let sep_w = s(11.0);
+    let pad = s(6.0);
 
-    // 每一行先量总宽再居中；窄图时窗口比图片宽，两侧留白看起来才不歪
-    let gap = s(5.0);
-    let actions = [
-        Action::Tool(Tool::Arrow),
-        Action::Tool(Tool::Rect),
-        Action::Tool(Tool::Pen),
-        Action::Tool(Tool::Text),
-        Action::Tool(Tool::Mosaic),
-        Action::Tool(Tool::Ocr),
+    // bool = 这一格前面要不要画一条分组竖线
+    let layout_items: Vec<(Action, bool)> = vec![
+        (Action::Tool(Tool::Ellipse), false),
+        (Action::Tool(Tool::Arrow), false),
+        (Action::Tool(Tool::Rect), false),
+        (Action::Tool(Tool::Pen), false),
+        (Action::Tool(Tool::Mosaic), false),
+        (Action::Tool(Tool::Text), false),
+        (Action::Tool(Tool::Ocr), false),
+        (Action::Stroke, true),
+        (Action::Undo, false),
+        (Action::Topmost, true),
+        (Action::Copy, false),
+        (Action::Save, false),
+        (Action::Pin, false),
+        (Action::Minimize, true),
+        (Action::Close, false),
+        (Action::Done, false),
     ];
-    let tools_w: i32 = actions
-        .iter()
-        .map(|action| wide_width(dc, text_of_action(*action)) + s(16.0))
-        .sum::<i32>()
-        + gap * (actions.len() as i32 - 1);
-    // 顶部还跟着浓淡 + 撤销…，宽图时和工具排成一行一起居中
-    let stroke_label = STROKE_LABELS[editor.stroke.min(2) as usize];
-    let mut top_row: Vec<(Action, &str)> = vec![(Action::Stroke, stroke_label)];
-    for action in [Action::Undo, Action::Copy, Action::Save, Action::Pin] {
-        top_row.push((action, text_of_action(action)));
-    }
-    let top_w: i32 = top_row
-        .iter()
-        .map(|(_, label)| wide_width(dc, label) + s(16.0))
-        .sum::<i32>()
-        + gap * (top_row.len() as i32 - 1);
-    let mut x = ((client.right - tools_w) / 2).max(s(12.0));
 
-    for action in actions {
-        let label = text_of_action(action);
-        let width_px = wide_width(dc, label) + s(16.0);
-        let rect = RECT {
-            left: x,
-            top: tools_y,
-            right: x + width_px,
-            bottom: tools_y + height,
-        };
-        let active = matches!(action, Action::Tool(tool) if tool == editor.tool);
-        let pressed = editor.pressed == Some(action);
-        draw_pill(dc, rect, active, pressed);
-        SetTextColor(
-            dc,
-            if active {
-                crate::theme::ui().text
-            } else {
-                crate::theme::ui().text3
-            },
-        );
-        let mut text_rect = rect;
-        text_rect.bottom += 1;
-        if pressed {
-            text_rect.top += 1;
-            text_rect.bottom += 1;
-        }
-        DrawTextW(
-            dc,
-            wide(label).as_ptr(),
-            -1,
-            &mut text_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
+    let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
+    let bar_w = layout_items.len() as i32 * item
+        + (layout_items.len() as i32 - 1) * gap
+        + groups * (sep_w + gap)
+        + pad * 2;
+    let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
 
-        editor.buttons.push((rect, action));
-        x = rect.right + gap;
-    }
-
-    // 顶部一行：浓淡（细 / 中 / 粗）+ 撤销 / 复制 / 保存 / 贴图，整组居中
-    let mut x = ((client.right - top_w) / 2).max(s(12.0));
-
-    for (action, label) in top_row {
-        let width_px = wide_width(dc, label) + s(16.0);
-        let rect = RECT {
-            left: x,
-            top: bar_top,
-            right: x + width_px,
-            bottom: bar_top + height,
-        };
-        let pressed = editor.pressed == Some(action);
-
-        draw_pill(dc, rect, false, pressed);
-        SetTextColor(
-            dc,
-            crate::theme::ui().text,
-        );
-        let mut text_rect = rect;
-        text_rect.bottom += 1;
-        if pressed {
-            text_rect.top += 1;
-            text_rect.bottom += 1;
-        }
-        DrawTextW(
-            dc,
-            wide(label).as_ptr(),
-            -1,
-            &mut text_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
-        editor.buttons.push((rect, action));
-        x = rect.right + gap;
-    }
-
-    // 右上角：最小化 / 关闭，用普通窗口的符号，不占工具栏文字
-    let control = s(28.0);
-    let close = RECT {
-        left: client.right - s(12.0) - control,
-        top: bar_top,
-        right: client.right - s(12.0),
-        bottom: bar_top + height,
-    };
-    let minimize = RECT {
-        left: close.left - s(4.0) - control,
-        top: close.top,
-        right: close.left - s(4.0),
-        bottom: close.bottom,
-    };
-    // 「置顶」开关：画成一个小胶囊，开着是蓝底白字，关着是灰底灰字
-    let topmost = RECT {
-        left: minimize.left - s(6.0) - s(46.0),
-        top: close.top,
-        right: minimize.left - s(6.0),
-        bottom: close.bottom,
-    };
+    // 底栏背板：圆角 + 1px 描边
     {
-        let (fill, border, text_color) = if editor.topmost {
-            (
-                crate::theme::ui().accent,
-                crate::theme::ui().accent,
-                crate::theme::ui().bg,
-            )
-        } else {
-            let chip = crate::theme::ui().chip;
-            (chip, chip, crate::theme::ui().text3)
-        };
-        let brush = CreateSolidBrush(fill);
-        let pen = CreatePen(0, 1, border);
-        let old = SelectObject(dc, brush as HGDIOBJ);
+        let brush = CreateSolidBrush(ui.surface);
+        let pen = CreatePen(0, 1, ui.border);
+        let old_brush = SelectObject(dc, brush as HGDIOBJ);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         windows_sys::Win32::Graphics::Gdi::RoundRect(
             dc,
-            topmost.left,
-            topmost.top + s(2.0),
-            topmost.right,
-            topmost.bottom - s(2.0),
-            s(11.0),
-            s(11.0),
+            bar_left,
+            bar_top,
+            bar_left + bar_w,
+            bar_bottom,
+            s(13.0),
+            s(13.0),
         );
         SelectObject(dc, old_pen);
-        SelectObject(dc, old);
+        SelectObject(dc, old_brush);
         DeleteObject(pen as *mut _);
         DeleteObject(brush as *mut _);
-
-        let font = cached_font(8.5, 500);
-        let old_font = SelectObject(dc, font as HGDIOBJ);
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, text_color);
-        let mut rect = RECT {
-            left: topmost.left,
-            top: topmost.top,
-            right: topmost.right,
-            bottom: topmost.bottom,
-        };
-        DrawTextW(
-            dc,
-            wide(if editor.topmost { "置顶" } else { "不置顶" }).as_ptr(),
-            -1,
-            &mut rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
-        SelectObject(dc, old_font);
     }
 
-    let icon_color = crate::theme::ui().text2;
-    let pen = CreatePen(0, s(1.4).max(1), icon_color);
-    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    let icon_top = bar_top + (bar_h - item) / 2;
+    let mut x = bar_left + pad;
+    let mut hovered: Option<(Action, RECT)> = None;
+    for (action, new_group) in layout_items {
+        if new_group {
+            let pen = CreatePen(0, 1, ui.border);
+            let old = SelectObject(dc, pen as HGDIOBJ);
+            let sx = x + sep_w / 2;
+            MoveToEx(dc, sx, bar_top + s(11.0), std::ptr::null_mut());
+            LineTo(dc, sx, bar_bottom - s(11.0));
+            SelectObject(dc, old);
+            DeleteObject(pen as *mut _);
+            x += sep_w + gap;
+        }
 
-    // —
-    let mx = (minimize.left + minimize.right) / 2;
-    let my = (minimize.top + minimize.bottom) / 2;
-    let arm = s(6.0);
-    MoveToEx(dc, mx - arm, my, std::ptr::null_mut());
-    LineTo(dc, mx + arm, my);
+        let rect = RECT {
+            left: x,
+            top: icon_top,
+            right: x + item,
+            bottom: icon_top + item,
+        };
+        let active = match action {
+            Action::Tool(tool) => editor.tool == tool,
+            Action::Topmost => editor.topmost,
+            _ => false,
+        };
+        let pressed = editor.pressed == Some(action);
+        let hover = editor.hover == Some(action);
 
-    // ×
-    let cx = (close.left + close.right) / 2;
-    let cy = (close.top + close.bottom) / 2;
-    let arm = s(5.0);
-    MoveToEx(dc, cx - arm, cy - arm, std::ptr::null_mut());
-    LineTo(dc, cx + arm, cy + arm);
-    MoveToEx(dc, cx - arm, cy + arm, std::ptr::null_mut());
-    LineTo(dc, cx + arm, cy - arm);
+        if active || pressed || hover {
+            let fill = if active {
+                ui.accent
+            } else if pressed {
+                ui.chip_hover
+            } else {
+                ui.chip
+            };
+            let brush = CreateSolidBrush(fill);
+            let pen = CreatePen(0, 1, fill);
+            let old_brush = SelectObject(dc, brush as HGDIOBJ);
+            let old_pen = SelectObject(dc, pen as HGDIOBJ);
+            windows_sys::Win32::Graphics::Gdi::RoundRect(
+                dc,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                s(8.0),
+                s(8.0),
+            );
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            DeleteObject(pen as *mut _);
+            DeleteObject(brush as *mut _);
+        }
 
-    // 图钉那格改成文字胶囊了，这里不再画图标
-    let _ = &topmost;
+        let color = if active {
+            ui.bg
+        } else if matches!(action, Action::Done) {
+            ui.accent
+        } else {
+            ui.text2
+        };
+        draw_action_icon(dc, action, rect, color, editor.stroke);
+        if hover {
+            hovered = Some((action, rect));
+        }
+        editor.buttons.push((rect, action));
+        x = rect.right + gap;
+    }
 
-    SelectObject(dc, old_pen);
-    DeleteObject(pen as *mut _);
-    editor.buttons.push((topmost, Action::Topmost));
-    editor.buttons.push((minimize, Action::Minimize));
-    editor.buttons.push((close, Action::Close));
-
-    SelectObject(dc, old_font);
+    // 图标没有文字，靠 hover 时在底栏上方弹一个小标签（微信也是这么做的）
+    if let Some((action, rect)) = hovered {
+        draw_bar_tooltip(dc, action, rect, bar_top, editor.stroke);
+    }
 
     // 小提示（复制成功 / 已保存）：底部中间一个深色胶囊，1.4 秒后自己消失
     if let Some((text, at)) = &editor.toast {
@@ -2057,17 +2027,103 @@ unsafe fn editor_paint(hwnd: HWND) {
 
     let _ = toolbar;
     let _ = all;
+}
 
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
-    EndPaint(hwnd, &mut ps);
+/// 调试用：把编辑窗（图片 + 一条底栏）离屏画出来存成 PNG，不弹窗。
+/// 设了 `NST_EDITOR_PREVIEW=<路径>` 就走这里，改工具栏 / 图标时不用真截图就能看效果。
+pub unsafe fn preview_png(path: &str) -> bool {
+    let width = 900;
+    let height = 560;
 
-    // 拖拽时每帧都走这里，超过一帧（16ms）就记一笔，方便以后查回归
-    let cost_us = started.elapsed().as_micros();
-    if cost_us > 16_000 {
-        crate::debug_log(&format!("editor paint={cost_us}us"));
+    // 假的「截图内容」：上面一条深色标题栏，下面浅灰底 + 两个色块，方便看底栏压在哪里
+    let mut base = Bitmap::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let index = ((y * width + x) * 4) as usize;
+            let (mut r, mut g, mut b) = if y < 52 {
+                (34u8, 36u8, 40u8)
+            } else {
+                (246u8, 246u8, 248u8)
+            };
+            if y >= 120 && y < 260 && x >= 60 && x < 400 {
+                (r, g, b) = (232, 240, 252);
+            }
+            if y >= 300 && y < 440 && x >= 60 && x < 400 {
+                (r, g, b) = (240, 250, 236);
+            }
+            if y >= 120 && y < 440 && x >= 460 && x < 840 {
+                (r, g, b) = (250, 244, 236);
+            }
+            base.pixels[index] = b;
+            base.pixels[index + 1] = g;
+            base.pixels[index + 2] = r;
+            base.pixels[index + 3] = 255;
+        }
     }
+
+    let toolbar = s(44.0);
+    let hint = s(24.0);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height + toolbar + hint,
+    };
+
+    let (dc, dib, bits) = make_dib(client.right, client.bottom);
+    if dc.is_null() || dib.is_null() {
+        return false;
+    }
+
+    let mut editor = Editor {
+        base,
+        shapes: Vec::new(),
+        // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
+        tool: Tool::Rect,
+        scale: 1.0,
+        image_left: 0,
+        image_top: 0,
+        drag_from: None,
+        drag_to: None,
+        pen_points: Vec::new(),
+        text: None,
+        stroke: 1,
+        buttons: Vec::new(),
+        pressed: None,
+        hover: Some(Action::Tool(Tool::Mosaic)),
+        toast: None,
+        topmost: false,
+        source: None,
+        back: None,
+    };
+
+    editor_draw(dc, &mut editor, client);
+    windows_sys::Win32::Graphics::Gdi::GdiFlush();
+
+    // BGRA（自顶向下）→ PNG 要的 RGBA
+    let mut rgba = Vec::with_capacity((client.right * client.bottom * 4) as usize);
+    let raw = std::slice::from_raw_parts(bits, (client.right * client.bottom * 4) as usize);
+    for pixel in raw.chunks_exact(4) {
+        rgba.push(pixel[2]);
+        rgba.push(pixel[1]);
+        rgba.push(pixel[0]);
+        rgba.push(255);
+    }
+    let ok = match image::RgbaImage::from_raw(
+        client.right as u32,
+        client.bottom as u32,
+        rgba,
+    ) {
+        Some(buffer) => buffer.save(path).is_ok(),
+        None => false,
+    };
+
+    if let Some((source, _)) = editor.source.take() {
+        DeleteDC(source);
+    }
+    DeleteObject(dib as *mut _);
+    DeleteDC(dc);
+    ok
 }
 
 fn wide_width(dc: HDC, text: &str) -> i32 {
@@ -2091,17 +2147,321 @@ fn wide_width(dc: HDC, text: &str) -> i32 {
 
 const DT_CALCRECT: u32 = 0x0400;
 
-fn draw_pill(dc: HDC, rect: RECT, active: bool, pressed: bool) {
+/// 工具栏按钮的图标：全部用 GDI 基本图元画，不依赖图标资源
+fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8) {
     unsafe {
-        let c = crate::theme::ui();
-        let brush = CreateSolidBrush(if pressed {
-            c.chip_hover
-        } else if active {
-            c.chip
-        } else {
-            c.surface
-        });
-        let pen = CreatePen(0, 1, if active || pressed { c.accent } else { c.border });
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let r = (w.min(h) as f32 * 0.29).round().max(3.0) as i32;
+        let thin = s(1.6).max(1);
+        let pen = CreatePen(0, thin, color);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+        match action {
+            Action::Tool(Tool::Rect) => {
+                windows_sys::Win32::Graphics::Gdi::Rectangle(dc, cx - r, cy - r, cx + r, cy + r);
+            }
+            Action::Tool(Tool::Ellipse) => {
+                windows_sys::Win32::Graphics::Gdi::Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+            }
+            Action::Tool(Tool::Arrow) => {
+                let (ax, ay) = (cx - r, cy + r);
+                let (bx, by) = (cx + r - 1, cy - r + 1);
+                MoveToEx(dc, ax, ay, std::ptr::null_mut());
+                LineTo(dc, bx, by);
+                let arm = (r as f32 * 0.8) as i32;
+                // 箭头两条边：从尖端往左、往下各一条
+                MoveToEx(dc, bx, by, std::ptr::null_mut());
+                LineTo(dc, bx - arm, by + 1);
+                MoveToEx(dc, bx, by, std::ptr::null_mut());
+                LineTo(dc, bx - 1, by + arm);
+            }
+            Action::Tool(Tool::Pen) => {
+                // 笔：一根粗斜线当笔杆，左下角一个实心笔尖
+                let body = CreatePen(0, (s(2.6)).max(2), color);
+                let old_body = SelectObject(dc, body as HGDIOBJ);
+                MoveToEx(dc, cx - r + s(3.0), cy + r - s(3.0), std::ptr::null_mut());
+                LineTo(dc, cx + r - s(1.0), cy - r + s(1.0));
+                SelectObject(dc, old_body);
+                DeleteObject(body as *mut _);
+
+                let nib = [
+                    POINT { x: cx - r, y: cy + r },
+                    POINT { x: cx - r + s(2.0), y: cy + r - s(6.0) },
+                    POINT { x: cx - r + s(6.0), y: cy + r - s(2.0) },
+                ];
+                let brush = CreateSolidBrush(color);
+                let old = SelectObject(dc, brush as HGDIOBJ);
+                let nib_pen = CreatePen(0, 1, color);
+                let old_p = SelectObject(dc, nib_pen as HGDIOBJ);
+                Polygon(dc, nib.as_ptr(), 3);
+                SelectObject(dc, old_p);
+                SelectObject(dc, old);
+                DeleteObject(nib_pen as *mut _);
+                DeleteObject(brush as *mut _);
+            }
+            Action::Tool(Tool::Mosaic) => {
+                let cell = ((r * 2) as f32 / 3.0).round().max(2.0) as i32;
+                for gy in 0..3 {
+                    for gx in 0..3 {
+                        let l = cx - r + gx * cell;
+                        let t = cy - r + gy * cell;
+                        if (gx + gy) % 2 == 0 {
+                            let brush = CreateSolidBrush(color);
+                            let old = SelectObject(dc, brush as HGDIOBJ);
+                            let fill_pen = CreatePen(0, 1, color);
+                            let old_p = SelectObject(dc, fill_pen as HGDIOBJ);
+                            windows_sys::Win32::Graphics::Gdi::Rectangle(
+                                dc,
+                                l,
+                                t,
+                                l + cell,
+                                t + cell,
+                            );
+                            SelectObject(dc, old_p);
+                            SelectObject(dc, old);
+                            DeleteObject(fill_pen as *mut _);
+                            DeleteObject(brush as *mut _);
+                        } else {
+                            windows_sys::Win32::Graphics::Gdi::Rectangle(
+                                dc,
+                                l,
+                                t,
+                                l + cell,
+                                t + cell,
+                            );
+                        }
+                    }
+                }
+            }
+            Action::Tool(Tool::Text) => draw_glyph(dc, "T", rect, color),
+            Action::Tool(Tool::Ocr) => {
+                // 「A」+ 一圈框（微信取字就是这个意思）
+                let f = r + 2;
+                let pen = CreatePen(0, 1, color);
+                let old = SelectObject(dc, pen as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::RoundRect(
+                    dc,
+                    cx - f,
+                    cy - f,
+                    cx + f,
+                    cy + f,
+                    s(4.0),
+                    s(4.0),
+                );
+                SelectObject(dc, old);
+                DeleteObject(pen as *mut _);
+                draw_glyph(dc, "A", rect, color);
+            }
+            Action::Stroke => {
+                // 三根线，粗细 1 / 2 / 3，当前那档标个圆点（微信的线宽也是这么示意）
+                let len = r;
+                let current = stroke.min(2) as usize;
+                for (i, level) in [1i32, 2, 3].iter().enumerate() {
+                    let p = CreatePen(0, (*level * s(1.0)).max(1), color);
+                    let old = SelectObject(dc, p as HGDIOBJ);
+                    let ly = cy - s(6.0) + i as i32 * s(6.0);
+                    MoveToEx(dc, cx - len, ly, std::ptr::null_mut());
+                    LineTo(dc, cx + len, ly);
+                    SelectObject(dc, old);
+                    DeleteObject(p as *mut _);
+                    if i == current {
+                        // 当前档右边点一个小圆，跟线同色
+                        let brush = CreateSolidBrush(color);
+                        let old_b = SelectObject(dc, brush as HGDIOBJ);
+                        let dot = s(1.8).max(1);
+                        windows_sys::Win32::Graphics::Gdi::Ellipse(
+                            dc,
+                            cx + len + s(2.0) - dot,
+                            ly - dot,
+                            cx + len + s(2.0) + dot,
+                            ly + dot,
+                        );
+                        SelectObject(dc, old_b);
+                        DeleteObject(brush as *mut _);
+                    }
+                }
+            }
+            Action::Undo => {
+                // 上半圈 + 左端向下的箭头（↺ 那个意思）
+                let pen = CreatePen(0, (thin + 1).max(2), color);
+                let old = SelectObject(dc, pen as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::Arc(
+                    dc,
+                    cx - r,
+                    cy - r,
+                    cx + r,
+                    cy + r,
+                    cx + r,
+                    cy,
+                    cx - r,
+                    cy,
+                );
+                SelectObject(dc, old);
+                DeleteObject(pen as *mut _);
+
+                let head = [
+                    POINT { x: cx - r, y: cy + s(5.0) },
+                    POINT { x: cx - r - s(4.0), y: cy - s(1.0) },
+                    POINT { x: cx - r + s(4.0), y: cy - s(1.0) },
+                ];
+                let brush = CreateSolidBrush(color);
+                let old_b = SelectObject(dc, brush as HGDIOBJ);
+                Polygon(dc, head.as_ptr(), 3);
+                SelectObject(dc, old_b);
+                DeleteObject(brush as *mut _);
+            }
+            Action::Copy => {
+                // 两张叠在一起的纸
+                let d = r;
+                windows_sys::Win32::Graphics::Gdi::Rectangle(
+                    dc,
+                    cx - d,
+                    cy - d + s(3.0) as i32,
+                    cx + d - s(3.0) as i32,
+                    cy + d,
+                );
+                windows_sys::Win32::Graphics::Gdi::Rectangle(
+                    dc,
+                    cx - d + s(3.0) as i32,
+                    cy - d,
+                    cx + d,
+                    cy + d - s(3.0) as i32,
+                );
+            }
+            Action::Save => {
+                // 向下的箭头 + 底下的托盘
+                MoveToEx(dc, cx, cy - r, std::ptr::null_mut());
+                LineTo(dc, cx, cy + r / 2);
+                MoveToEx(dc, cx - r / 2, cy, std::ptr::null_mut());
+                LineTo(dc, cx, cy + r / 2);
+                MoveToEx(dc, cx + r / 2, cy, std::ptr::null_mut());
+                LineTo(dc, cx, cy + r / 2);
+                MoveToEx(dc, cx - r, cy + r, std::ptr::null_mut());
+                LineTo(dc, cx + r, cy + r);
+            }
+            Action::Pin => {
+                // 图钉：实心圆头 + 一根针 + 底座
+                let brush = CreateSolidBrush(color);
+                let old_b = SelectObject(dc, brush as HGDIOBJ);
+                let head_pen = CreatePen(0, 1, color);
+                let old_p = SelectObject(dc, head_pen as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::Ellipse(
+                    dc,
+                    cx - r / 2,
+                    cy - r,
+                    cx + r / 2,
+                    cy,
+                );
+                SelectObject(dc, old_p);
+                SelectObject(dc, old_b);
+                DeleteObject(head_pen as *mut _);
+                DeleteObject(brush as *mut _);
+                MoveToEx(dc, cx, cy, std::ptr::null_mut());
+                LineTo(dc, cx, cy + r - 2);
+                MoveToEx(dc, cx - r / 2, cy + r - 2, std::ptr::null_mut());
+                LineTo(dc, cx + r / 2, cy + r - 2);
+            }
+            Action::Topmost => {
+                // 窗口 + 向上的箭头（这个窗口要留在最上面）
+                windows_sys::Win32::Graphics::Gdi::Rectangle(
+                    dc,
+                    cx - r,
+                    cy - r + s(2.0) as i32,
+                    cx + r,
+                    cy + r,
+                );
+                MoveToEx(dc, cx, cy + r - s(2.0) as i32, std::ptr::null_mut());
+                LineTo(dc, cx, cy - r + s(3.0) as i32);
+                MoveToEx(dc, cx - s(3.0) as i32, cy - r + s(6.0) as i32, std::ptr::null_mut());
+                LineTo(dc, cx, cy - r + s(3.0) as i32);
+                MoveToEx(dc, cx + s(3.0) as i32, cy - r + s(6.0) as i32, std::ptr::null_mut());
+                LineTo(dc, cx, cy - r + s(3.0) as i32);
+            }
+            Action::Minimize => {
+                let arm = r;
+                MoveToEx(dc, cx - arm, cy, std::ptr::null_mut());
+                LineTo(dc, cx + arm, cy);
+            }
+            Action::Close => {
+                let arm = r - s(1.0) as i32;
+                MoveToEx(dc, cx - arm, cy - arm, std::ptr::null_mut());
+                LineTo(dc, cx + arm, cy + arm);
+                MoveToEx(dc, cx - arm, cy + arm, std::ptr::null_mut());
+                LineTo(dc, cx + arm, cy - arm);
+            }
+            Action::Done => {
+                // 对勾：两段折线，稍粗一点（微信那个绿色的 ✓）
+                let pen = CreatePen(0, thin + 1, color);
+                let old = SelectObject(dc, pen as HGDIOBJ);
+                let arm = r;
+                MoveToEx(dc, cx - arm, cy, std::ptr::null_mut());
+                LineTo(dc, cx - s(2.0) as i32, cy + arm - s(2.0) as i32);
+                LineTo(dc, cx + arm, cy - arm + s(1.0) as i32);
+                SelectObject(dc, old);
+                DeleteObject(pen as *mut _);
+            }
+            _ => {}
+        }
+
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen as *mut _);
+    }
+}
+
+/// 画一个居中的字符（T / A 这种，直接借系统字体，不用自己拼笔画）
+fn draw_glyph(dc: HDC, text: &str, rect: RECT, color: u32) {
+    unsafe {
+        let font = cached_font(11.0, 700);
+        let old = SelectObject(dc, font as HGDIOBJ);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, color);
+        let mut target = rect;
+        target.top += 1;
+        DrawTextW(
+            dc,
+            wide(text).as_ptr(),
+            -1,
+            &mut target,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+    }
+}
+
+/// hover 时在底栏上方弹一个小标签（图标没文字，靠它认工具）
+fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke: u8) {
+    unsafe {
+        let label = match action {
+            Action::Stroke => STROKE_LABELS[stroke.min(2) as usize],
+            _ => text_of_action(action),
+        };
+        if label.is_empty() {
+            return;
+        }
+        let font = cached_font(8.5, 500);
+        let old_font = SelectObject(dc, font as HGDIOBJ);
+        let width = wide_width(dc, label) + s(16.0);
+        let height = s(20.0);
+        let left = ((anchor.left + anchor.right) / 2 - width / 2).max(s(4.0));
+        let top = bar_top - height - s(5.0);
+        let rect = RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        };
+
+        // 和底栏同色 + 1px 描边：浅色主题下是白底灰边，深色主题下是深底浅字，
+        // 弹在图片上方（图片大多偏亮）也看得清
+        let ui = crate::theme::ui();
+        let (fill, ink) = (ui.surface, ui.text);
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(0, 1, ui.border);
         let old_brush = SelectObject(dc, brush as HGDIOBJ);
         let old_pen = SelectObject(dc, pen as HGDIOBJ);
         windows_sys::Win32::Graphics::Gdi::RoundRect(
@@ -2110,15 +2470,28 @@ fn draw_pill(dc: HDC, rect: RECT, active: bool, pressed: bool) {
             rect.top,
             rect.right,
             rect.bottom,
-            s(12.0),
-            s(12.0),
+            s(8.0),
+            s(8.0),
         );
         SelectObject(dc, old_pen);
         SelectObject(dc, old_brush);
         DeleteObject(pen as *mut _);
         DeleteObject(brush as *mut _);
+
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, ink);
+        let mut target = rect;
+        DrawTextW(
+            dc,
+            wide(label).as_ptr(),
+            -1,
+            &mut target,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_font);
     }
 }
+
 
 unsafe fn composite(editor: &Editor) -> Bitmap {
     let (dc, dib, bits) = make_dib(editor.base.width, editor.base.height);
@@ -2162,6 +2535,7 @@ impl Editor {
             topmost: self.topmost,
             buttons: Vec::new(),
             pressed: None,
+            hover: None,
             toast: None,
             source: None,
             back: None,
@@ -2616,6 +2990,14 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         Action::Minimize => {
             ShowWindow(hwnd, SW_MINIMIZE);
         }
+        Action::Done => {
+            // 微信的 ✓：复制到剪贴板然后直接收工
+            commit_text(hwnd);
+            let editor = &*editor;
+            let bitmap = composite(editor);
+            clipboard_bitmap(&bitmap);
+            DestroyWindow(hwnd);
+        }
         Action::Close => {
             DestroyWindow(hwnd);
         }
@@ -2655,7 +3037,7 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
 
     let work = crate::work_area_at(anchor);
     let max_w = ((work.right - work.left) as f32 * 0.85).max(1.0);
-    let chrome = s(44.0) * 2 + s(24.0);
+    let chrome = s(44.0) + s(24.0);
     let max_h = (((work.bottom - work.top) as f32 * 0.8) as i32 - chrome).max(1) as f32;
     let scale = (max_w / editor.base.width as f32)
         .min(max_h / editor.base.height as f32)
@@ -2666,11 +3048,11 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
     let toolbar = s(44.0);
     let hint = s(24.0);
     let client_w = image_w.max(s(600.0));
-    let client_h = toolbar + image_h + toolbar + hint;
+    let client_h = image_h + toolbar + hint;
 
     editor.scale = scale;
     editor.image_left = (client_w - image_w) / 2;
-    editor.image_top = toolbar;
+    editor.image_top = 0;
 
     let (x, y) = if suggested.is_null() {
         (rect.left, rect.top)
@@ -2813,6 +3195,25 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
             let editor = &mut *editor;
+            // 工具栏图标没有文字，hover 时要在上方弹小标签：这里维护 hover 状态
+            let cursor_point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            let hover = hit_button(editor, cursor_point);
+            if editor.hover != hover {
+                editor.hover = hover;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            // 让鼠标离开客户区时能收到 WM_MOUSELEAVE，把高亮和标签清掉
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut track);
+
             let ix = (((lparam as i32) & 0xFFFF) - editor.image_left) as f32 / editor.scale;
             let iy = ((((lparam as i32) >> 16) & 0xFFFF) - editor.image_top) as f32 / editor.scale;
             let point = (ix as i32, iy as i32);
@@ -2826,6 +3227,15 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 }
             } else if editor.drag_from.is_some() {
                 editor.drag_to = Some(point);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        // 鼠标移出客户区：把 hover 高亮和小标签收掉
+        WM_MOUSELEAVE => {
+            let editor = editor_state(hwnd);
+            if !editor.is_null() && (*editor).hover.is_some() {
+                (*editor).hover = None;
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0
@@ -2880,6 +3290,13 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     }
                     Tool::Rect if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
                         editor.shapes.push(Shape::Rect {
+                            a: from,
+                            b: to,
+                            stroke: editor.stroke,
+                        })
+                    }
+                    Tool::Ellipse if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
+                        editor.shapes.push(Shape::Ellipse {
                             a: from,
                             b: to,
                             stroke: editor.stroke,
@@ -3033,8 +3450,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     use_scale_at(cursor);
     let work = crate::work_area_at(cursor);
     let max_w = ((work.right - work.left) as f32 * 0.85) as i32;
-    // 上下两条工具栏 + 底部提示也要占高度，算缩放时先扣掉，否则窗口比屏幕高、底部会被裁掉
-    let chrome = s(44.0) * 2 + s(24.0);
+    // 底部一条工具栏 + 底部提示也要占高度，算缩放时先扣掉，否则窗口比屏幕高、底部会被裁掉
+    let chrome = s(44.0) + s(24.0);
     let work_w = work.right - work.left;
     let work_h = work.bottom - work.top;
     let max_h = (work_h as f32 * 0.8) as i32 - chrome;
@@ -3046,11 +3463,11 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let toolbar = s(44.0);
     let hint = s(24.0);
 
-    // 原位摆放装不下（比如整窗最大化，顶部没有地方放工具栏）就缩一点，
-    // 保证「整张图 + 上下两条工具栏」都在屏幕里 —— 宁可稍微缩小，也不能把图裁掉
+    // 原位摆放装不下（比如整窗最大化，底下没地方放工具栏）就缩一点，
+    // 保证「整张图 + 底部工具栏 + 提示」都在屏幕里 —— 宁可稍微缩小，也不能把图裁掉
     let fits_in_place = |scale: f32| {
-        let height = toolbar + (bitmap.height as f32 * scale) as i32 + toolbar + hint;
-        rect.1 - toolbar >= work.top && rect.1 - toolbar + height <= work.bottom
+        let height = (bitmap.height as f32 * scale) as i32 + toolbar + hint;
+        rect.1 >= work.top && rect.1 + height <= work.bottom
     };
     if !fits_in_place(scale) {
         let fit_h = ((work_h - chrome) as f32 / bitmap.height as f32).min(1.0);
@@ -3062,17 +3479,17 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let image_h = (bitmap.height as f32 * scale) as i32;
 
     let client_w = image_w.max(s(600.0));
-    // 上下两条工具栏 + 底部提示，始终在图片外面
-    let client_h = toolbar + image_h + toolbar + hint;
+    // 图片在上面，底部一条工具栏 + 提示，始终在图片外面（微信那种单条底栏）
+    let client_h = image_h + toolbar + hint;
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = toolbar;
+    let mut image_top = 0;
     let mut window_x = rect.0 - image_left;
-    let mut window_y = rect.1 - toolbar;
+    let mut window_y = rect.1;
     if !fits_in_place(scale) {
         // 原位放不下：整窗居中，图片完整显示（不裁切）
         window_y = work.top + ((work_h - client_h) / 2).max(0);
-        image_top = toolbar;
+        image_top = 0;
     } else if window_y < work.top {
         window_y = work.top;
     }
@@ -3105,6 +3522,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         text: None,
         buttons: Vec::new(),
         pressed: None,
+        hover: None,
         toast: None,
         source: None,
         back: None,
