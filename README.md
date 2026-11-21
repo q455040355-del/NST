@@ -243,6 +243,12 @@ CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --work
 
 绿色版：解压后 `netspeed.exe` 旁边必须有 `models\`，配置在 `%LOCALAPPDATA%\NetSpeedTaskbar\`。
 
+日常发版别手敲：`powershell -ExecutionPolicy Bypass -File scripts\release.ps1`
+（省略版本号 = 当前 +1 patch，也可以 `scripts\release.ps1 0.1.49`）。它会改 workspace 版本、
+刷 `Cargo.lock`、本地 release 构建、提交、打 annotate tag、推 main + tag；
+工作区不干净 / 不在 main / 落后 origin / tag 已存在 / 版本号没变大都会直接拦下来。
+`-DryRun` 只演练（改完再回滚），`-Watch` 会盯着 Release 流水线跑完并列出资产。
+
 崩溃会在 `%TEMP%\netspeed-rs.log` 留一条 `PANIC 文件:行: 消息`（日志超过 1 MB 自动重建）。
 
 ## 待办
