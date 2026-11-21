@@ -19,7 +19,13 @@ param(
     # 只演练：改完文件、刷完 lock、编完就回滚，不提交/不打 tag/不推
     [switch]$DryRun,
     # 推完盯着 Release 流水线跑完，并列出资产
-    [switch]$Watch
+    [switch]$Watch,
+    # 推完把新 exe 部署到本机日常跑的那份（scripts\deploy.ps1：停进程 -> 备份 -> 覆盖 -> 重启）
+    [switch]$Deploy,
+    # 部署目标目录；省略则用 deploy.ps1 的默认值（D:\OneDrive\桌面\NST）
+    [string]$DeployPath = "",
+    # 部署后不自动重启面板
+    [switch]$NoRestart
 )
 
 $ErrorActionPreference = "Stop"
@@ -156,6 +162,11 @@ Write-Host ""
 Write-Host "  当前版本 : $current"
 Write-Host "  目标版本 : $Version   (tag $tag)"
 Write-Host "  分支     : $branch（领先 origin $behind 个提交）"
+$wantDeploy = $Deploy -or ($DeployPath -ne "")
+if ($wantDeploy) {
+    $target = if ($DeployPath -ne "") { $DeployPath } else { "scripts\deploy.ps1 的默认目录（D:\OneDrive\桌面\NST）" }
+    Write-Host "  部署     : $target$(if ($NoRestart) { '（不重启）' } else { '（会重启面板）' })"
+}
 Write-Host ""
 
 # ---------------------------------------------------------------- 改版本 + 刷 lock
@@ -199,6 +210,9 @@ if ($DryRun) {
     Write-Host ""
     $buildNote = if ($NoBuild) { "（-NoBuild，构建没跑）" } else { "、构建能过" }
     Write-Host "✓ DryRun 通过：版本 $current -> $Version、lock 能刷新$buildNote。" -ForegroundColor Green
+    if ($wantDeploy) {
+        Write-Host "  正式发版会额外部署到本机（scripts\deploy.ps1，停止旧进程 -> 备份 -> 覆盖 -> 重启）。"
+    }
     Write-Host "  正式发版去掉 -DryRun 即可（会提交、打 tag $tag、推 main + tag）。"
     exit 0
 }
@@ -248,6 +262,24 @@ $releaseUrl = "https://github.com/q455040355-del/NST/releases/tag/$tag"
 Write-Host ""
 Write-Host "✓ 已推送：main + $tag（$sha）" -ForegroundColor Green
 Write-Host "  Release 页（流水线跑完才有资产）: $releaseUrl"
+
+# ---------------------------------------------------------------- 部署到本机
+
+if ($wantDeploy) {
+    $deployScript = Join-Path $root "scripts\deploy.ps1"
+    if (-not (Test-Path $deployScript)) {
+        Fail "找不到 scripts\deploy.ps1"
+    }
+    Step "部署到本机日常那份（会先停掉正在跑的面板）"
+    $deployArgs = @()
+    if ($DeployPath -ne "") { $deployArgs += @("-Deploy", $DeployPath) }
+    if ($NoRestart) { $deployArgs += "-NoRestart" }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $deployScript @deployArgs
+    if ($LASTEXITCODE -ne 0) {
+        Fail "部署失败，看上面的输出（旧 exe 备份在 %TEMP%\netspeed-before-deploy.exe）"
+    }
+    Write-Host "✓ 本机已更新" -ForegroundColor Green
+}
 
 # ---------------------------------------------------------------- 盯流水线
 
