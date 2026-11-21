@@ -8,8 +8,6 @@ use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpReadData,
     WinHttpReceiveResponse, WinHttpSendRequest, WINHTTP_FLAG_SECURE, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-};
 
 use crate::theme::wide;
 
@@ -186,25 +184,32 @@ fn replace_and_restart(bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&fresh, bytes).map_err(|error| error.to_string())?;
 
     let bat = dir.join("update.bat");
+    // 只用 cmd 内建命令：tasklist / find 会被 PATH 里的 MSYS 工具劫持（find 是 GNU 的），
+    // 之前那版会弹个 cmd 窗口报 "find: 'I:/': No such file or directory"。
+    // 等进程退出改成「move 失败就重试」，目标被占用时 move 本来就会失败。
     let script = format!(
         "@echo off\r\n\
-         :wait\r\n\
-         tasklist /fi \"imagename eq netspeed.exe\" | find /i \"netspeed.exe\" > nul\r\n\
-         if not errorlevel 1 (\r\n\
+         setlocal\r\n\
+         set \"NEW={}\"\r\n\
+         set \"EXE={}\"\r\n\
+         :retry\r\n\
+         move /y \"%NEW%\" \"%EXE%\" > nul 2>&1\r\n\
+         if exist \"%NEW%\" (\r\n\
            timeout /t 1 /nobreak > nul\r\n\
-           goto wait\r\n\
+           goto retry\r\n\
          )\r\n\
-         move /y \"{}\" \"{}\" > nul\r\n\
-         start \"\" \"{}\"\r\n\
-         del \"%~f0\"\r\n",
+         start \"\" \"%EXE%\"\r\n",
         fresh.display(),
-        exe.display(),
         exe.display()
     );
     std::fs::write(&bat, script).map_err(|error| error.to_string())?;
 
+    // CREATE_NO_WINDOW：不弹黑框
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("cmd")
-        .args(["/C", "start", "/min", "", &bat.to_string_lossy()])
+        .args(["/C", &bat.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| error.to_string())?;
 
