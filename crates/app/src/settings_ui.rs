@@ -2512,15 +2512,8 @@ unsafe extern "system" fn dialog_proc(
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::Update) => {
-                    // 打开 GitHub 最新 Release 页面
-                    let _ = std::process::Command::new("cmd")
-                        .args([
-                            "/C",
-                            "start",
-                            "",
-                            "https://github.com/q455040355-del/NST/releases/latest",
-                        ])
-                        .spawn();
+                    crate::update::check(state.parent);
+                    return 0;
                 }
                 None => {}
             }

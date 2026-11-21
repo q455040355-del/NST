@@ -27,6 +27,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Com",
     "Win32_UI_Controls_Dialogs",
+    "Win32_Networking_WinHttp",
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # PaddleOCR 推理（Apache-2.0，纯 Rust，无 ONNX Runtime）；上游锁 nightly-2026-09-08

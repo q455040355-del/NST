@@ -46,6 +46,9 @@ jobs:
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
-          files: netspeed-*.zip
+          # zip 给手动下载；单独的 netspeed.exe 给程序内「检查更新」直接下载用
+          files: |
+            netspeed-*.zip
+            target/release/netspeed.exe
           # 仓库还没填 license 文件时也能出包；说明里带上提交范围
           generate_release_notes: true

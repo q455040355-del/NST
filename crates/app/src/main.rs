@@ -17,6 +17,7 @@ mod shot;
 mod theme;
 mod tray;
 mod ui;
+mod update;
 
 use netspeed_core::settings::{parse_hotkey, Settings};
 use panel::Panel;
