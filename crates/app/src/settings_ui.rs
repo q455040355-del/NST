@@ -109,6 +109,7 @@ enum Hit {
     GifHotkey,
     Scrollbar,
     AutoStart,
+    Update,
 }
 
 struct Fonts {
@@ -388,6 +389,8 @@ struct Layout {
     gif_hotkey: RECT,
     /// 页脚左边的「开机自启」整行热区
     auto_start: RECT,
+    /// 页脚「检查更新」按钮
+    update: RECT,
 }
 
 fn layout(state: &State, client: RECT) -> Layout {
@@ -516,6 +519,13 @@ fn layout(state: &State, client: RECT) -> Layout {
             left: pad + s(4.0, scale),
             top: done.top,
             right: (pad + s(4.0, scale) + s(170.0, scale)).min(done.left - s(12.0, scale)),
+            bottom: done.bottom,
+        },
+        // 页脚右侧：检查更新，紧挨着「完成」
+        update: RECT {
+            left: done.left - s(12.0, scale) - s(104.0, scale),
+            top: done.top,
+            right: done.left - s(12.0, scale),
             bottom: done.bottom,
         },
     }
@@ -1426,6 +1436,34 @@ unsafe fn paint(hwnd: HWND) {
 
     // 页脚左边：开机自启（放在这里就不用让内容区再长一行、也不会多出滚动条）
     {
+        // 检查更新（页脚右侧，紧挨「完成」）
+        let area = l.update;
+        let hovered = state.hover == Some(Hit::Update);
+        let (fill, border) = if hovered {
+            (c.chip_hover, c.chip_hover)
+        } else {
+            (c.chip, mix_white(c.border, 0.05))
+        };
+        p.round(
+            area.left,
+            area.top + p.s(4.0),
+            area.right,
+            area.bottom - p.s(4.0),
+            p.s(8.0),
+            fill,
+            border,
+        );
+        p.text(
+            "检查更新",
+            state.fonts.value,
+            if hovered { c.text } else { c.text2 },
+            area.left,
+            area.top,
+            area.right,
+            area.bottom,
+            DT_CENTER_ALIGN,
+        );
+
         let hovered = state.hover == Some(Hit::AutoStart);
         let sw_w = p.s(38.0);
         let sw_h = p.s(22.0);
@@ -2025,6 +2063,9 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.auto_start, point) {
         return Some(Hit::AutoStart);
     }
+    if contains(&l.update, point) {
+        return Some(Hit::Update);
+    }
 
     // 滚动条比内容区窄，得先判：否则会被下面「内容区偏移」的逻辑吃掉
     if max_scroll(state, client) > 0 {
@@ -2469,6 +2510,17 @@ unsafe extern "system" fn dialog_proc(
                 Some(Hit::AutoStart) => {
                     toggle_auto_start(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::Update) => {
+                    // 打开 GitHub 最新 Release 页面
+                    let _ = std::process::Command::new("cmd")
+                        .args([
+                            "/C",
+                            "start",
+                            "",
+                            "https://github.com/q455040355-del/NST/releases/latest",
+                        ])
+                        .spawn();
                 }
                 None => {}
             }

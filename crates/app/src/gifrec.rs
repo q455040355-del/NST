@@ -18,7 +18,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
     InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
     BITMAPINFO, BITMAPINFOHEADER, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ,
-    LineTo, MoveToEx, PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
+    PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
