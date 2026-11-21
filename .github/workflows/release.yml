@@ -52,3 +52,29 @@ jobs:
             target/release/netspeed.exe
           # 仓库还没填 license 文件时也能出包；说明里带上提交范围
           generate_release_notes: true
+
+      # Releases 只留最近 5 个，旧的连 tag 一起删掉，免得列表越滚越长
+      - name: Prune old releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{
+            Authorization = "token $env:GH_TOKEN"
+            "User-Agent"  = "netspeed-release"
+            Accept        = "application/vnd.github+json"
+          }
+          $base = "https://api.github.com/repos/${{ github.repository }}"
+          $releases = Invoke-RestMethod -Uri "$base/releases?per_page=100" -Headers $headers
+          $keep = $releases | Select-Object -First 5
+          $drop = $releases | Where-Object { $keep.id -notcontains $_.id }
+          foreach ($release in $drop) {
+            Write-Host "删除旧 Release $($release.tag_name)"
+            Invoke-RestMethod -Method Delete -Uri "$base/releases/$($release.id)" -Headers $headers | Out-Null
+            # Release 删了 tag 还在，一起清掉
+            try {
+              Invoke-RestMethod -Method Delete -Uri "$base/git/refs/tags/$($release.tag_name)" -Headers $headers | Out-Null
+            } catch {
+              Write-Host "tag $($release.tag_name) 删除失败（可能已不存在）"
+            }
+          }
