@@ -916,21 +916,15 @@ pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
     let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
     let path = String::from_utf16_lossy(&name[..length]);
     if std::fs::write(&path, &bytes).is_err() {
-        MessageBoxW(
+        crate::dialog::info(
             owner,
-            wide("WebP 保存失败：磁盘空间不足、没有写入权限，或路径无效。").as_ptr(),
-            wide("保存 WebP").as_ptr(),
-            MB_OK | MB_ICONWARNING,
+            "保存 WebP",
+            "WebP 保存失败：磁盘空间不足、没有写入权限，或路径无效。",
         );
         return;
     }
 
     let size = bytes.len() as f64 / 1024.0 / 1024.0;
     let text = format!("已保存（{size:.2} MB）\n{path}");
-    MessageBoxW(
-        owner,
-        wide(&text).as_ptr(),
-        wide("WebP 已保存").as_ptr(),
-        MB_OK | MB_ICONINFORMATION,
-    );
+    crate::dialog::info(owner, "WebP 已保存", &text);
 }

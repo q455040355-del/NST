@@ -2060,11 +2060,12 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.done, point) {
         return Some(Hit::Done);
     }
-    if contains(&l.auto_start, point) {
-        return Some(Hit::AutoStart);
-    }
+    // 「检查更新」压在「开机自启」的热区范围里，必须先判它
     if contains(&l.update, point) {
         return Some(Hit::Update);
+    }
+    if contains(&l.auto_start, point) {
+        return Some(Hit::AutoStart);
     }
 
     // 滚动条比内容区窄，得先判：否则会被下面「内容区偏移」的逻辑吃掉

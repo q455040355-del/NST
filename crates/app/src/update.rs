@@ -9,7 +9,6 @@ use windows_sys::Win32::Networking::WinHttp::{
     WinHttpReceiveResponse, WinHttpSendRequest, WINHTTP_FLAG_SECURE, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MB_ICONQUESTION, IDYES,
 };
 
 use crate::theme::wide;
@@ -22,14 +21,7 @@ pub fn check(owner: HWND) {
     std::thread::spawn(move || {
         let owner = owner as HWND;
         let Some(body) = http_get(API) else {
-            unsafe {
-                MessageBoxW(
-                    owner,
-                    wide("检查更新失败：连不上 GitHub（可能没网或被墙）。").as_ptr(),
-                    wide("检查更新").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
+            crate::dialog::info(owner, "检查更新", "检查更新失败：连不上 GitHub（可能没网或被墙）。");
             return;
         };
         let json = String::from_utf8_lossy(&body).to_string();
@@ -39,29 +31,18 @@ pub fn check(owner: HWND) {
         let current = env!("CARGO_PKG_VERSION");
         let latest = tag.trim_start_matches('v').to_string();
         if !is_newer(&latest, current) {
-            unsafe {
-                MessageBoxW(
-                    owner,
-                    wide(&format!("已是最新版本 v{current}。")).as_ptr(),
-                    wide("检查更新").as_ptr(),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-            }
+            crate::dialog::info(
+                owner,
+                "检查更新",
+                &format!("已是最新版本 v{current}。"),
+            );
             return;
         }
 
         let text = format!(
             "发现新版本 v{latest}（当前 v{current}）。\n\n现在下载并替换吗？程序会自动重启。"
         );
-        let answer = unsafe {
-            MessageBoxW(
-                owner,
-                wide(&text).as_ptr(),
-                wide("检查更新").as_ptr(),
-                MB_YESNO | MB_ICONQUESTION,
-            )
-        };
-        if answer != IDYES {
+        if !crate::dialog::confirm(owner, "检查更新", &text) {
             return;
         }
 
@@ -70,38 +51,21 @@ pub fn check(owner: HWND) {
             "https://github.com/q455040355-del/NST/releases/download/v{latest}/netspeed.exe"
         );
         let Some(bytes) = http_get(&url) else {
-            unsafe {
-                MessageBoxW(
-                    owner,
-                    wide("下载失败，请稍后再试（或去 Releases 页面手动下载）。").as_ptr(),
-                    wide("检查更新").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
+            crate::dialog::info(
+                owner,
+                "检查更新",
+                "下载失败，请稍后再试（或去 Releases 页面手动下载）。",
+            );
             return;
         };
         if bytes.len() < 1_000_000 {
             // 多半是错误页/重定向，别把 exe 覆盖成垃圾
-            unsafe {
-                MessageBoxW(
-                    owner,
-                    wide("下载到的文件不对，已放弃更新。").as_ptr(),
-                    wide("检查更新").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
+            crate::dialog::info(owner, "检查更新", "下载到的文件不对，已放弃更新。");
             return;
         }
 
         if let Err(error) = replace_and_restart(&bytes) {
-            unsafe {
-                MessageBoxW(
-                    owner,
-                    wide(&format!("更新失败：{error}")).as_ptr(),
-                    wide("检查更新").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
+            crate::dialog::info(owner, "检查更新", &format!("更新失败：{error}"));
         }
     });
 }

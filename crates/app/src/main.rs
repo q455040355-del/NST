@@ -4,6 +4,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod dialog;
 mod gifrec;
 mod history_ui;
 mod hint;
