@@ -683,16 +683,18 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     }
 
     // 帧先留着，停止后一次性交给 libwebp 的动画编码器（帧间优化它自己做）
-    let mut shots: Vec<Vec<u8>> = Vec::new();
+    // (RGBA 帧, 真实经过的毫秒)：丢掉重复帧后时间戳仍按真实时间走，否则时长会被压缩
+    let mut shots: Vec<(Vec<u8>, i32)> = Vec::new();
+    let started_at = std::time::Instant::now();
+    let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
     let mut last_raw: Vec<u8> = Vec::new();
     // 内存兜底：整段最多占 600MB
     // 内存兜底：整段最多占 900MB（120fps 下比 30fps 时限短得多）
     let max_frames = ((900 * 1024 * 1024) / (width.max(1) * height.max(1) * 4) as usize).max(30);
     // WebP 动画的时间戳是毫秒：120fps 取 8ms（≈125fps），60 取 16，30 取 33
-    let delay_ms = (1000 / fps.max(1) as i32).max(1);
 
     for shot in &warmup {
-        shots.push(to_rgba(shot));
+        shots.push((to_rgba(shot), stamp(std::time::Instant::now())));
         last_raw.clear();
         last_raw.extend_from_slice(shot);
     }
@@ -721,13 +723,18 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
             // 画面没变：这一帧直接不要，时间轴照样往前走
             continue;
         }
-        shots.push(to_rgba(&frame));
+        shots.push((to_rgba(&frame), stamp(std::time::Instant::now())));
         last_raw.clear();
         last_raw.extend_from_slice(&frame);
     }
 
+    // 收尾：画面最后静止的那一段也要算进时长，补一帧（内容同上、时间戳取结束时）
+    if let Some((frame, _)) = shots.last().cloned() {
+        shots.push((frame, stamp(std::time::Instant::now())));
+    }
+
     let mode = STOP_MODE.load(Ordering::SeqCst);
-    let bytes = encode_webp(width, height, &shots, delay_ms);
+    let bytes = encode_webp(width, height, &shots, (1000 / fps.max(1) as i32).max(1));
     crate::debug_log(&format!("rec done: frames={} bytes={} size={width}x{height}", shots.len(), bytes.len()));
     finish(border, button);
 
@@ -758,7 +765,7 @@ fn to_rgba(bgra: &[u8]) -> Vec<u8> {
 }
 
 /// 用 libwebp 的动画编码器出 WebP（帧间优化、重复帧、调色板它自己处理）
-fn encode_webp(width: i32, height: i32, frames: &[Vec<u8>], delay_ms: i32) -> Vec<u8> {
+fn encode_webp(width: i32, height: i32, frames: &[(Vec<u8>, i32)], delay_ms: i32) -> Vec<u8> {
     if frames.is_empty() {
         return Vec::new();
     }
@@ -770,8 +777,15 @@ fn encode_webp(width: i32, height: i32, frames: &[Vec<u8>], delay_ms: i32) -> Ve
 
     let mut encoder = webp::AnimEncoder::new(width.max(1) as u32, height.max(1) as u32, &config);
     encoder.set_loop_count(0);
-    for (index, frame) in frames.iter().enumerate() {
-        let timestamp = index as i32 * delay_ms;
+    // 时间戳必须是递增的真实时间：中间丢掉重复帧后不能拿序号乘帧间隔，否则时长会变短
+    let mut previous_ts = -1;
+    for (frame, ts) in frames {
+        let mut timestamp = (*ts).max(previous_ts + 1).max(0);
+        if false && previous_ts >= 0 {
+            // 长时间不变（比如录屏时画面静止）：留一点真实等待，但不要超长
+            timestamp = previous_ts + delay_ms * 8;
+        }
+        previous_ts = timestamp;
         encoder.add_frame(webp::AnimFrame::from_rgba(
             frame,
             width.max(1) as u32,

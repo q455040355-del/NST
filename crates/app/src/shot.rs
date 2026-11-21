@@ -2587,6 +2587,11 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
             SetWindowPos(hwnd, insert, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if editor.topmost {
+                // 任务栏也是 topmost：把自己再抬到 topmost 组最前面，并激活一下，才盖得住
+                SetForegroundWindow(hwnd);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            }
             SetWindowTextW(
                 hwnd,
                 wide(if editor.topmost {
@@ -2679,6 +2684,22 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_DPICHANGED => {
             editor_relayout(hwnd, lparam as *const RECT);
             0
+        }
+        // 置顶着的时候，被别的窗口/任务栏顶下去就再顶回来
+        WM_ACTIVATE | WM_WINDOWPOSCHANGED => {
+            let editor = editor_state(hwnd);
+            if !editor.is_null() && (*editor).topmost {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_APP_EDITOR_TOAST => {
             let editor = editor_state(hwnd);
