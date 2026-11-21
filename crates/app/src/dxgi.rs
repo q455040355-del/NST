@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice,
-    IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 
 /// 一次抓取的结果
@@ -92,9 +92,21 @@ impl Duplicator {
             let output = output?;
 
             let output1: IDXGIOutput1 = output.cast().ok()?;
-            let duplicator = output1.DuplicateOutput(&device).ok()?;
+            // DuplicateOutput1 可以指定想要的像素格式：这台机器是 HDR 桌面，原生格式是
+            // R10G10B10A2（10bit），直接复制到 BGRA8 会静默失败、整帧全黑。
+            // 用 DuplicateOutput1 让系统在 GPU 上帮我们转成 BGRA8（SDR 映射）。
+            let duplicator = match output.cast::<IDXGIOutput5>() {
+                Ok(output5) => output5
+                    .DuplicateOutput1(&device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM])
+                    .ok()?,
+                Err(_) => output1.DuplicateOutput(&device).ok()?,
+            };
 
             let dup_desc = duplicator.GetDesc();
+            if dup_desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                // 系统没给 BGRA8（老系统 / 特殊驱动）：别硬来，让调用方回落 GDI
+                return None;
+            }
             let full_w = dup_desc.ModeDesc.Width as i32;
             let full_h = dup_desc.ModeDesc.Height as i32;
             let output_rect = output.GetDesc().ok()?.DesktopCoordinates;
