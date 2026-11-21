@@ -285,14 +285,22 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
     DeleteObject(border as *mut _);
     DeleteObject(bg as *mut _);
 
-    // 两半分隔线
+    // 两个按钮各自一圈淡灰描边（中间不再画分隔线）
     let half = width / 2;
-    let divider = CreatePen(0, 1, 0x00E4_E8EC);
-    let old = SelectObject(dc, divider as HGDIOBJ);
-    MoveToEx(dc, half, 8, std::ptr::null_mut());
-    LineTo(dc, half, height - 8);
-    SelectObject(dc, old);
-    DeleteObject(divider as *mut _);
+    let stroke = CreatePen(0, 1, 0x00D2_D7DC);
+    let old_pen = SelectObject(dc, stroke as HGDIOBJ);
+    let hollow = windows_sys::Win32::Graphics::Gdi::GetStockObject(
+        windows_sys::Win32::Graphics::Gdi::NULL_BRUSH,
+    );
+    let old_brush = SelectObject(dc, hollow as HGDIOBJ);
+    for index in 0..2 {
+        let left = index as i32 * half + 3;
+        let right = (index as i32 + 1) * half - 3;
+        RoundRect(dc, left, 3, right, height - 3, s_round(), s_round());
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(stroke as *mut _);
 
     // 悬停的那一半铺一层浅灰
     if hover == 0 || hover == 1 {
