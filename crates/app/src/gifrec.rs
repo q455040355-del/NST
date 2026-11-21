@@ -340,7 +340,17 @@ pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
         .and_then(|frames| frames.get_frame(0).and_then(|frame| rgba_to_dib(&frame)))
         ;
 
-    if OpenClipboard(owner) == 0 {
+    // 剪贴板可能被别的程序占着，重试几次
+    let mut opened = 0;
+    for attempt in 0..6 {
+        opened = OpenClipboard(owner);
+        if opened != 0 {
+            break;
+        }
+        crate::debug_log(&format!("clipboard open failed, attempt {attempt}"));
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    if opened == 0 {
         return;
     }
     EmptyClipboard();
@@ -719,6 +729,9 @@ unsafe fn run(panel: usize, x: i32, y: i32, width: i32, height: i32, fps: u32, b
     let bytes = encode_webp(width, height, &shots, delay_ms);
     finish(border, button);
 
+    if bytes.is_empty() {
+        crate::debug_log(&format!("rec empty: frames={} mode={mode}", shots.len()));
+    }
     if !bytes.is_empty() {
         unsafe {
             let pointer = Box::into_raw(Box::new(bytes));
@@ -766,7 +779,10 @@ fn encode_webp(width: i32, height: i32, frames: &[Vec<u8>], delay_ms: i32) -> Ve
     }
     match encoder.try_encode() {
         Ok(memory) => memory.to_vec(),
-        Err(_) => Vec::new(),
+        Err(error) => {
+            crate::debug_log(&format!("webp encode failed: {error:?} frames={}", frames.len()));
+            Vec::new()
+        }
     }
 }
 
