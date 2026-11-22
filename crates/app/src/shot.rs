@@ -1192,7 +1192,13 @@ enum Tool {
     Square,
     /// 空心椭圆（微信那排第一个）
     Ellipse,
+    /// 直线
+    Line,
     Pen,
+    /// 序号：点一下放一个自动递增的圆标
+    Numbered,
+    /// 橡皮：点哪条删哪条
+    Eraser,
     Text,
     Mosaic,
     /// 拖框选一块区域做 OCR
@@ -1220,6 +1226,15 @@ enum Shape {
         a: (i32, i32),
         b: (i32, i32),
         stroke: u8,
+    },
+    Line {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+    Numbered {
+        at: (i32, i32),
+        n: i32,
     },
     Pen {
         points: Vec<(i32, i32)>,
@@ -1259,6 +1274,7 @@ enum Action {
     Stroke,
     Tool(Tool),
     Undo,
+    Redo,
     Copy,
     Save,
     Pin,
@@ -1288,6 +1304,10 @@ struct Editor {
     /// 左键拖拽平移：起点 + 起始的 image_left/top
     pan: Option<((i32, i32), (i32, i32))>,
     shapes: Vec<Shape>,
+    /// 撤销掉的图形（重做用；一旦画了新的就清空）
+    undone: Vec<Shape>,
+    /// 下一个序号
+    next_number: i32,
     tool: Tool,
     scale: f32,
     image_left: i32,
@@ -1314,6 +1334,8 @@ struct Editor {
 }
 
 const ANNOT: u32 = 0x003A_3AE0; // 0x00BBGGRR，红
+/// 序号的底色（微信那个红）
+const NUMBER_RED: u32 = 0x0040_43E6;
 
 fn editor_state(hwnd: HWND) -> *mut Editor {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Editor }
@@ -1348,11 +1370,15 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Rect) => "矩形",
         Action::Tool(Tool::Square) => "正方形",
         Action::Tool(Tool::Ellipse) => "椭圆",
+        Action::Tool(Tool::Line) => "直线",
+        Action::Tool(Tool::Numbered) => "序号",
+        Action::Tool(Tool::Eraser) => "橡皮",
         Action::Tool(Tool::Pen) => "画笔",
         Action::Tool(Tool::Text) => "文字",
         Action::Tool(Tool::Mosaic) => "马赛克",
         Action::Tool(Tool::Ocr) => "OCR",
         Action::Undo => "撤销",
+        Action::Redo => "重做",
         Action::Copy => "复制",
         Action::Save => "保存",
         Action::Stroke => "浓淡",
@@ -1477,6 +1503,99 @@ fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {    if poin
         Polyline(dc, pts.as_ptr(), pts.len() as i32);
         SelectObject(dc, old);
         DeleteObject(pen as *mut _);
+    }
+}
+
+/// 图形的包围盒（橡皮命中测试用）
+fn shape_bounds(shape: &Shape) -> (i32, i32, i32, i32) {
+    match shape {
+        Shape::Arrow { a, b, .. }
+        | Shape::Rect { a, b, .. }
+        | Shape::Square { a, b, .. }
+        | Shape::Ellipse { a, b, .. }
+        | Shape::Line { a, b, .. }
+        | Shape::Mosaic { a, b, .. } => (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
+        Shape::Numbered { at, .. } => (at.0 - 12, at.1 - 12, at.0 + 12, at.1 + 12),
+        Shape::Text { at, .. } => (at.0, at.1, at.0 + 80, at.1 + 24),
+        Shape::Pen { points, .. } => {
+            let mut left = i32::MAX;
+            let mut top = i32::MAX;
+            let mut right = i32::MIN;
+            let mut bottom = i32::MIN;
+            for (x, y) in points {
+                left = left.min(*x);
+                top = top.min(*y);
+                right = right.max(*x);
+                bottom = bottom.max(*y);
+            }
+            if points.is_empty() {
+                (0, 0, 0, 0)
+            } else {
+                (left, top, right, bottom)
+            }
+        }
+    }
+}
+
+/// 橡皮：点在哪里，返回最上面那条被点中的图形
+fn shape_at(editor: &Editor, at: (i32, i32)) -> Option<usize> {
+    const PAD: i32 = 6;
+    for (index, shape) in editor.shapes.iter().enumerate().rev() {
+        let (left, top, right, bottom) = shape_bounds(shape);
+        if at.0 >= left - PAD && at.0 <= right + PAD && at.1 >= top - PAD && at.1 <= bottom + PAD {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn draw_line(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
+    let (ax, ay) = scaled(a, scale);
+    let (bx, by) = scaled(b, scale);
+    unsafe {
+        let pen = CreatePen(0, width, ANNOT);
+        let old = SelectObject(dc, pen as HGDIOBJ);
+        MoveToEx(dc, ax, ay, std::ptr::null_mut());
+        LineTo(dc, bx, by);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
+    }
+}
+
+/// 序号：红底白字的圆标，圆心就是点下去的位置
+fn draw_numbered(dc: HDC, at: (i32, i32), n: i32, scale: f32) {
+    let (x, y) = scaled(at, scale);
+    let r = (11.0 * scale).round().max(7.0) as i32;
+    unsafe {
+        let brush = CreateSolidBrush(NUMBER_RED);
+        let pen = CreatePen(0, 1, NUMBER_RED);
+        let old_b = SelectObject(dc, brush as HGDIOBJ);
+        let old_p = SelectObject(dc, pen as HGDIOBJ);
+        windows_sys::Win32::Graphics::Gdi::Ellipse(dc, x - r, y - r, x + r, y + r);
+        SelectObject(dc, old_p);
+        SelectObject(dc, old_b);
+        DeleteObject(pen as *mut _);
+        DeleteObject(brush as *mut _);
+
+        let text = n.to_string();
+        let font = cached_font(11.0 * scale, 700);
+        let old_f = SelectObject(dc, font as HGDIOBJ);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, 0x00FF_FFFF);
+        let mut rect = RECT {
+            left: x - r,
+            top: y - r,
+            right: x + r,
+            bottom: y + r,
+        };
+        DrawTextW(
+            dc,
+            wide(&text).as_ptr(),
+            -1,
+            &mut rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_f);
     }
 }
 
@@ -1657,6 +1776,9 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::Ellipse => "拖出椭圆 · Esc 取消",
         Tool::Square => "拖出正方形（宽高始终一样）· Esc 取消",
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
+        Tool::Line => "拖一条直线 · Esc 取消",
+        Tool::Numbered => "点一下放一个序号（自动递增）",
+        Tool::Eraser => "点一下删掉那条标注",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
         _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
     }
@@ -1678,6 +1800,10 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
             Shape::Ellipse { a, b, stroke } => {
                 draw_ellipse(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
+            Shape::Line { a, b, stroke } => {
+                draw_line(dc, *a, *b, stroke_width(scale, *stroke), scale)
+            }
+            Shape::Numbered { at, n } => draw_numbered(dc, *at, *n, scale),
             Shape::Pen { points, stroke } => {
                 draw_pen(dc, points, stroke_width(scale, *stroke), scale)
             }
@@ -1881,6 +2007,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             Tool::Rect => draw_rect(dc, from, to, width, editor.scale),
             Tool::Square => draw_rect(dc, from, squared(from, to), width, editor.scale),
             Tool::Ellipse => draw_ellipse(dc, from, to, width, editor.scale),
+            Tool::Line => draw_line(dc, from, to, width, editor.scale),
+            Tool::Numbered => draw_numbered(dc, to, editor.next_number, editor.scale),
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
                 let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
@@ -1931,14 +2059,18 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Rect), false),
         (Action::Tool(Tool::Square), false),
         (Action::Tool(Tool::Ellipse), false),
+        (Action::Tool(Tool::Line), false),
         (Action::Tool(Tool::Arrow), false),
         (Action::Tool(Tool::Pen), false),
+        (Action::Tool(Tool::Numbered), false),
         (Action::Tool(Tool::Mosaic), false),
+        (Action::Tool(Tool::Eraser), false),
         (Action::Tool(Tool::Text), false),
         (Action::Tool(Tool::Ocr), false),
         (Action::Scroll, false),
         (Action::Stroke, true),
         (Action::Undo, false),
+        (Action::Redo, false),
         (Action::Topmost, true),
         (Action::Copy, false),
         (Action::Save, false),
@@ -2202,6 +2334,8 @@ pub unsafe fn preview_png(path: &str) -> bool {
         zoom: preview_zoom,
         pan: None,
         shapes: Vec::new(),
+        undone: Vec::new(),
+        next_number: 1,
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
         scale: preview_zoom,
@@ -2635,6 +2769,54 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                     }
                 }
             }
+            // ╱ 一条斜线
+            Action::Tool(Tool::Line) => {
+                icon_line(dc, cx - r, cy + r, cx + r, cy - r, pen, color);
+            }
+            // 实心圆里一个 1（序号）
+            Action::Tool(Tool::Numbered) => {
+                let brush = CreateSolidBrush(color);
+                let old_b = SelectObject(dc, brush as HGDIOBJ);
+                let old_p = SelectObject(dc, CreatePen(0, 1, color) as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::Ellipse(dc, rx, ry, bx, by);
+                SelectObject(dc, old_b);
+                DeleteObject(brush as *mut _);
+                draw_glyph_sized(dc, "1", rect, 0x00FF_FFFF, 9.0);
+                let _ = old_p;
+            }
+            // 橡皮：斜的方块 + 一道斜线
+            Action::Tool(Tool::Eraser) => {
+                let hx = s(3.0);
+                let body = [
+                    POINT { x: cx - r, y: cy - r + s(5.0) },
+                    POINT { x: cx - r + s(6.0), y: cy - r },
+                    POINT { x: cx + r, y: cy + r - s(5.0) },
+                    POINT { x: cx + r - s(6.0), y: cy + r },
+                ];
+                icon_polyline(dc, &body, pen, color, true);
+                icon_line(dc, cx - hx, cy + hx, cx + hx, cy - hx, pen, color);
+            }
+            // ↷ 上半圈 + 右端开口箭头（和撤销左右对称）
+            Action::Redo => {
+                let arc_pen = CreatePen(0, pen, color);
+                let old = SelectObject(dc, arc_pen as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::Arc(
+                    dc,
+                    cx - r,
+                    cy - r,
+                    cx + r,
+                    cy + r,
+                    cx - r,
+                    cy,
+                    cx + r,
+                    cy,
+                );
+                SelectObject(dc, old);
+                DeleteObject(arc_pen as *mut _);
+                let arm = s(5.0);
+                icon_line(dc, cx + r, cy, cx + r - s(1.0), cy - arm, pen, color);
+                icon_line(dc, cx + r, cy, cx + r + arm, cy - s(1.0), pen, color);
+            }
             // ↶ 上半圈 + 开口箭头
             Action::Undo => {
                 let arc_pen = CreatePen(0, pen, color);
@@ -2843,11 +3025,19 @@ unsafe fn composite(editor: &Editor) -> Bitmap {
 }
 
 impl Editor {
+    /// 新画的图形入栈，同时把重做栈清掉（和常见编辑器一致）
+    fn push_shape(&mut self, shape: Shape) {
+        self.shapes.push(shape);
+        self.undone.clear();
+    }
+
     /// 只为了给 composite 传一份 scale=1 的参数
     fn clone_for_render(&self) -> Editor {
         Editor {
             base: self.base.clone(),
             shapes: self.shapes.clone(),
+            undone: Vec::new(),
+            next_number: self.next_number,
             screen: self.screen,
             base_scale: self.base_scale,
             zoom: self.zoom,
@@ -3165,7 +3355,7 @@ unsafe fn commit_text(parent: HWND) {
 
     let editor = &mut *editor;
     if !value.trim().is_empty() {
-        editor.shapes.push(Shape::Text {
+        editor.push_shape(Shape::Text {
             at: text_widget.at,
             text: value,
         });
@@ -3241,7 +3431,16 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         }
         Action::Undo => {
             let editor = &mut *editor;
-            editor.shapes.pop();
+            if let Some(shape) = editor.shapes.pop() {
+                editor.undone.push(shape);
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+        Action::Redo => {
+            let editor = &mut *editor;
+            if let Some(shape) = editor.undone.pop() {
+                editor.shapes.push(shape);
+            }
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
         Action::Stroke => {
@@ -3644,10 +3843,34 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
 
+            // 序号 / 橡皮是「点一下」的工具，不走拖拽
+            if matches!(editor.tool, Tool::Numbered | Tool::Eraser) {
+                if let Some(at) = editor.drag_from {
+                    match editor.tool {
+                        Tool::Numbered => {
+                            let n = editor.next_number;
+                            editor.next_number += 1;
+                            editor.push_shape(Shape::Numbered { at, n });
+                        }
+                        Tool::Eraser => {
+                            if let Some(index) = shape_at(editor, at) {
+                                editor.shapes.remove(index);
+                                editor.undone.clear();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                editor.drag_from = None;
+                editor.drag_to = None;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+
             if editor.tool == Tool::Pen {
                 if editor.pen_points.len() > 1 {
                     let points = std::mem::take(&mut editor.pen_points);
-                    editor.shapes.push(Shape::Pen {
+                    editor.push_shape(Shape::Pen {
                         points,
                         stroke: editor.stroke,
                     });
@@ -3662,15 +3885,22 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 let wide_enough = right - left >= 8 && bottom - top >= 8;
 
                 match editor.tool {
+                    Tool::Line if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
+                        editor.push_shape(Shape::Line {
+                            a: from,
+                            b: to,
+                            stroke: editor.stroke,
+                        })
+                    }
                     Tool::Arrow if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
-                        editor.shapes.push(Shape::Arrow {
+                        editor.push_shape(Shape::Arrow {
                             a: from,
                             b: to,
                             stroke: editor.stroke,
                         })
                     }
                     Tool::Rect if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
-                        editor.shapes.push(Shape::Rect {
+                        editor.push_shape(Shape::Rect {
                             a: from,
                             b: to,
                             stroke: editor.stroke,
@@ -3678,21 +3908,21 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     }
                     Tool::Square if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
                         let corner = squared(from, to);
-                        editor.shapes.push(Shape::Square {
+                        editor.push_shape(Shape::Square {
                             a: from,
                             b: corner,
                             stroke: editor.stroke,
                         })
                     }
                     Tool::Ellipse if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
-                        editor.shapes.push(Shape::Ellipse {
+                        editor.push_shape(Shape::Ellipse {
                             a: from,
                             b: to,
                             stroke: editor.stroke,
                         })
                     }
                     Tool::Mosaic if wide_enough => {
-                        editor.shapes.push(Shape::Mosaic {
+                        editor.push_shape(Shape::Mosaic {
                             a: from,
                             b: to,
                             stroke: editor.stroke,
@@ -3770,11 +4000,13 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     SetWindowTextW(hwnd, wide("截图编辑 · 已复制到剪贴板").as_ptr());
                     show_toast(hwnd, "已复制到剪贴板");
                 }
+                0x59 if GetKeyState(0x11) < 0 => {
+                    // Ctrl+Y：重做
+                    editor_command(hwnd, Action::Redo);
+                }
                 0x5A if GetKeyState(0x11) < 0 => {
-                    // Ctrl+Z
-                    let editor = &mut *editor_state(hwnd);
-                    editor.shapes.pop();
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    // Ctrl+Z：撤销（走命令，重做栈才对得上）
+                    editor_command(hwnd, Action::Undo);
                 }
                 0x43 if GetKeyState(0x11) < 0 => {
                     commit_text(hwnd);
@@ -3931,6 +4163,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         zoom: 1.0,
         pan: None,
         shapes: Vec::new(),
+        undone: Vec::new(),
+        next_number: 1,
         tool: Tool::None,
         scale,
         image_left,
