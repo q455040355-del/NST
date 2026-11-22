@@ -1281,6 +1281,8 @@ enum Action {
     /// 描边浓淡切换（细 / 中 / 粗）
     Stroke,
     Tool(Tool),
+    /// 顺时针转 90°
+    Rotate,
     Undo,
     Redo,
     Copy,
@@ -1389,6 +1391,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Translate) => "翻译",
         Action::Undo => "撤销",
         Action::Redo => "重做",
+        Action::Rotate => "旋转",
         Action::Copy => "复制",
         Action::Save => "保存",
         Action::Stroke => "浓淡",
@@ -1514,6 +1517,65 @@ fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {    if poin
         SelectObject(dc, old);
         DeleteObject(pen as *mut _);
     }
+}
+
+/// 顺时针转 90°：图转、图形坐标跟着转、再按显示区重新适配
+unsafe fn rotate_editor(hwnd: HWND, editor: &mut Editor) {
+    let (width, height) = (editor.base.width, editor.base.height);
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let mut rotated = Bitmap {
+        width: height,
+        height: width,
+        pixels: vec![0u8; (width * height * 4) as usize],
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let src = ((y * width + x) * 4) as usize;
+            let dst = ((x * height + (height - 1 - y)) * 4) as usize;
+            rotated.pixels[dst..dst + 4].copy_from_slice(&editor.base.pixels[src..src + 4]);
+        }
+    }
+    editor.base = rotated;
+
+    let map = |point: (i32, i32)| (height - 1 - point.1, point.0);
+    for shape in editor.shapes.iter_mut() {
+        match shape {
+            Shape::Arrow { a, b, .. }
+            | Shape::Rect { a, b, .. }
+            | Shape::Square { a, b, .. }
+            | Shape::Ellipse { a, b, .. }
+            | Shape::Line { a, b, .. }
+            | Shape::Mosaic { a, b, .. } => {
+                *a = map(*a);
+                *b = map(*b);
+            }
+            Shape::Pen { points, .. } | Shape::Marker { points, .. } => {
+                for point in points.iter_mut() {
+                    *point = map(*point);
+                }
+            }
+            Shape::Numbered { at, .. } => *at = map(*at),
+            Shape::Text { at, .. } => *at = map(*at),
+        }
+    }
+    editor.undone.clear();
+
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    let view_h = editor_view_height(client);
+    if client.right > 0 && view_h > 0 {
+        // 转完长宽互换，重新挑一个「整张塞得下」的比例
+        let fit = (client.right as f32 / editor.base.width as f32)
+            .min(view_h as f32 / editor.base.height as f32);
+        editor.scale = fit.min(4.0).max(0.05);
+        clamp_image(editor, client);
+    }
+    editor.drag_from = None;
+    editor.drag_to = None;
+    editor.pen_points.clear();
+    InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
 /// 图形的包围盒（橡皮命中测试用）
@@ -2224,6 +2286,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Ocr), false),
         (Action::Tool(Tool::Translate), false),
         (Action::Scroll, false),
+        (Action::Rotate, false),
         (Action::Stroke, true),
         (Action::Undo, false),
         (Action::Redo, false),
@@ -2247,9 +2310,20 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let avail = (client.right - s(16.0)).max(s(240.0));
     if measure(item, gap, sep_w) > avail {
         let factor = avail as f32 / measure(item, gap, sep_w) as f32;
-        item = ((item as f32 * factor) as i32).max(s(22.0));
+        item = ((item as f32 * factor) as i32).max(s(16.0));
         gap = ((gap as f32 * factor) as i32).max(s(1.0));
-        sep_w = ((sep_w as f32 * factor) as i32).max(s(6.0));
+        sep_w = ((sep_w as f32 * factor) as i32).max(s(4.0));
+    }
+    // 压到最小还是放不下：把间隔和分组线再挤掉一点，保证最右边的 ✓ 不会被切
+    if measure(item, gap, sep_w) > avail {
+        gap = s(1.0);
+        sep_w = s(2.0);
+        item = ((avail
+            - (layout_items.len() as i32 - 1) * gap
+            - groups * (sep_w + gap)
+            - pad * 2)
+            / layout_items.len() as i32)
+            .max(s(14.0));
     }
     let bar_w = measure(item, gap, sep_w);
     let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
@@ -2962,6 +3036,27 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                 icon_polyline(dc, &body, pen, color, true);
                 icon_line(dc, cx - hx, cy + hx, cx + hx, cy - hx, pen, color);
             }
+            // ↻ 顺时针整圈 + 箭头
+            Action::Rotate => {
+                let arc_pen = CreatePen(0, pen, color);
+                let old = SelectObject(dc, arc_pen as HGDIOBJ);
+                windows_sys::Win32::Graphics::Gdi::Arc(
+                    dc,
+                    cx - r,
+                    cy - r,
+                    cx + r,
+                    cy + r,
+                    cx + r,
+                    cy,
+                    cx,
+                    cy + r,
+                );
+                SelectObject(dc, old);
+                DeleteObject(arc_pen as *mut _);
+                let arm = s(5.0);
+                icon_line(dc, cx + r, cy, cx + r - arm, cy - s(3.0), pen, color);
+                icon_line(dc, cx + r, cy, cx + r - s(2.0), cy + s(1.0), pen, color);
+            }
             // ↷ 上半圈 + 右端开口箭头（和撤销左右对称）
             Action::Redo => {
                 let arc_pen = CreatePen(0, pen, color);
@@ -3608,6 +3703,10 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
                 editor.shapes.push(shape);
             }
             InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+        Action::Rotate => {
+            let editor = &mut *editor;
+            rotate_editor(hwnd, editor);
         }
         Action::Stroke => {
             let editor = &mut *editor;
