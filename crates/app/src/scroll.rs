@@ -148,6 +148,10 @@ pub struct Stitcher {
     /// 上一帧原图：用它和当前帧算「这一下滚了多少、往哪滚」，
     /// 比拿长图去猜方向靠谱（长图内容重复时两个方向都能对上，就会拼重）
     prev: Option<Bitmap>,
+    /// 当前帧顶端落在长图的第几行（显示区顶端在长图里的位置）。
+    /// 有了它才知道「这一帧看到的内容有多少是新的」：往下滚越过长图底部才多出新行，
+    /// 往上滚越过长图顶部才多出新行；中间那段来回滚都是已经拼过的，不能再接一遍。
+    offset: i32,
 }
 
 impl Stitcher {
@@ -166,6 +170,7 @@ impl Stitcher {
             max_rows,
             last_best: None,
             prev,
+            offset: 0,
         }
     }
 
@@ -319,19 +324,14 @@ impl Stitcher {
                 self.last_best = Some((shift.abs(), (ratio * 1000.0) as u32));
                 if shift == 0 {
                     Pushed::Unchanged
-                } else if shift > 0 {
-                    let moved = shift.min(frame.height);
-                    if moved < 2 {
-                        Pushed::Unchanged
-                    } else {
-                        self.append_rows_from(&frame, frame.height - moved)
-                    }
                 } else {
-                    let moved = (-shift).min(frame.height);
+                    let moved = shift.abs().min(frame.height);
                     if moved < 2 {
                         Pushed::Unchanged
+                    } else if shift > 0 {
+                        self.scroll_down(&frame, moved)
                     } else {
-                        self.prepend_rows_count(&frame, moved)
+                        self.scroll_up(&frame, moved)
                     }
                 }
             }
@@ -343,6 +343,32 @@ impl Stitcher {
             self.frame_h = frame_height;
         }
         outcome
+    }
+
+    /// 往下滚：显示区在长图里下移 moved 行。
+    /// 只有越过长图底部的那几行是新内容；如果这一下只是从上面滚回来、
+    /// 底部还没超出已经拼好的部分，那就一行都不用接（以前会整段再接一遍，于是重复）。
+    fn scroll_down(&mut self, frame: &Bitmap, moved: i32) -> Pushed {
+        self.offset += moved;
+        let need = self.offset + frame.height - self.image.height;
+        if need <= 0 {
+            return Pushed::Unchanged;
+        }
+        let need = need.min(frame.height);
+        self.append_rows_from(frame, frame.height - need)
+    }
+
+    /// 往上滚：显示区在长图里上移 moved 行。
+    /// 只有越过长图顶部的那几行是新内容；没越过去就说明这一段早就拼过了，
+    /// 直接丢掉（以前是整段往前面塞，所以「往下滚再往上滚」会出现两份内容）。
+    fn scroll_up(&mut self, frame: &Bitmap, moved: i32) -> Pushed {
+        self.offset -= moved;
+        if self.offset >= 0 {
+            return Pushed::Unchanged;
+        }
+        let need = (-self.offset).min(frame.height);
+        self.offset = 0;
+        self.prepend_rows_count(frame, need)
     }
 
     /// 把这一帧的 from_row 之后的行接在长图末尾
@@ -423,8 +449,16 @@ impl Stitcher {
             return false;
         }
         let _ = fresh;
-        let from = compare_h;
-        matches!(self.append_rows_from(frame, from), Pushed::Appended)
+        // 内容没动，那么「超出长图底部的行」就是被胶囊挡住、这次才露出来的那条
+        let need = self.offset + frame.height - self.image.height;
+        if need <= 0 {
+            return false;
+        }
+        let need = need.min(frame.height);
+        matches!(
+            self.append_rows_from(frame, frame.height - need),
+            Pushed::Appended
+        )
     }
 }
 
@@ -1405,6 +1439,109 @@ mod tests {
                 _ => panic!("往上滚 step={step} 没接上"),
             }
         }
+    }
+
+    #[test]
+    fn scroll_session_with_backtracking_matches_document() {
+        // 一整段真实节奏：下去、回来一点、再下去、又回来……最后整幅必须和文档逐字节一致
+        let width = 500;
+        let window = 600;
+        let doc = text_like(width, 2400, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        let mut top = 0;
+        let mut bottom = window;
+        for step in [260, 90, -180, 300, -40, 120] {
+            top += step;
+            bottom = bottom.max(top + window);
+            let _ = stitcher.push(crop(top));
+            assert_eq!(stitcher.height(), bottom, "滚到 {top} 时长图高度不对");
+            let expect = &doc.pixels[..(bottom as usize * width as usize * 4)];
+            assert_eq!(stitcher.image().pixels, expect, "滚到 {top} 时内容重复/错行");
+        }
+        assert_eq!(stitcher.height(), 1150);
+    }
+
+    #[test]
+    fn scrolling_down_then_up_then_down_never_duplicates() {
+        // 用户报的那个：往下滚 → 往上滚 → 再往下滚，图里出现两份同样的内容
+        let width = 400;
+        let window = 600;
+        let doc = text_like(width, 2400, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        for top in [300, 600, 900] {
+            assert!(
+                matches!(stitcher.push(crop(top)), Pushed::Appended),
+                "往下滚到 {top} 应该接上"
+            );
+        }
+        assert_eq!(stitcher.height(), 1500);
+
+        // 往回滚：这段早拼过了，一行都不该再加
+        assert!(
+            matches!(stitcher.push(crop(600)), Pushed::Unchanged),
+            "往回滚不该接新内容"
+        );
+        assert_eq!(stitcher.height(), 1500, "往回滚把内容拼重了");
+
+        // 又滚回原处：还是不该变长
+        assert!(
+            matches!(stitcher.push(crop(900)), Pushed::Unchanged),
+            "滚回原处不该接新内容"
+        );
+        assert_eq!(stitcher.height(), 1500, "滚回原处把内容拼重了");
+
+        // 继续往下：只接新露出来的那 300 行
+        assert!(matches!(stitcher.push(crop(1200)), Pushed::Appended));
+        assert_eq!(stitcher.height(), 1800);
+
+        // 整幅内容必须和文档 0..1800 行逐字节一致（重复、错行都会在这里露出来）
+        let expect = &doc.pixels[..(stitcher.height() as usize * width as usize * 4)];
+        assert_eq!(stitcher.image().pixels, expect, "来回滚之后内容重复/错行");
+    }
+
+    #[test]
+    fn scrolling_up_past_top_only_adds_rows_above() {
+        // 首帧从文档第 400 行起，往上滚 113 行：只该补 287..400 这 113 行
+        let width = 600;
+        let window = 500;
+        let step = 113;
+        let doc = text_like(width, 1200, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(400));
+        assert!(matches!(stitcher.push(crop(400 - step)), Pushed::Appended));
+        assert_eq!(stitcher.height(), window + step);
+        // 拼出来的应该是文档 287..1200 行：补在头上的 113 行 + 原来的 500 行
+        let start = ((400 - step) as usize) * width as usize * 4;
+        let end = start + (window + step) as usize * width as usize * 4;
+        let expect = &doc.pixels[start..end];
+        assert_eq!(stitcher.image().pixels, expect, "往上越顶之后头部内容不对");
+
+        // 再往下一滚回 400：整段都在长图里了，不该再长
+        assert!(matches!(stitcher.push(crop(400)), Pushed::Unchanged));
+        assert_eq!(stitcher.height(), window + step, "滚回去又拼重了");
     }
 
     #[test]
