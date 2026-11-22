@@ -1542,6 +1542,7 @@ fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {    if poin
 unsafe fn fit_window_to_image(hwnd: HWND, editor: &mut Editor) {
     let toolbar = s(44.0);
     let hint = s(24.0);
+    let _ = (toolbar, hint);
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     let work = crate::work_area_at(cursor);
@@ -2094,6 +2095,7 @@ fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
     }
 }
 
+#[allow(dead_code)]
 fn hint_for(tool: Tool) -> &'static str {
     match tool {
         Tool::None => "选一个工具再画 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 关闭",
@@ -2254,7 +2256,8 @@ unsafe fn editor_paint(hwnd: HWND) {
 /// 把编辑窗画进任意 DC（窗口用背缓冲，预览用离屏 DIB）
 /// 图片显示区高度（窗口底部留给工具栏和提示条）
 fn editor_view_height(client: RECT) -> i32 {
-    (client.bottom - s(24.0) - s(44.0)).max(0)
+    // 窗口现在就等于图片，底栏改成浮在图片上，不再占高度
+    client.bottom.max(0)
 }
 
 /// 缩放之后把图片夹回显示区：比显示区小就居中，比它大就不许整块划出去
@@ -2322,7 +2325,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         left: 0,
         top: 0,
         right: client.right,
-        bottom: (client.bottom - hint_h - toolbar).max(0),
+        bottom: client.bottom,
     };
     if std::env::var_os("NST_EDITOR_DEBUG").is_some() {
         crate::debug_log(&format!(
@@ -2455,7 +2458,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    let bar_top = (view.bottom + ((toolbar - bar_h) / 2).max(0) + s(1.0)).max(0);
+    // 底栏浮在图片上（图片底部中间），半透明 + 投影
+    let bar_top = (client.bottom - bar_h - s(10.0)).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -2699,30 +2703,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         }
     }
 
-    // 提示（带当前缩放比例）
-    let hint_text = format!(
-        "{} · {}%",
-        hint_for(editor.tool),
-        (editor.zoom * 100.0).round() as i32
-    );
-    let hint = hint_text.as_str();
-    let hint_font = cached_font(8.0, 400);
-    let old_hint = SelectObject(dc, hint_font as HGDIOBJ);
-    SetTextColor(dc, crate::theme::ui().text3);
-    let mut hint_rect = RECT {
-        left: s(12.0),
-        top: client.bottom - s(22.0),
-        right: client.right - s(12.0),
-        bottom: client.bottom - s(4.0),
-    };
-    DrawTextW(
-        dc,
-        wide(hint).as_ptr(),
-        -1,
-        &mut hint_rect,
-        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-    );
-    SelectObject(dc, old_hint);
 
     let _ = toolbar;
     let _ = all;
@@ -4172,10 +4152,10 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
 
     let image_w = (editor.base.width as f32 * scale) as i32;
     let image_h = (editor.base.height as f32 * scale) as i32;
-    let toolbar = s(44.0);
-    let hint = s(24.0);
-    let client_w = image_w.max(s(600.0));
-    let client_h = image_h + toolbar + hint;
+    let _toolbar = s(44.0);
+    let _hint = s(24.0);
+    let client_w = image_w.max(s(240.0));
+    let client_h = image_h.max(s(120.0));
 
     // 换屏只更新「适配缩放」，用户当前的放大倍数要保留
     editor.base_scale = scale;
@@ -4750,9 +4730,9 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let image_w = (bitmap.width as f32 * scale) as i32;
     let image_h = (bitmap.height as f32 * scale) as i32;
 
-    let client_w = image_w.max(s(600.0));
-    // 图片在上面，底部一条工具栏 + 提示，始终在图片外面（微信那种单条底栏）
-    let client_h = image_h + toolbar + hint;
+    // 窗口就是图片本身：四周不再有空白，也没有专门留给工具栏的高度
+    let client_w = image_w.max(s(240.0));
+    let client_h = image_h.max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
     let mut image_top = 0;
