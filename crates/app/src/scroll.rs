@@ -332,6 +332,39 @@ impl Stitcher {
         }
     }
 
+    /// 收尾用：内容没滚动、但这一帧比之前高（胶囊收掉了），
+    /// 把多出来的底部几行直接补上；找不到重叠就什么都不做。
+    pub fn extend_with_tail(&mut self, frame: &Bitmap) -> bool {
+        if frame.width != self.width || frame.height <= self.frame_h {
+            return false;
+        }
+        let fresh: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(frame, y)).collect();
+        let total = self.sigs.len() as i32;
+        let compare_h = self.frame_h;
+        let max_overlap = compare_h.min(total);
+        let min_overlap = (compare_h / 4).max(32);
+        if max_overlap <= min_overlap {
+            return false;
+        }
+        let mut best: Option<(f32, i32)> = None;
+        for k in (min_overlap..=max_overlap).rev() {
+            let corr = correlation(&self.sigs[(total - k) as usize..], &fresh, k);
+            if best.map_or(corr > 0.5, |(c, _)| corr > c + 0.05) {
+                best = Some((corr, k));
+            }
+        }
+        let Some((corr, k)) = best else { return false };
+        if corr < 0.5 {
+            return false;
+        }
+        let mismatch = self.mismatch_at(frame, total - k, 0, k);
+        if mismatch > 0.08 {
+            return false;
+        }
+        let added = self.append_rows(frame, &fresh, k);
+        matches!(added, Pushed::Appended)
+    }
+
     /// 下滚：把新帧 k 之后的行接到长图末尾
     fn append_rows(&mut self, frame: &Bitmap, fresh: &[[u8; SIG]], k: i32) -> Pushed {
         let new_rows = frame.height - k;
@@ -693,7 +726,11 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 let (x, y, w, h) = REGION;
                 if let Some(frame) = capture_rect(x, y, w, h) {
-                    stitcher.push(&frame);
+                    // 胶囊收掉之后这一帧比之前高：把多出来的底部补上，
+                    // 不然最后那一条（被胶囊挡住的高度）永远拼不进去
+                    if !stitcher.extend_with_tail(&frame) {
+                        stitcher.push(&frame);
+                    }
                 }
             }
             finish(stitcher.image().clone(), confirm, original);
@@ -1200,6 +1237,25 @@ mod tests {
             }
         }
         bitmap
+    }
+
+
+    #[test]
+    fn tail_extension_adds_bottom_strip_when_frame_grows() {
+        // 先按「短帧」拼一段（模拟胶囊压着、只抓上半截）
+        let doc = text_like(600, 800, 0);
+        let mut short = doc.clone();
+        short.height = 500;
+        short.pixels.truncate((600 * 500 * 4) as usize);
+        let mut stitcher = Stitcher::new(short);
+        assert_eq!(stitcher.height(), 500);
+
+        // 收尾：胶囊收掉，同一块内容整帧抓下来（内容没滚，但多了下面 300 行）
+        let mut full = doc.clone();
+        full.height = 800;
+        full.pixels.truncate((600 * 800 * 4) as usize);
+        assert!(stitcher.extend_with_tail(&full), "应该能把底部补上");
+        assert_eq!(stitcher.height(), 800);
     }
 
     #[test]
