@@ -1205,6 +1205,8 @@ enum Tool {
     Mosaic,
     /// 拖框选一块区域做 OCR
     Ocr,
+    /// 拖框选一块区域：OCR 后发给 ChatGPT / DeepSeek 翻译
+    Translate,
 }
 
 #[derive(Clone)]
@@ -1384,6 +1386,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Text) => "文字",
         Action::Tool(Tool::Mosaic) => "马赛克",
         Action::Tool(Tool::Ocr) => "OCR",
+        Action::Tool(Tool::Translate) => "翻译",
         Action::Undo => "撤销",
         Action::Redo => "重做",
         Action::Copy => "复制",
@@ -1923,6 +1926,7 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::Marker => "按住拖，高亮一块（半透明）",
         Tool::Numbered => "点一下放一个序号（自动递增）",
         Tool::Eraser => "点一下删掉那条标注",
+        Tool::Translate => "拖出要翻译的区域 · 只把文字发给 API",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
         _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
     }
@@ -2162,7 +2166,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
                 draw_mosaic(dc, &editor.base, from_px, to_px, editor.scale, mosaic_block(editor.scale, editor.stroke));
                 draw_drag_frame(dc, from, to, editor.scale);
             }
-            Tool::Text | Tool::Ocr => draw_drag_frame(dc, from, to, editor.scale),
+            Tool::Text | Tool::Ocr | Tool::Translate => draw_drag_frame(dc, from, to, editor.scale),
             _ => {}
         }
     }
@@ -2218,6 +2222,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Eraser), false),
         (Action::Tool(Tool::Text), false),
         (Action::Tool(Tool::Ocr), false),
+        (Action::Tool(Tool::Translate), false),
         (Action::Scroll, false),
         (Action::Stroke, true),
         (Action::Undo, false),
@@ -2895,6 +2900,12 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                         icon_dot(dc, l, t, l + cell - s(1.0), t + cell - s(1.0), color);
                     }
                 }
+            }
+            // A 加一条下划线（翻译）
+            Action::Tool(Tool::Translate) => {
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                draw_glyph_sized(dc, "A", rect, color, 8.0);
+                icon_line(dc, cx - s(6.0), cy + s(7.0), cx + s(6.0), cy + s(7.0), pen, color);
             }
             // T（外面一个方框，和微信一致）
             Action::Tool(Tool::Text) => {
@@ -4095,6 +4106,12 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                         // 框的左下角起笔，输入框宽度跟框一样宽
                         let width = right - left;
                         start_text(hwnd, (left, top), width);
+                    }
+                    Tool::Translate if wide_enough => {
+                        let region = editor.base.crop(left, top, right - left, bottom - top);
+                        editor.tool = Tool::None;
+                        crate::translate::translate_region_async(PANEL, region);
+                        SetWindowTextW(hwnd, wide("截图编辑 · 正在翻译…").as_ptr());
                     }
                     Tool::Ocr if wide_enough => {
                         // 只对框里这块做 OCR

@@ -64,6 +64,15 @@ fn normalize_newlines(text: &str) -> String {
     out
 }
 
+/// 同步识别：翻译那条链路要的是纯文本，不要 Outcome。
+pub fn recognize_pub(bitmap: &Bitmap) -> Result<String, String> {
+    let outcome = recognize(bitmap);
+    match outcome.error {
+        Some(error) => Err(error),
+        None => Ok(outcome.text),
+    }
+}
+
 fn recognize(bitmap: &Bitmap) -> OcrOutcome {
     let Some(dir) = models_dir() else {
         return OcrOutcome {

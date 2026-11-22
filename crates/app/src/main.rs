@@ -13,6 +13,8 @@ mod autostart;
 mod menu;
 mod ocr;
 mod ocr_ui;
+mod translate;
+mod translate_settings;
 mod panel;
 mod settings_ui;
 mod scroll;
@@ -54,6 +56,7 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
+const WM_APP_TRANSLATE_READY: u32 = WM_APP + 11;
 pub(crate) const WM_APP_GIF_DONE: u32 = WM_APP + 9;
 pub(crate) const WM_APP_SCROLL_DONE: u32 = WM_APP + 10;
 const WM_APP_ANIM: u32 = WM_APP + 6;
@@ -131,6 +134,7 @@ const ID_PANEL_HIDE: usize = 1200;
 const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
 const ID_OCR: usize = 1303;
+const ID_TRANSLATE_SETTINGS: usize = 1305;
 const ID_GIF: usize = 1304;
 const ID_QUIT: usize = 1099;
 
@@ -1167,6 +1171,24 @@ unsafe extern "system" fn wnd_proc(
             show_menu(hwnd);
             0
         }
+        WM_APP_TRANSLATE_READY => {
+            let pointer = wparam as *mut translate::TranslateOutcome;
+            if !pointer.is_null() {
+                let outcome = Box::from_raw(pointer);
+                let mut text = String::new();
+                if !outcome.source.is_empty() {
+                    text.push_str(&outcome.source);
+                }
+                if !outcome.translated.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\r\n\r\n\r\n");
+                    }
+                    text.push_str(&outcome.translated);
+                }
+                ocr_ui::open(hwnd, &text, outcome.error.as_deref());
+            }
+            0
+        }
         WM_APP_ANIM => {
             let mut keep = false;
             if let Some(panel) = panel_mut(hwnd) {
@@ -1358,6 +1380,9 @@ fn show_menu(hwnd: HWND) {
             panel.settings.ocr_hotkey.clone(),
         ));
     }
+    if panel.settings.shot_enabled {
+        rows.push(menu::Entry::item(ID_TRANSLATE_SETTINGS, "翻译设置…"));
+    }
     if panel.settings.gif_enabled {
         rows.push(menu::Entry::hotkey(
             ID_GIF,
@@ -1401,6 +1426,9 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);
+            }
+            ID_TRANSLATE_SETTINGS => {
+                translate_settings::open(hwnd);
             }
             ID_GIF => {
                 if gifrec::is_recording() {
