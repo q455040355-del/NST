@@ -29,6 +29,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# 没有终端时不要让 git 干等凭据输入（这台机器全局没配 credential.helper）
+$env:GIT_TERMINAL_PROMPT = "0"
 
 # ---------------------------------------------------------------- 小工具
 
@@ -251,9 +253,9 @@ Remove-Item $notesPath -ErrorAction SilentlyContinue
 # ---------------------------------------------------------------- 推
 
 Step "推 main"
-Run git @("push", "origin", "main")
+Run git @("-c", "credential.helper=wincred", "push", "origin", "main")
 Step "推 tag $tag（会触发 Release 流水线）"
-Run git @("push", "origin", $tag)
+Run git @("-c", "credential.helper=wincred", "push", "origin", $tag)
 
 $sha = Capture git @("rev-parse", "HEAD")
 $runUrl = "https://github.com/q455040355-del/NST/actions"
