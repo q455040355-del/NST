@@ -1197,6 +1197,8 @@ enum Tool {
     Pen,
     /// 高亮笔：半透明黄，压在字上面还能看清
     Marker,
+    /// 聚光灯：拖出一块，其余压暗
+    Spotlight,
     /// 序号：点一下放一个自动递增的圆标
     Numbered,
     /// 橡皮：点哪条删哪条
@@ -1239,6 +1241,10 @@ enum Shape {
     Marker {
         points: Vec<(i32, i32)>,
         stroke: u8,
+    },
+    Spotlight {
+        a: (i32, i32),
+        b: (i32, i32),
     },
     Numbered {
         at: (i32, i32),
@@ -1283,6 +1289,8 @@ enum Action {
     Tool(Tool),
     /// 顺时针转 90°
     Rotate,
+    /// 美化开关（导出/复制时加留白和背景）
+    Beautify,
     Undo,
     Redo,
     Copy,
@@ -1318,6 +1326,8 @@ struct Editor {
     undone: Vec<Shape>,
     /// 下一个序号
     next_number: i32,
+    /// 美化：导出时加留白、背景和圆角
+    beautify: bool,
     tool: Tool,
     scale: f32,
     image_left: i32,
@@ -1382,6 +1392,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Ellipse) => "椭圆",
         Action::Tool(Tool::Line) => "直线",
         Action::Tool(Tool::Marker) => "高亮",
+        Action::Tool(Tool::Spotlight) => "聚光灯",
         Action::Tool(Tool::Numbered) => "序号",
         Action::Tool(Tool::Eraser) => "橡皮",
         Action::Tool(Tool::Pen) => "画笔",
@@ -1392,6 +1403,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Undo => "撤销",
         Action::Redo => "重做",
         Action::Rotate => "旋转",
+        Action::Beautify => "美化",
         Action::Copy => "复制",
         Action::Save => "保存",
         Action::Stroke => "浓淡",
@@ -1547,6 +1559,7 @@ unsafe fn rotate_editor(hwnd: HWND, editor: &mut Editor) {
             | Shape::Square { a, b, .. }
             | Shape::Ellipse { a, b, .. }
             | Shape::Line { a, b, .. }
+            | Shape::Spotlight { a, b }
             | Shape::Mosaic { a, b, .. } => {
                 *a = map(*a);
                 *b = map(*b);
@@ -1604,6 +1617,7 @@ fn shape_bounds(shape: &Shape) -> (i32, i32, i32, i32) {
                 (left, top, right, bottom)
             }
         }
+        Shape::Spotlight { a, b } => (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
         Shape::Numbered { at, .. } => (at.0 - 12, at.1 - 12, at.0 + 12, at.1 + 12),
         Shape::Text { at, .. } => (at.0, at.1, at.0 + 80, at.1 + 24),
         Shape::Pen { points, .. } => {
@@ -1768,6 +1782,57 @@ unsafe fn draw_marker(dc: HDC, editor: &Editor, points: &[(i32, i32)], stroke: u
     DeleteDC(layer_dc);
     DeleteObject(mask_bmp as *mut _);
     DeleteDC(mask_dc);
+}
+
+/// 聚光灯：框外压暗（黑色 45%），框里保持原样
+unsafe fn draw_spotlight(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32, editor: &Editor) {
+    let (ax, ay) = scaled(a, scale);
+    let (bx, by) = scaled(b, scale);
+    let (left, right) = (ax.min(bx), ax.max(bx));
+    let (top, bottom) = (ay.min(by), ay.max(by));
+    let width = (editor.base.width as f32 * scale) as i32;
+    let height = (editor.base.height as f32 * scale) as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    // 1x1 的黑：AlphaBlend 用 SourceConstantAlpha，会自动拉伸
+    let (black_dc, black_bmp, bits) = make_dib(1, 1);
+    if black_dc.is_null() || bits.is_null() {
+        if !black_bmp.is_null() {
+            DeleteObject(black_bmp as *mut _);
+        }
+        if !black_dc.is_null() {
+            DeleteDC(black_dc);
+        }
+        return;
+    }
+    *bits = 0;
+    *bits.add(1) = 0;
+    *bits.add(2) = 0;
+    *bits.add(3) = 255;
+
+    let blend = windows_sys::Win32::Graphics::Gdi::BLENDFUNCTION {
+        BlendOp: windows_sys::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 115,
+        AlphaFormat: 0,
+    };
+    let dim = |x: i32, y: i32, w: i32, h: i32| {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        windows_sys::Win32::Graphics::Gdi::AlphaBlend(
+            dc, x, y, w, h, black_dc, 0, 0, 1, 1, blend,
+        );
+    };
+    dim(0, 0, width, top.clamp(0, height));
+    dim(0, bottom.clamp(0, height), width, (height - bottom).max(0));
+    dim(0, top.clamp(0, height), left.clamp(0, width), (bottom - top).clamp(0, height));
+    dim(right.clamp(0, width), top.clamp(0, height), (width - right).max(0), (bottom - top).clamp(0, height));
+
+    DeleteObject(black_bmp as *mut _);
+    DeleteDC(black_dc);
 }
 
 /// 序号：红底白字的圆标，圆心就是点下去的位置
@@ -1986,6 +2051,7 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
         Tool::Line => "拖一条直线 · Esc 取消",
         Tool::Marker => "按住拖，高亮一块（半透明）",
+        Tool::Spotlight => "拖出一块，其余地方压暗",
         Tool::Numbered => "点一下放一个序号（自动递增）",
         Tool::Eraser => "点一下删掉那条标注",
         Tool::Translate => "拖出要翻译的区域 · 只把文字发给 API",
@@ -2016,6 +2082,7 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
             Shape::Marker { points, stroke } => unsafe {
                 draw_marker(dc, editor, points, *stroke)
             },
+            Shape::Spotlight { a, b } => unsafe { draw_spotlight(dc, *a, *b, scale, editor) },
             Shape::Numbered { at, n } => draw_numbered(dc, *at, *n, scale),
             Shape::Pen { points, stroke } => {
                 draw_pen(dc, points, stroke_width(scale, *stroke), scale)
@@ -2222,6 +2289,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             Tool::Ellipse => draw_ellipse(dc, from, to, width, editor.scale),
             Tool::Line => draw_line(dc, from, to, width, editor.scale),
             Tool::Numbered => draw_numbered(dc, to, editor.next_number, editor.scale),
+            Tool::Spotlight => draw_spotlight(dc, from, to, editor.scale, editor),
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
                 let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
@@ -2279,6 +2347,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Arrow), false),
         (Action::Tool(Tool::Pen), false),
         (Action::Tool(Tool::Marker), false),
+        (Action::Tool(Tool::Spotlight), false),
         (Action::Tool(Tool::Numbered), false),
         (Action::Tool(Tool::Mosaic), false),
         (Action::Tool(Tool::Eraser), false),
@@ -2287,6 +2356,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Translate), false),
         (Action::Scroll, false),
         (Action::Rotate, false),
+        (Action::Beautify, false),
         (Action::Stroke, true),
         (Action::Undo, false),
         (Action::Redo, false),
@@ -2566,6 +2636,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         shapes: Vec::new(),
         undone: Vec::new(),
         next_number: 1,
+        beautify: false,
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
         scale: preview_zoom,
@@ -3036,6 +3107,19 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                 icon_polyline(dc, &body, pen, color, true);
                 icon_line(dc, cx - hx, cy + hx, cx + hx, cy - hx, pen, color);
             }
+            // 方框外压暗、中间亮（聚光灯）
+            Action::Tool(Tool::Spotlight) => {
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                let inner = s(5.0);
+                icon_dot(dc, cx - inner, cy - inner, cx + inner, cy + inner, color);
+                icon_outline(dc, 1, cx - inner, cy - inner, cx + inner, cy + inner, pen, color);
+            }
+            // ▣ 双层框（美化：图外面再套一层）
+            Action::Beautify => {
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color);
+                let inset = s(3.0);
+                icon_outline(dc, 0, rx + inset, ry + inset, bx - inset, by - inset, pen, color);
+            }
             // ↻ 顺时针整圈 + 箭头
             Action::Rotate => {
                 let arc_pen = CreatePen(0, pen, color);
@@ -3282,6 +3366,67 @@ unsafe fn composite(editor: &Editor) -> Bitmap {
 
     DeleteObject(dib as *mut _);
     DeleteDC(dc);
+
+    if editor.beautify {
+        beautify_bitmap(&out)
+    } else {
+        out
+    }
+}
+
+/// 美化：四周留白 + 淡渐变底 + 圆角。只在导出/复制/贴图这条路上做，
+/// 编辑窗里不动像素（想改随时关掉再导出）。
+fn beautify_bitmap(source: &Bitmap) -> Bitmap {
+    let pad = 28.max((source.width.min(source.height) as f32 * 0.06) as i32);
+    let width = source.width + pad * 2;
+    let height = source.height + pad * 2;
+    let radius = 14.max((source.width.min(source.height) as f32 * 0.02) as i32);
+    let mut out = Bitmap {
+        width,
+        height,
+        pixels: vec![0u8; (width * height * 4) as usize],
+    };
+
+    // 底色：上浅下深，很淡
+    for y in 0..height {
+        let t = y as f32 / height.max(1) as f32;
+        let r = (246.0 - 10.0 * t) as u8;
+        let g = (247.0 - 9.0 * t) as u8;
+        let b = (250.0 - 8.0 * t) as u8;
+        for x in 0..width {
+            let offset = ((y * width + x) * 4) as usize;
+            out.pixels[offset] = b;
+            out.pixels[offset + 1] = g;
+            out.pixels[offset + 2] = r;
+            out.pixels[offset + 3] = 255;
+        }
+    }
+
+    // 贴图，四个角按半径切掉（圆角矩形判定）
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let dx = if x < radius {
+                radius - x
+            } else if x >= source.width - radius {
+                x - (source.width - radius - 1)
+            } else {
+                0
+            };
+            let dy = if y < radius {
+                radius - y
+            } else if y >= source.height - radius {
+                y - (source.height - radius - 1)
+            } else {
+                0
+            };
+            if dx > 0 && dy > 0 && dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let src = ((y * source.width + x) * 4) as usize;
+            let dst = (((y + pad) * width + (x + pad)) * 4) as usize;
+            out.pixels[dst..dst + 4].copy_from_slice(&source.pixels[src..src + 4]);
+        }
+    }
     out
 }
 
@@ -3299,6 +3444,7 @@ impl Editor {
             shapes: self.shapes.clone(),
             undone: Vec::new(),
             next_number: self.next_number,
+            beautify: self.beautify,
             screen: self.screen,
             base_scale: self.base_scale,
             zoom: self.zoom,
@@ -3707,6 +3853,19 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         Action::Rotate => {
             let editor = &mut *editor;
             rotate_editor(hwnd, editor);
+        }
+        Action::Beautify => {
+            let editor = &mut *editor;
+            editor.beautify = !editor.beautify;
+            show_toast(
+                hwnd,
+                if editor.beautify {
+                    "美化：已开（复制/保存时加留白）"
+                } else {
+                    "美化：已关"
+                },
+            );
+            InvalidateRect(hwnd, std::ptr::null(), 0);
         }
         Action::Stroke => {
             let editor = &mut *editor;
@@ -4158,6 +4317,9 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 let wide_enough = right - left >= 8 && bottom - top >= 8;
 
                 match editor.tool {
+                    Tool::Spotlight if wide_enough => {
+                        editor.push_shape(Shape::Spotlight { a: from, b: to })
+                    }
                     Tool::Line if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
                         editor.push_shape(Shape::Line {
                             a: from,
@@ -4444,6 +4606,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         shapes: Vec::new(),
         undone: Vec::new(),
         next_number: 1,
+        beautify: false,
         tool: Tool::None,
         scale,
         image_left,
@@ -4526,5 +4689,48 @@ mod square_tool_tests {
     #[test]
     fn squared_of_equal_side_is_unchanged() {
         assert_eq!(squared((0, 0), (50, 50)), (50, 50));
+    }
+}
+
+#[cfg(test)]
+mod beautify_tests {
+    use super::*;
+
+    fn solid(width: i32, height: i32) -> Bitmap {
+        let mut bitmap = Bitmap {
+            width,
+            height,
+            pixels: vec![0u8; (width * height * 4) as usize],
+        };
+        for pixel in bitmap.pixels.chunks_exact_mut(4) {
+            pixel[0] = 30; // B
+            pixel[1] = 60; // G
+            pixel[2] = 200; // R
+            pixel[3] = 255;
+        }
+        bitmap
+    }
+
+    #[test]
+    fn beautify_adds_padding_and_keeps_the_picture() {
+        let source = solid(200, 100);
+        let out = beautify_bitmap(&source);
+        assert!(out.width > source.width && out.height > source.height, "应该四周留白");
+        // 左右/上下留白一样宽
+        assert_eq!(out.width - source.width, out.height - source.height);
+        // 正中那一点还是原图颜色
+        let center = ((out.height / 2) * out.width + out.width / 2) as usize * 4;
+        assert_eq!(&out.pixels[center..center + 3], &[30, 60, 200]);
+        // 四个角是背景（不是原图颜色）
+        for (x, y) in [(0, 0), (out.width - 1, 0), (0, out.height - 1), (out.width - 1, out.height - 1)] {
+            let offset = ((y * out.width + x) * 4) as usize;
+            assert_ne!(&out.pixels[offset..offset + 3], &[30, 60, 200], "角落应被切掉");
+        }
+    }
+
+    #[test]
+    fn beautify_keeps_alpha_opaque() {
+        let out = beautify_bitmap(&solid(64, 64));
+        assert!(out.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 }
