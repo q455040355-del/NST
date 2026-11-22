@@ -4064,3 +4064,25 @@ mod tests {
         assert_eq!(rect.bottom - rect.top, 150);
     }
 }
+
+#[cfg(test)]
+mod square_tool_tests {
+    use super::*;
+
+    #[test]
+    fn squared_uses_long_side() {
+        assert_eq!(squared((10, 10), (110, 60)), (110, 110));
+        assert_eq!(squared((10, 10), (60, 110)), (110, 110));
+    }
+
+    #[test]
+    fn squared_follows_direction() {
+        assert_eq!(squared((110, 110), (10, 60)), (10, 10));
+        assert_eq!(squared((110, 110), (60, 10)), (10, 10));
+    }
+
+    #[test]
+    fn squared_of_equal_side_is_unchanged() {
+        assert_eq!(squared((0, 0), (50, 50)), (50, 50));
+    }
+}
