@@ -4460,6 +4460,10 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 let right = from.0.max(to.0);
                 let bottom = from.1.max(to.1);
                 let wide_enough = right - left >= 8 && bottom - top >= 8;
+                crate::debug_log(&format!(
+                    "editor 收笔: from=({}, {}) to=({}, {}) 框={}x{}",
+                    from.0, from.1, to.0, to.1, right - left, bottom - top
+                ));
 
                 match editor.tool {
                     Tool::Spotlight if wide_enough => {
@@ -4780,7 +4784,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         0,
         class.as_ptr(),
         wide("截图编辑").as_ptr(),
-        WS_POPUP | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_POPUP | WS_VISIBLE,
         window_x,
         window_y,
         client_w,
