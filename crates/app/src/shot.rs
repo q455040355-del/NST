@@ -3975,6 +3975,12 @@ mod tests {
             last_label: None,
             cursor: POINT { x: 0, y: 0 },
             square,
+            toggle: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
         }
     }
 
