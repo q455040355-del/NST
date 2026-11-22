@@ -169,6 +169,27 @@ fn main() {
             return;
         }
 
+        // 调试用：把现成 mp4 的首帧解成 PNG，用来查录制画面对不对（歪没歪、颜色正不正）
+        if let Some(spec) = std::env::var_os("NST_REC_PROBE") {
+            let ok = gifrec::probe_to_png(&spec.to_string_lossy());
+            crate::debug_log(&format!("rec probe -> {ok}"));
+            return;
+        }
+
+        // 调试用：直接按 NV12 解首帧（不经过视频处理器），用来判断码流本身歪没歪
+        if let Some(spec) = std::env::var_os("NST_REC_PROBE_NV12") {
+            let ok = gifrec::probe_nv12_to_png(&spec.to_string_lossy());
+            crate::debug_log(&format!("nv12 probe -> {ok}"));
+            return;
+        }
+
+        // 调试用：抓一帧原始画面（不走编码器），判断「歪」是采集还是编码的锅
+        if let Some(spec) = std::env::var_os("NST_REC_RAW") {
+            let ok = gifrec::raw_frame_to_png(&spec.to_string_lossy());
+            crate::debug_log(&format!("raw frame -> {ok}"));
+            return;
+        }
+
         // 调试用：把截图编辑窗（含一条底栏）离屏画成 PNG，不弹窗、不进托盘。
         // 改工具栏 / 图标时用：NST_EDITOR_PREVIEW=D:\tmp\editor.png netspeed.exe
         if let Some(path) = std::env::var_os("NST_EDITOR_PREVIEW") {

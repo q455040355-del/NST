@@ -1072,8 +1072,11 @@ unsafe fn run(
     let area_scale =
         (MAX_OUT_PIXELS as f32 / (width.max(1) as f32 * height.max(1) as f32)).sqrt();
     let out_scale = side_scale.min(area_scale).min(1.0);
-    let out_w = ((width as f32 * out_scale).round() as i32).max(2);
-    let out_h = ((height as f32 * out_scale).round() as i32).max(2);
+    // H.264 / NV12 要求宽高是偶数：这里就把输出尺寸压成偶数，
+    // 抓帧缓冲也按这个尺寸抓——否则缓冲区行宽和编码器认定的行宽差 1 像素，
+    // 画面会斜着错位（斜纹/歪掉）
+    let out_w = (((width as f32 * out_scale).round() as i32).max(16)) & !15;
+    let out_h = (((height as f32 * out_scale).round() as i32).max(16)) & !15;
 
     let Some(mut grabber) = ScreenGrabber::new(x, y, width, height, out_w, out_h) else {
         finish(border, button);
@@ -1250,7 +1253,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32,
     MFVideoInterlace_Progressive, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_MT_DEFAULT_STRIDE, MF_MT_SUBTYPE, MF_SINK_WRITER_DISABLE_THROTTLING,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_VERSION, MFSTARTUP_NOSOCKET,
 };
@@ -1414,21 +1418,30 @@ impl Mp4Writer {
                 }
             };
 
-            // 输入：NV12（编码器最认的格式，省掉一层自动插的转换器）
+            // 输入：RGB32（就是 BGRA 的内存布局）。NV12 的行宽对齐各家编码器要求不一，
+            // 自己转很容易一行一行斜掉；交给 SinkWriter 插的视频处理器去转，它知道编码器要什么。
             let in_type: IMFMediaType = MFCreateMediaType().ok()?;
             in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
-            in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok()?;
+            in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).ok()?;
             in_type
                 .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .ok()?;
             in_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size).ok()?;
             in_type.SetUINT64(&MF_MT_FRAME_RATE, frame_rate).ok()?;
             in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par).ok()?;
+            // 正值 = 行序自下而上（我们送进去的就是这个方向）；
+            // 行宽按 64 字节对齐，视频处理器按这个 stride 取行
+            let stride = (width as usize) * 4;
+            let _ = in_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, stride as u32);
             if let Err(error) = writer.SetInputMediaType(stream, &in_type, None) {
                 crate::debug_log(&format!("mp4: SetInputMediaType 失败 {error}"));
                 let _ = MFShutdown();
                 return None;
             }
+            let agreed = in_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(0);
+            crate::debug_log(&format!(
+                "mp4: 输入 RGB32 stride {agreed}（{width}x{height}）"
+            ));
             if let Err(error) = writer.BeginWriting() {
                 crate::debug_log(&format!("mp4: BeginWriting 失败 {error}"));
                 let _ = MFShutdown();
@@ -1454,10 +1467,19 @@ impl Mp4Writer {
 
     fn write(&mut self, bgra: &[u8], ts_ms: i32) -> bool {
         let (w, h) = (self.width as usize, self.height as usize);
-        if w < 2 || h < 2 || bgra.len() < w * h * 4 {
+        if w < 2 || h < 2 {
             return false;
         }
-        let size = (w * h * 3 / 2) as u32;
+        // 行宽必须严格对上：差一个像素，整幅画面就会斜着错位
+        if bgra.len() != w * h * 4 {
+            crate::debug_log(&format!(
+                "mp4: 帧尺寸不对 {} != {w}x{h}x4（录出来会歪，直接丢掉）",
+                bgra.len()
+            ));
+            return false;
+        }
+        let stride = w * 4;
+        let size = (stride * h) as u32;
         // 时间戳必须严格递增（同一毫秒抓到两帧时往后挤 1ms，肉眼看不出来）
         let mut ts = ts_ms as i64 * 10_000;
         if ts <= self.last_ts {
@@ -1473,7 +1495,13 @@ impl Mp4Writer {
                 return false;
             }
             let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, size as usize);
-            bgra_to_nv12(bgra, w, h, dst);
+            // 自顶向下直接拷：编码器按自顶向下解释样本，倒过来就上下颠倒
+            let row = w * 4;
+            for y in 0..h {
+                let src = &bgra[y * row..][..row];
+                let dst_row = y * stride;
+                dst[dst_row..dst_row + row].copy_from_slice(src);
+            }
             let _ = buffer.Unlock();
             if buffer.SetCurrentLength(size).is_err() {
                 return false;
@@ -1517,46 +1545,6 @@ impl Mp4Writer {
     }
 }
 
-/// BGRA（自顶向下）→ NV12（自下而上，MF 默认的 stride 方向）
-fn bgra_to_nv12(src: &[u8], w: usize, h: usize, dst: &mut [u8]) {
-    // BT.709 有限范围：Y 16..235，UV 16..240
-    let y_size = w * h;
-    for y in 0..h {
-        let src_row = &src[y * w * 4..][..w * 4];
-        let dst_row = &mut dst[(h - 1 - y) * w..][..w];
-        for x in 0..w {
-            let b = src_row[x * 4] as i32;
-            let g = src_row[x * 4 + 1] as i32;
-            let r = src_row[x * 4 + 2] as i32;
-            let luma = (47 * r + 157 * g + 16 * b + 128) >> 8;
-            dst_row[x] = (luma + 16).clamp(0, 255) as u8;
-        }
-    }
-    let uv = &mut dst[y_size..];
-    let uv_row_bytes = w;
-    for y in (0..h).step_by(2) {
-        let row0 = &src[y * w * 4..][..w * 4];
-        let row1 = &src[(y + 1) * w * 4..][..w * 4];
-        let out_row = (h / 2 - 1 - y / 2) * uv_row_bytes;
-        let dst_row = &mut uv[out_row..][..uv_row_bytes];
-        for x in (0..w).step_by(2) {
-            let mut sb = 0;
-            let mut sg = 0;
-            let mut sr = 0;
-            for (row, xx) in [(row0, x), (row0, x + 1), (row1, x), (row1, x + 1)] {
-                sb += row[xx * 4] as i32;
-                sg += row[xx * 4 + 1] as i32;
-                sr += row[xx * 4 + 2] as i32;
-            }
-            let (r, g, b) = (sr / 4, sg / 4, sb / 4);
-            let u = ((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128;
-            let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
-            dst_row[x] = u.clamp(0, 255) as u8;
-            dst_row[x + 1] = v.clamp(0, 255) as u8;
-        }
-    }
-}
-
 /// 首帧 BGRA → CF_DIB（32 位、行序自下而上）
 fn dib_from_bgra(first: &[u8], width: i32, height: i32) -> Option<(Vec<u8>, usize)> {
     let w = width.max(1) as usize;
@@ -1586,7 +1574,7 @@ fn dib_from_bgra(first: &[u8], width: i32, height: i32) -> Option<(Vec<u8>, usiz
 }
 
 /// 自测用：把写好的 mp4 解一帧回来（RGB32、行序自下而上），验证文件真有画面
-pub fn probe_first_frame(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> {
+pub fn probe_first_frame(path: &std::path::Path) -> Option<(i32, i32, usize, Vec<u8>)> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
@@ -1624,6 +1612,13 @@ pub fn probe_first_frame(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> 
         let current = reader.GetCurrentMediaType(stream).ok()?;
         let size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
         let (w, h) = ((size >> 32) as i32, (size & 0xFFFF_FFFF) as i32);
+        // 解码器给的每行字节数可能比 w*4 大（对齐），必须按它来拼
+        let stride = current
+            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+            .ok()
+            .map(|value| value as usize)
+            .filter(|value| *value >= (w as usize) * 4)
+            .unwrap_or((w as usize) * 4);
 
         let mut sample: Option<IMFSample> = None;
         let mut flags = 0u32;
@@ -1652,7 +1647,209 @@ pub fn probe_first_frame(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> 
         let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec();
         let _ = buffer.Unlock();
         let _ = MFShutdown();
-        Some((w, h, bytes))
+        Some((w, h, stride, bytes))
+    }
+}
+
+/// 直接按 NV12 解一帧（不让 SourceReader 插转换器），用来判断「歪」是码流本身还是转换环节
+pub fn probe_first_frame_nv12(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
+            return None;
+        }
+        let wide_path: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let reader = MFCreateSourceReaderFromURL(PCWSTR(wide_path.as_ptr()), None).ok()?;
+        let out_type: IMFMediaType = MFCreateMediaType().ok()?;
+        out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+        out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok()?;
+        let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        reader.SetCurrentMediaType(stream, None, &out_type).ok()?;
+        let current = reader.GetCurrentMediaType(stream).ok()?;
+        let size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+        let (w, h) = ((size >> 32) as i32, (size & 0xFFFF_FFFF) as i32);
+        let stride = current
+            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+            .ok()
+            .map(|value| value as usize)
+            .filter(|value| *value >= w as usize)
+            .unwrap_or(w as usize);
+
+        let mut sample: Option<IMFSample> = None;
+        let mut flags = 0u32;
+        reader
+            .ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))
+            .ok()?;
+        let sample = sample?;
+        let buffer = sample.ConvertToContiguousBuffer().ok()?;
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        buffer.Lock(&mut ptr, None, Some(&mut len)).ok()?;
+        let raw = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+        let (uw, uh) = ((w / 2) as usize, (h / 2) as usize);
+        let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        let uv_base = stride * h as usize;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let yv = raw.get(y * stride + x).copied().unwrap_or(16) as f32;
+                let ux = (x / 2).min(uw.saturating_sub(1));
+                let uy = (y / 2).min(uh.saturating_sub(1));
+                let uv_index = uv_base + uy * stride + ux * 2;
+                let uu = raw.get(uv_index).copied().unwrap_or(128) as f32;
+                let vv = raw.get(uv_index + 1).copied().unwrap_or(128) as f32;
+                let luma = (yv - 16.0) * 255.0 / 219.0;
+                let cb = (uu - 128.0) * 255.0 / 224.0;
+                let cr = (vv - 128.0) * 255.0 / 224.0;
+                let r = (luma + 1.5748 * cr).clamp(0.0, 255.0) as u8;
+                let g = (luma - 0.1873 * cb - 0.4681 * cr).clamp(0.0, 255.0) as u8;
+                let b = (luma + 1.8556 * cb).clamp(0.0, 255.0) as u8;
+                rgba.push(r);
+                rgba.push(g);
+                rgba.push(b);
+                rgba.push(255);
+            }
+        }
+        let _ = buffer.Unlock();
+        let _ = MFShutdown();
+        Some((w, h, rgba))
+    }
+}
+
+/// 调试用：把 NV12 直解的首帧存 PNG（上/下方向按自顶向下直接拼）
+pub fn probe_nv12_to_png(spec: &str) -> bool {
+    let path = std::path::PathBuf::from(spec.trim());
+    let Some((pw, ph, rgba)) = probe_first_frame_nv12(&path) else {
+        crate::debug_log("nv12 probe: 解不出首帧");
+        return false;
+    };
+    let dir = std::env::temp_dir().join("NST");
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join(
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "probe.mp4".to_string())
+            .replace(".mp4", ".nv12.png"),
+    );
+    match image::RgbaImage::from_raw(pw as u32, ph as u32, rgba) {
+        Some(image) => {
+            let ok = image.save(&out).is_ok();
+            crate::debug_log(&format!("nv12 probe: {pw}x{ph} -> {} ({ok})", out.display()));
+            ok
+        }
+        None => false,
+    }
+}
+
+/// 调试用：把现成 mp4 的首帧解出来存成 PNG，肉眼查「录歪了没有 / 颜色正不正」
+///   NST_REC_PROBE="D:\path\rec.mp4" netspeed.exe
+pub fn probe_to_png(spec: &str) -> bool {
+    let path = std::path::PathBuf::from(spec.trim());
+    let Some((pw, ph, stride, pixels)) = probe_first_frame(&path) else {
+        crate::debug_log("probe: 解不出首帧");
+        return false;
+    };
+    let mut rgba = Vec::with_capacity((pw * ph * 4) as usize);
+    for row in 0..ph {
+        // MF 给的 RGB32 是自下而上的
+        let src_row = (ph - 1 - row) as usize * stride;
+        for col in 0..pw {
+            let i = src_row + (col * 4) as usize;
+            if i + 3 < pixels.len() {
+                rgba.push(pixels[i + 2]);
+                rgba.push(pixels[i + 1]);
+                rgba.push(pixels[i]);
+            } else {
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
+            }
+            rgba.push(255);
+        }
+    }
+    let out = path.with_extension("probe.png");
+    let expect = (pw as usize) * (ph as usize) * 4;
+    crate::debug_log(&format!(
+        "probe: {pw}x{ph} rgba={} expect={expect} src={}",
+        rgba.len(),
+        pixels.len()
+    ));
+    match image::RgbaImage::from_raw(pw as u32, ph as u32, rgba) {
+        Some(image) => {
+            // 原目录可能没写权限（比如桌面被策略挡住），退到临时目录再存一次
+            let mut target = out.clone();
+            if image.save(&target).is_err() {
+                let dir = std::env::temp_dir().join("NST");
+                let _ = std::fs::create_dir_all(&dir);
+                target = dir.join(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "probe.mp4".to_string())
+                        .replace(".mp4", ".probe.png"),
+                );
+                if image.save(&target).is_err() {
+                    crate::debug_log("probe: 保存失败（原目录和临时目录都不行）");
+                    return false;
+                }
+            }
+            crate::debug_log(&format!("probe: 存到 {}", target.display()));
+            true
+        }
+        None => {
+            crate::debug_log("probe: from_raw 失败");
+            false
+        }
+    }
+}
+
+/// 调试用：抓一帧原始画面存 PNG（不经过编码器），用来判断「歪」是采集还是编码造成的
+///   NST_REC_RAW="x,y,w,h,out.png" netspeed.exe
+pub unsafe fn raw_frame_to_png(spec: &str) -> bool {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let x: i32 = parts[0].trim().parse().unwrap_or(0);
+    let y: i32 = parts[1].trim().parse().unwrap_or(0);
+    let w: i32 = parts[2].trim().parse().unwrap_or(0);
+    let h: i32 = parts[3].trim().parse().unwrap_or(0);
+    let out = std::path::PathBuf::from(parts[4].trim());
+    if w < 16 || h < 16 {
+        return false;
+    }
+    let Some(mut grabber) = ScreenGrabber::new(x, y, w, h, w & !1, h & !1) else {
+        return false;
+    };
+    grabber.validate_dxgi(x, y);
+    let mut buffer = Vec::new();
+    if !grabber.grab_if_changed(x, y, &[], &mut buffer) {
+        crate::debug_log("raw: 抓帧失败");
+        return false;
+    }
+    let (pw, ph) = (w & !1, h & !1);
+    crate::debug_log(&format!("raw: 缓冲 {} 字节，期望 {}", buffer.len(), pw * ph * 4));
+    let mut rgba = Vec::with_capacity((pw * ph * 4) as usize);
+    for i in 0..(pw * ph) as usize {
+        let base = i * 4;
+        if base + 3 < buffer.len() {
+            rgba.push(buffer[base + 2]);
+            rgba.push(buffer[base + 1]);
+            rgba.push(buffer[base]);
+            rgba.push(255);
+        } else {
+            rgba.extend_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+    match image::RgbaImage::from_raw(pw as u32, ph as u32, rgba) {
+        Some(image) => {
+            let ok = image.save(&out).is_ok();
+            crate::debug_log(&format!("raw: -> {} ({ok})", out.display()));
+            ok
+        }
+        None => false,
     }
 }
 
@@ -1672,9 +1869,15 @@ pub unsafe fn selftest(spec: &str) -> bool {
     if w < 16 || h < 16 || path.as_os_str().is_empty() {
         return false;
     }
-    // 跟正式录制一样：H.264 要偶数宽高
-    let out_w = (w & !1).max(2);
-    let out_h = (h & !1).max(2);
+    // 跟正式录制一样：抓帧尺寸和编码尺寸必须一致，而且 H.264 要偶数宽高
+    let out_w = (w & !15).max(16);
+    let out_h = (h & !15).max(16);
+    // 走和正式录制同一条采集路径（ScreenGrabber，含缩放），这样奇偶尺寸/缩放的问题才测得到
+    let Some(mut grabber) = ScreenGrabber::new(x, y, w, h, out_w, out_h) else {
+        crate::debug_log("rec test: 采集器创建失败");
+        return false;
+    };
+    grabber.validate_dxgi(x, y);
 
     let Some(mut writer) = Mp4Writer::new(&path, out_w, out_h, 30, 65) else {
         crate::debug_log("rec test: 编码器创建失败");
@@ -1682,12 +1885,16 @@ pub unsafe fn selftest(spec: &str) -> bool {
     };
     let started = std::time::Instant::now();
     let mut frames = 0;
+    let mut buffer = Vec::new();
+    let mut prev: Vec<u8> = Vec::new();
     while started.elapsed().as_secs() < seconds {
-        if let Some(frame) = crate::shot::capture_rect(x, y, w, h) {
+        if grabber.grab_if_changed(x, y, &prev, &mut buffer) {
             let ts = started.elapsed().as_millis() as i32;
-            if writer.write(&frame.pixels, ts) {
+            if writer.write(&buffer, ts) {
                 frames += 1;
             }
+            prev.clear();
+            prev.extend_from_slice(&buffer);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -1701,7 +1908,7 @@ pub unsafe fn selftest(spec: &str) -> bool {
     }
 
     // 解一帧回来，确认不是黑屏、也不是上下颠倒
-    let Some((pw, ph, pixels)) = probe_first_frame(&path) else {
+    let Some((pw, ph, stride, pixels)) = probe_first_frame(&path) else {
         crate::debug_log("rec test: 解不出首帧");
         return false;
     };
@@ -1719,7 +1926,7 @@ pub unsafe fn selftest(spec: &str) -> bool {
     let png_path = path.with_extension("probe.png");
     let mut rgba = Vec::with_capacity((pw * ph * 4) as usize);
     for row in 0..ph {
-        let src_row = ((ph - 1 - row) * pw * 4) as usize; // RGB32 是自下而上的
+        let src_row = (ph - 1 - row) as usize * stride; // RGB32 是自下而上的
         for col in 0..pw {
             let i = src_row + (col * 4) as usize;
             if i + 3 < pixels.len() {
