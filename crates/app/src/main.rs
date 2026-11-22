@@ -155,6 +155,13 @@ fn main() {
             windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
         }
 
+        // 调试用：在给定区域上跑一遍「抓帧 + 拼接」，把长图存 PNG（滚动由外部脚本驱动）
+        if let Some(spec) = std::env::var_os("NST_SCROLL_TEST") {
+            let ok = scroll::selftest(&spec.to_string_lossy());
+            crate::debug_log(&format!("scroll test -> {ok}"));
+            return;
+        }
+
         // 调试用：把截图编辑窗（含一条底栏）离屏画成 PNG，不弹窗、不进托盘。
         // 改工具栏 / 图标时用：NST_EDITOR_PREVIEW=D:\tmp\editor.png netspeed.exe
         if let Some(path) = std::env::var_os("NST_EDITOR_PREVIEW") {

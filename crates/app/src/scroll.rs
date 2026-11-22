@@ -166,14 +166,16 @@ impl Stitcher {
         self.image.height >= self.max_rows
     }
 
-    /// 重叠区逐像素平均差（隔行隔列采样）
-    fn pixel_diff(&self, frame: &Bitmap, k: i32) -> f32 {
+    /// 重叠区里「明显不一样」的像素占比（隔行隔列采样）：
+    /// 对齐时只有抗锯齿边缘会超阈值，差几行就会一大片，比平均差好区分
+    fn pixel_mismatch(&self, frame: &Bitmap, k: i32) -> f32 {
+        const HARD: i32 = 40;
         let width = self.width;
         if k <= 0 || k > self.image.height {
-            return 255.0;
+            return 1.0;
         }
         let top = self.image.height - k;
-        let mut sum = 0u64;
+        let mut bad = 0u64;
         let mut count = 0u64;
         let mut y = 0;
         while y < k {
@@ -184,46 +186,56 @@ impl Stitcher {
                 let a = a_row + x as usize * 4;
                 let b = b_row + x as usize * 4;
                 if a + 2 < self.image.pixels.len() && b + 2 < frame.pixels.len() {
+                    let mut worst = 0i32;
                     for c in 0..3 {
                         let d = self.image.pixels[a + c] as i32 - frame.pixels[b + c] as i32;
-                        sum += d.unsigned_abs() as u64;
-                        count += 1;
+                        worst = worst.max(d.abs());
                     }
+                    if worst > HARD {
+                        bad += 1;
+                    }
+                    count += 1;
                 }
                 x += 2;
             }
             y += 2;
         }
         if count == 0 {
-            255.0
+            1.0
         } else {
-            sum as f32 / count as f32
+            bad as f32 / count as f32
         }
     }
 
     pub fn push(&mut self, frame: &Bitmap) -> Pushed {
-        if frame.width != self.width || frame.height != self.frame_h {
+        if frame.width != self.width {
+            return Pushed::Lost;
+        }
+        // 允许帧高不一样：胶囊压在选区里时每次只抓上半截，
+        // 收尾那次是全高；重叠只按两边都有的高度算，新行照样全接。
+        let compare_h = frame.height.min(self.frame_h);
+        if compare_h < 24 {
             return Pushed::Lost;
         }
         let fresh: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(frame, y)).collect();
         let total = self.sigs.len() as i32;
 
         // 完全没动：和上一帧逐行比，几乎一样就算没滚
-        if total >= self.frame_h {
-            let tail = &self.sigs[(total - self.frame_h) as usize..];
+        if total >= compare_h {
+            let tail = &self.sigs[(total - compare_h) as usize..];
             let mut sum = 0u64;
             for (a, b) in tail.iter().zip(fresh.iter()) {
                 sum += sig_diff(a, b) as u64;
             }
-            let cells = self.frame_h as u64 * SIG as u64;
+            let cells = compare_h as u64 * SIG as u64;
             if sum * 100 < cells * 6 {
                 return Pushed::Unchanged;
             }
         }
 
         // 第一步：相关系数粗筛，留几个候选（重复内容会有好几个峰）
-        let max_overlap = (self.frame_h - 8).min(total);
-        let min_overlap = (self.frame_h / 4).max(32).min(max_overlap);
+        let max_overlap = (compare_h - 8).min(total);
+        let min_overlap = (compare_h / 4).max(32).min(max_overlap);
         let mut candidates: Vec<(f32, i32)> = Vec::new();
         for k in min_overlap..=max_overlap {
             let tail = &self.sigs[(total - k) as usize..];
@@ -235,28 +247,35 @@ impl Stitcher {
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(8);
 
-        // 第二步：候选里比真实像素，挑差异最小的
-        let mut best: Option<(f32, i32)> = None;
-        for (_, k) in &candidates {
-            let diff = self.pixel_diff(frame, *k);
-            if best.map_or(true, |(best_diff, _)| diff < best_diff) {
-                best = Some((diff, *k));
-            }
-        }
-        self.last_best = best.map(|(diff, k)| (k, (diff * 100.0) as u32));
-
-        let Some((diff, k)) = best else {
+        // 第二步：候选里比真实像素（文字重排会有抗锯齿差异，绝对值不会很小，
+        // 所以看「最好的那个是不是明显比第二好的更好」）
+        let mut scored: Vec<(f32, i32)> = candidates
+            .iter()
+            .map(|(_, k)| (self.pixel_mismatch(frame, *k), *k))
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((best_ratio, best_k)) = scored.first().copied() else {
+            self.last_best = None;
             return Pushed::Lost;
         };
-        if k >= self.frame_h {
+        let second = scored
+            .iter()
+            .filter(|(_, k)| (k - best_k).abs() > 12)
+            .map(|(ratio, _)| *ratio)
+            .next()
+            .unwrap_or(1.0);
+        self.last_best = Some((best_k, (best_ratio * 1000.0) as u32));
+
+        if best_k >= frame.height {
             return Pushed::Unchanged;
         }
-        // 平均差超过 8 灰阶就认为对不上
-        if diff > 8.0 {
+        // 明显不一样的像素超过 8%，或者和第二名拉不开 1.4 倍，都算没对准
+        if best_ratio > 0.08 || second < best_ratio * 1.4 {
             return Pushed::Lost;
         }
+        let k = best_k;
 
-        let new_rows = self.frame_h - k;
+        let new_rows = frame.height - k;
         let room = self.max_rows - self.image.height;
         let take = new_rows.min(room.max(0));
         if take <= 0 {
@@ -280,6 +299,8 @@ impl Stitcher {
             self.image.height += 1;
         }
 
+        // 下一帧按这次的高度来比（收尾那次是全高，别的都是半高）
+        self.frame_h = frame.height;
         Pushed::Appended
     }
 }
@@ -431,9 +452,19 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
     CHIP.store(chip as isize, Ordering::SeqCst);
     RegisterHotKey(chip, HOTKEY_STOP, MOD_NOREPEAT, 0x1B); // Esc = 放弃
 
+    // 放弃时回原图
     let original = first.clone();
+    // 首帧要跟后面抓帧一样高（胶囊在里面时只有上半截），否则高度对不上永远接不了
+    let cap_h = (h - if inner { CHIP_H + s(10.0) } else { 0 }).max(32);
     std::thread::spawn(move || {
-        let mut stitcher = Stitcher::new(first);
+        let seed = capture_rect(x, y, w, cap_h).unwrap_or_else(|| {
+            // 抓不到就用传进来的图裁一段
+            let mut copy = first.clone();
+            copy.height = cap_h.min(first.height);
+            copy.pixels.truncate((copy.width * copy.height * 4).max(0) as usize);
+            copy
+        });
+        let mut stitcher = Stitcher::new(seed);
         while !STOP.load(Ordering::SeqCst) {
             burst_push(&mut stitcher, 3);
             if stitcher.full() {
@@ -722,6 +753,60 @@ unsafe fn paint_chip(hwnd: HWND) {
     DeleteObject(check_font as *mut _);
 
     EndPaint(hwnd, &mut ps);
+}
+
+/// 自测：在给定屏幕区域上跑 N 秒「抓帧 + 拼接」，把结果存 PNG（滚动由外面驱动）。
+/// 用来在没人盯着屏幕时验证拼接算法对真实内容是否成立：
+///   NST_SCROLL_TEST="x,y,w,h,秒数,out.png" netspeed.exe
+pub unsafe fn selftest(spec: &str) -> bool {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 6 {
+        return false;
+    }
+    let x: i32 = parts[0].trim().parse().unwrap_or(0);
+    let y: i32 = parts[1].trim().parse().unwrap_or(0);
+    let w: i32 = parts[2].trim().parse().unwrap_or(0);
+    let h: i32 = parts[3].trim().parse().unwrap_or(0);
+    let seconds: u64 = parts[4].trim().parse().unwrap_or(6);
+    let path = parts[5].trim();
+    if w < 32 || h < 32 || path.is_empty() {
+        return false;
+    }
+    let Some(seed) = capture_rect(x, y, w, h) else {
+        return false;
+    };
+    let mut stitcher = Stitcher::new(seed);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if let Some(frame) = capture_rect(x, y, w, h) {
+            let outcome = match stitcher.push(&frame) {
+                Pushed::Appended => "接上".to_string(),
+                Pushed::Unchanged => "没滚动".to_string(),
+                Pushed::Lost => format!("对不上 best={:?}", stitcher.last_best),
+            };
+            crate::debug_log(&format!(
+                "scroll test: {outcome} -> {} 行",
+                stitcher.height()
+            ));
+        }
+    }
+    let image = stitcher.image();
+    crate::debug_log(&format!(
+        "scroll test: 结束 {}x{}",
+        image.width, image.height
+    ));
+    let mut rgba = Vec::with_capacity((image.width * image.height * 4) as usize);
+    for pixel in image.pixels.chunks_exact(4) {
+        rgba.push(pixel[2]);
+        rgba.push(pixel[1]);
+        rgba.push(pixel[0]);
+        rgba.push(255);
+    }
+    match image::RgbaImage::from_raw(image.width as u32, image.height as u32, rgba) {
+        Some(buffer) => buffer.save(path).is_ok(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
