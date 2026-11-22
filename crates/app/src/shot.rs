@@ -1329,6 +1329,8 @@ struct Editor {
     next_number: i32,
     /// 美化：导出时加留白、背景和圆角
     beautify: bool,
+    /// 诊断用：只探测一次窗口顶部压着什么
+    probed: bool,
     /// 底栏的矩形（客户区坐标）：按钮命中判定只在这块里做，
     /// 免得别处的残影/旧矩形把画布上的点击吞掉
     bar: RECT,
@@ -2206,6 +2208,35 @@ unsafe fn editor_paint(hwnd: HWND) {
     };
     let _ = dib;
 
+    if !editor.probed {
+        editor.probed = true;
+        unsafe {
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut rect);
+            for offset in [8, 30, 60, 90] {
+                let point = POINT {
+                    x: rect.left + 200,
+                    y: rect.top + offset,
+                };
+                let under = WindowFromPoint(point);
+                let mut name = [0u16; 128];
+                let len = GetClassNameW(under, name.as_mut_ptr(), name.len() as i32);
+                let class = String::from_utf16_lossy(&name[..len.max(0) as usize]);
+                crate::debug_log(&format!(
+                    "editor 顶部探测: y+{offset} -> hwnd={under:?} class={class} 本窗={}",
+                    under == hwnd
+                ));
+            }
+            // 也看看窗口自己有没有非客户区（有标题栏时 client 会比 window 矮一截）
+            crate::debug_log(&format!(
+                "editor 尺寸: window={}x{} client={}x{}",
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                client.right,
+                client.bottom
+            ));
+        }
+    }
     editor_draw(dc, editor, client);
 
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -2758,6 +2789,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        probed: false,
         bar: RECT {
             left: 0,
             top: 0,
@@ -3572,6 +3604,7 @@ impl Editor {
             undone: Vec::new(),
             next_number: self.next_number,
             beautify: self.beautify,
+            probed: true,
             bar: self.bar,
             screen: self.screen,
             base_scale: self.base_scale,
@@ -4756,6 +4789,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        probed: false,
         bar: RECT {
             left: 0,
             top: 0,
