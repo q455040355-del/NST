@@ -1329,6 +1329,8 @@ struct Editor {
     next_number: i32,
     /// 美化：导出时加留白、背景和圆角
     beautify: bool,
+    /// 图片上方的透明带高度（工具栏浮在这条带子里）
+    top_margin: i32,
     /// 诊断用：只探测一次窗口顶部压着什么
     probed: bool,
     /// 底栏的矩形（客户区坐标）：按钮命中判定只在这块里做，
@@ -1551,12 +1553,13 @@ unsafe fn fit_window_to_image(hwnd: HWND, editor: &mut Editor) {
 
     let image_w = (editor.base.width as f32 * editor.scale).round() as i32;
     let image_h = (editor.base.height as f32 * editor.scale).round() as i32;
-    let mut width = image_w.max(s(600.0)).min(max_w);
-    let mut height = image_h + toolbar + hint;
+    let margin = editor.top_margin;
+    let mut width = image_w.max(s(240.0)).min(max_w);
+    let mut height = image_h + margin;
     if height > max_h {
         height = max_h;
     }
-    width = width.max(s(320.0));
+    width = width.max(s(240.0));
 
     let mut rect: RECT = std::mem::zeroed();
     GetWindowRect(hwnd, &mut rect);
@@ -2241,6 +2244,37 @@ unsafe fn editor_paint(hwnd: HWND) {
     }
     editor_draw(dc, editor, client);
 
+    // 只保留「图片」和「工具栏」两块区域，其余裁掉 —— 于是图片上方那条带子
+    // 既不显示底色、也不吃点击，看起来就是一条浮在桌面上的工具栏
+    {
+        let image_top = editor.image_top;
+        let image_bottom =
+            image_top + (editor.base.height as f32 * editor.scale).round() as i32;
+        let image = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
+            0,
+            image_top.max(0),
+            client.right,
+            image_bottom.min(client.bottom),
+        );
+        let bar = editor.bar;
+        let bar_rgn = windows_sys::Win32::Graphics::Gdi::CreateRoundRectRgn(
+            bar.left - s(6.0),
+            bar.top - s(5.0),
+            bar.right + s(6.0),
+            bar.bottom + s(5.0),
+            s(14.0),
+            s(14.0),
+        );
+        windows_sys::Win32::Graphics::Gdi::CombineRgn(
+            image,
+            image,
+            bar_rgn,
+            windows_sys::Win32::Graphics::Gdi::RGN_OR,
+        );
+        windows_sys::Win32::Graphics::Gdi::SetWindowRgn(hwnd, image, 1);
+        windows_sys::Win32::Graphics::Gdi::DeleteObject(bar_rgn as *mut _);
+    }
+
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -2273,10 +2307,11 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
     // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
-    if height >= view_h {
-        editor.image_top = editor.image_top.clamp(view_h - height, 0);
+    let margin = editor.top_margin;
+    if height >= view_h - margin {
+        editor.image_top = editor.image_top.clamp((view_h - height).min(margin), margin);
     } else {
-        editor.image_top = 0;
+        editor.image_top = margin;
     }
 }
 
@@ -2458,8 +2493,9 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    // 底栏浮在图片上（图片底部中间），半透明 + 投影
-    let bar_top = (client.bottom - bar_h - s(10.0)).max(0);
+    // 工具栏放在图片上方那条透明带里，水平居中；不压图
+    let strip_height = editor.image_top.max(0);
+    let bar_top = ((strip_height - bar_h) / 2).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -2498,12 +2534,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     ];
 
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
-    editor.bar = RECT {
-        left: 0,
-        top: bar_top,
-        right: client.right,
-        bottom: (bar_bottom + s(4.0)).min(client.bottom),
-    };
     let measure = |item: i32, gap: i32, sep_w: i32| -> i32 {
         layout_items.len() as i32 * item
             + (layout_items.len() as i32 - 1) * gap
@@ -2531,6 +2561,13 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
     let bar_w = measure(item, gap, sep_w);
     let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
+    // 记下底栏的真实范围：命中判定和窗口区域都用它
+    editor.bar = RECT {
+        left: bar_left,
+        top: bar_top,
+        right: bar_left + bar_w,
+        bottom: bar_top + bar_h,
+    };
 
     // 底栏投影：比背板大一圈的浅灰圆角，制造「浮起来」的感觉
     {
@@ -2769,6 +2806,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        top_margin: 0,
         probed: false,
         bar: RECT {
             left: 0,
@@ -3584,6 +3622,7 @@ impl Editor {
             undone: Vec::new(),
             next_number: self.next_number,
             beautify: self.beautify,
+            top_margin: self.top_margin,
             probed: true,
             bar: self.bar,
             screen: self.screen,
@@ -4730,12 +4769,13 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let image_w = (bitmap.width as f32 * scale) as i32;
     let image_h = (bitmap.height as f32 * scale) as i32;
 
-    // 窗口就是图片本身：四周不再有空白，也没有专门留给工具栏的高度
+    // 图片上方留一条带子放工具栏；这条带子会被窗口区域裁掉，看起来是透明的
+    let strip = s(54.0);
     let client_w = image_w.max(s(240.0));
-    let client_h = image_h.max(s(120.0));
+    let client_h = (strip + image_h).max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = 0;
+    let mut image_top = strip;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1;
     if !fits_in_place(scale) {
@@ -4769,6 +4809,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        top_margin: strip,
         probed: false,
         bar: RECT {
             left: 0,
