@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use std::ffi::c_void;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
     DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, InvalidateRect, ReleaseDC, SelectObject,
     SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
     CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HALFTONE,
@@ -56,7 +56,8 @@ static BORDER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 右侧缩略图窗口
 static PREVIEW: AtomicIsize = AtomicIsize::new(0);
 /// 缩略图像素（宽, 高, BGRA），由抓帧线程写、预览窗口读
-static THUMB: std::sync::Mutex<Option<(i32, i32, Vec<u8>)>> = std::sync::Mutex::new(None);
+static THUMB: std::sync::Mutex<Option<(i32, i32, std::sync::Arc<Vec<u8>>)>> =
+    std::sync::Mutex::new(None);
 /// 胶囊是不是压在选区里
 static INNER: AtomicBool = AtomicBool::new(false);
 static mut PANEL: HWND = std::ptr::null_mut();
@@ -473,7 +474,7 @@ unsafe fn refresh_thumb(stitcher: &Stitcher, width: i32) {
         }
     }
     if let Ok(mut guard) = THUMB.lock() {
-        *guard = Some((thumb_w, thumb_h, pixels));
+        *guard = Some((thumb_w, thumb_h, std::sync::Arc::new(pixels)));
     }
     let preview = PREVIEW.load(Ordering::SeqCst) as HWND;
     if !preview.is_null() {
@@ -880,22 +881,66 @@ unsafe extern "system" fn preview_proc(
     }
 }
 
-/// 把缩略图画进右侧那个小窗口：先在底上画一块深色，再把缩略图按比例铺满
+thread_local! {
+    /// 预览窗口的后备缓冲（尺寸变了才重建），避免每帧先填底色再贴图闪烁
+    static PREVIEW_BACK: std::cell::RefCell<Option<(i32, i32, HDC, HBITMAP)>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 把缩略图画进右侧那个小窗口：先画到后备缓冲，再整块贴上去
 unsafe fn paint_preview(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let dc = BeginPaint(hwnd, &mut ps);
+    let window_dc = BeginPaint(hwnd, &mut ps);
     let mut client: RECT = std::mem::zeroed();
     windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+    if client.right <= 0 || client.bottom <= 0 {
+        EndPaint(hwnd, &mut ps);
+        return;
+    }
+
+    // 双缓冲：先画到后备 DC，最后一次性贴到窗口（否则每帧先填底色再贴图会闪）
+    let back = PREVIEW_BACK.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_ref() {
+            Some((w, h, dc, _dib)) if *w == client.right && *h == client.bottom => Some(*dc),
+            _ => {
+                if let Some((_, _, old_dc, old_dib)) = guard.take() {
+                    DeleteObject(old_dib as *mut _);
+                    DeleteDC(old_dc);
+                }
+                let (mem, dib, _bits) = make_dib(client.right, client.bottom);
+                if mem.is_null() || dib.is_null() {
+                    if !dib.is_null() {
+                        DeleteObject(dib as *mut _);
+                    }
+                    if !mem.is_null() {
+                        DeleteDC(mem);
+                    }
+                    None
+                } else {
+                    *guard = Some((client.right, client.bottom, mem, dib));
+                    Some(mem)
+                }
+            }
+        }
+    });
+    let Some(dc) = back else {
+        EndPaint(hwnd, &mut ps);
+        return;
+    };
 
     let ui = crate::theme::ui();
     let brush = CreateSolidBrush(0x0020_2020);
     FillRect(dc, &client, brush);
     DeleteObject(brush as *mut _);
 
-    let snapshot = THUMB.lock().ok().and_then(|guard| guard.clone());
+    // 缩略图：锁住期间直接拷进临时 DIB，别把整张缩略图 clone 一份
+    let snapshot = THUMB
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(w, h, p)| (*w, *h, p.clone())));
     if let Some((thumb_w, thumb_h, pixels)) = snapshot {
         if thumb_w > 0 && thumb_h > 0 {
-            // 按「塞得进窗口」的比例缩放，居中
             let max_w = (client.right - 8).max(1);
             let max_h = (client.bottom - 8).max(1);
             let scale = (max_w as f32 / thumb_w as f32).min(max_h as f32 / thumb_h as f32);
@@ -911,27 +956,19 @@ unsafe fn paint_preview(hwnd: HWND) {
                     bits,
                     (thumb_w * thumb_h * 4) as usize,
                 );
-                SetStretchBltMode(dc, HALFTONE);
-                StretchBlt(
-                    dc,
-                    left,
-                    top,
-                    draw_w,
-                    draw_h,
-                    mem,
-                    0,
-                    0,
-                    thumb_w,
-                    thumb_h,
-                    SRCCOPY,
-                );
+                if draw_w == thumb_w && draw_h == thumb_h {
+                    BitBlt(dc, left, top, draw_w, draw_h, mem, 0, 0, SRCCOPY);
+                } else {
+                    SetStretchBltMode(dc, HALFTONE);
+                    StretchBlt(dc, left, top, draw_w, draw_h, mem, 0, 0, thumb_w, thumb_h, SRCCOPY);
+                }
                 DeleteObject(dib as *mut _);
                 DeleteDC(mem);
             }
         }
     }
 
-    // 一圈细边框，跟别的小窗保持一致
+    // 一圈细边框
     let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, ui.border);
     let old_pen = SelectObject(dc, pen as HGDIOBJ);
     let old_brush = SelectObject(
@@ -951,6 +988,7 @@ unsafe fn paint_preview(hwnd: HWND) {
     SelectObject(dc, old_pen);
     DeleteObject(pen as *mut _);
 
+    BitBlt(window_dc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     EndPaint(hwnd, &mut ps);
 }
 
