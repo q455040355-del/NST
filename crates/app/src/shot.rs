@@ -320,7 +320,7 @@ fn use_scale_at(point: POINT) {
     );
 }
 
-fn s(value: f32) -> i32 {
+pub(crate) fn s(value: f32) -> i32 {
     (value * ui_scale()).round() as i32
 }
 

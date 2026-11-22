@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_MOUSEWHEEL};
 
-use crate::shot::{capture_rect, Bitmap};
+use crate::shot::{capture_rect, s, Bitmap};
 use crate::theme::wide;
 
 const DT_NOPREFIX: u32 = 0x0800;
@@ -47,6 +47,8 @@ static AUTO: AtomicBool = AtomicBool::new(true);
 static STOP: AtomicBool = AtomicBool::new(false);
 static CHIP: AtomicIsize = AtomicIsize::new(0);
 static BORDER_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 胶囊是不是放在选区「里面」（放里面时抓帧要避开它那一条）
+static INNER: AtomicBool = AtomicBool::new(false);
 
 /// 一行 16 段灰度签名
 fn row_sig(bitmap: &Bitmap, row: i32) -> [u8; SIG] {
@@ -275,9 +277,18 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
         DeleteGdi(outer as *mut _);
     }
 
-    // 提示胶囊：放在选区上方（上面没地方就放下面），不会被截进去
-    let chip_x = x;
-    let chip_y = if y - CHIP_H - 12 >= 0 {
+    // 提示胶囊：优先放在选区「里面」的下沿（微信那种），
+    // 抓帧时把这条高度让出去，所以不会被拼进长图；选区太矮就退到外面
+    let inner = h >= CHIP_H + s(120.0);
+    INNER.store(inner, Ordering::SeqCst);
+    let chip_x = if inner {
+        (x + (w - CHIP_W) / 2).max(x)
+    } else {
+        x
+    };
+    let chip_y = if inner {
+        y + h - CHIP_H - s(10.0)
+    } else if y - CHIP_H - 12 >= 0 {
         y - CHIP_H - 12
     } else {
         y + h + 12
@@ -332,7 +343,8 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
             }
             std::thread::sleep(std::time::Duration::from_millis(120));
             let (x, y, w, h) = REGION;
-            if let Some(frame) = capture_rect(x, y, w, h) {
+            let cap_h = capture_height();
+            if let Some(frame) = capture_rect(x, y, w, cap_h) {
                 match stitcher.push(&frame) {
                     Pushed::Appended => {
                         idle = 0;
@@ -375,8 +387,31 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
             scrolls += 1;
             idle = 0;
         }
+        // 收尾：胶囊压在选区里时，先把它收掉，补抓一帧完整区域，
+        // 这样最后那条（被胶囊挡住的高度）也不会缺
+        if INNER.load(Ordering::SeqCst) {
+            let chip = CHIP.load(Ordering::SeqCst) as HWND;
+            if !chip.is_null() {
+                PostMessageW(chip, 0x0010, 0, 0); // WM_CLOSE
+            }
+            std::thread::sleep(std::time::Duration::from_millis(220));
+            let (x, y, w, h) = REGION;
+            if let Some(frame) = capture_rect(x, y, w, h) {
+                stitcher.push(&frame);
+            }
+        }
         finish(stitcher);
     });
+}
+
+/// 抓帧高度：胶囊在里面时只抓到它上沿，那一条留给最后补抓
+unsafe fn capture_height() -> i32 {
+    let (_, _, _, h) = REGION;
+    if INNER.load(Ordering::SeqCst) {
+        (h - CHIP_H - s(10.0)).max(32)
+    } else {
+        h
+    }
 }
 
 /// 结束：收掉窗口，把长图丢回面板（主线程开编辑窗）
