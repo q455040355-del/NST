@@ -304,3 +304,20 @@ impl Drop for Dib {
         }
     }
 }
+
+/// 方角：编辑窗用。圆角会把图片四个角切掉，描边就只剩四条边中间那段。
+pub fn square_corners(hwnd: HWND) {
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_DONOTROUND: i32 = 1;
+    let value = DWMWCP_DONOTROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &value as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // Win10 走的是 SetWindowRgn 那条路，这里清掉可能残留的圆角区域
+        SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+    }
+}

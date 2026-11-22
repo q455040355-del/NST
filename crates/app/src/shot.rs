@@ -1173,7 +1173,8 @@ pub unsafe fn begin(panel: HWND) {
     }
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-    crate::ui::round_corners(hwnd);
+    // 编辑窗不加 DWM 圆角：圆角会把图片的四个角切掉，描边看起来就只剩四条边中间一段
+    crate::ui::square_corners(hwnd);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
@@ -1328,6 +1329,9 @@ struct Editor {
     next_number: i32,
     /// 美化：导出时加留白、背景和圆角
     beautify: bool,
+    /// 底栏的矩形（客户区坐标）：按钮命中判定只在这块里做，
+    /// 免得别处的残影/旧矩形把画布上的点击吞掉
+    bar: RECT,
     tool: Tool,
     scale: f32,
     image_left: i32,
@@ -2453,6 +2457,12 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     ];
 
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
+    editor.bar = RECT {
+        left: 0,
+        top: bar_top,
+        right: client.right,
+        bottom: (bar_bottom + s(4.0)).min(client.bottom),
+    };
     let measure = |item: i32, gap: i32, sep_w: i32| -> i32 {
         layout_items.len() as i32 * item
             + (layout_items.len() as i32 - 1) * gap
@@ -2742,6 +2752,12 @@ pub unsafe fn preview_png(path: &str) -> bool {
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        bar: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
         scale: preview_zoom,
@@ -3550,6 +3566,7 @@ impl Editor {
             undone: Vec::new(),
             next_number: self.next_number,
             beautify: self.beautify,
+            bar: self.bar,
             screen: self.screen,
             base_scale: self.base_scale,
             zoom: self.zoom,
@@ -4071,6 +4088,11 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
 }
 
 unsafe fn hit_button(editor: &Editor, point: POINT) -> Option<Action> {
+    // 不在底栏那一条里就不可能是点按钮：直接放行给画布
+    let bar = editor.bar;
+    if point.y < bar.top || point.y > bar.bottom {
+        return None;
+    }
     for (rect, action) in &editor.buttons {
         if point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom {
             return Some(*action);
@@ -4239,6 +4261,18 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let iy = (((point.y - editor.image_top) as f32 / editor.scale) as i32)
                 .clamp(0, editor.base.height);
 
+            crate::debug_log(&format!(
+                "editor 点击: point=({}, {}) 图位置=({}, {}) scale={:.3} -> 图坐标=({}, {}) 画布={}x{}",
+                point.x,
+                point.y,
+                editor.image_left,
+                editor.image_top,
+                editor.scale,
+                ix,
+                iy,
+                editor.base.width,
+                editor.base.height,
+            ));
             let _ = &mut point;
             match editor.tool {
                 Tool::None => {
@@ -4712,6 +4746,12 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        bar: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
         tool: Tool::None,
         scale,
         image_left,
@@ -4752,7 +4792,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     }
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-    crate::ui::round_corners(hwnd);
+    // 编辑窗不加 DWM 圆角：圆角会把图片的四个角切掉，描边看起来就只剩四条边中间一段
+    crate::ui::square_corners(hwnd);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
