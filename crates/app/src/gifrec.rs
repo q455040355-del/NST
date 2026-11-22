@@ -1387,7 +1387,10 @@ impl WebpStreamer {
             picture.use_argb = 1;
             picture.width = self.width;
             picture.height = self.height;
-            if libwebp_sys::WebPPictureImportBGRA(
+            // 用 BGRX：GDI 抓来的 DIB 里 alpha 字节是 0（GDI 不写 alpha），
+            // 用 ImportBGRA 会把整帧当成全透明导出去 —— 录出来的 webp 一打开啥都没有。
+            // BGRX 的第 4 个字节当填充丢弃，alpha 按不透明处理。
+            if libwebp_sys::WebPPictureImportBGRX(
                 &mut picture,
                 bgra.as_ptr(),
                 self.width * 4,
@@ -1445,6 +1448,46 @@ impl WebpStreamer {
     }
 }
 
+
+/// 自测：抓一块屏幕录 N 秒，直接走跟正式录制一样的 WebP 编码路径，把结果写文件。
+/// 用来在不开 UI 的情况下验证「录出来的 webp 是不是有画面、alpha 是不是不透明」：
+///   NST_REC_TEST="x,y,w,h,秒数,out.webp" netspeed.exe
+pub unsafe fn selftest(spec: &str) -> bool {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 6 {
+        return false;
+    }
+    let x: i32 = parts[0].trim().parse().unwrap_or(0);
+    let y: i32 = parts[1].trim().parse().unwrap_or(0);
+    let w: i32 = parts[2].trim().parse().unwrap_or(0);
+    let h: i32 = parts[3].trim().parse().unwrap_or(0);
+    let seconds: u64 = parts[4].trim().parse().unwrap_or(3);
+    let path = parts[5].trim();
+    if w < 16 || h < 16 || path.is_empty() {
+        return false;
+    }
+    let Some(mut streamer) = WebpStreamer::new(w, h, 65.0, 2) else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let mut frames = 0;
+    while started.elapsed().as_secs() < seconds {
+        if let Some(frame) = crate::shot::capture_rect(x, y, w, h) {
+            let ts = started.elapsed().as_millis() as i32;
+            if streamer.add(&frame.pixels, ts) {
+                frames += 1;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let bytes = streamer.finish();
+    crate::debug_log(&format!(
+        "rec test: {} 帧, {} 字节",
+        frames,
+        bytes.len()
+    ));
+    std::fs::write(path, &bytes).is_ok()
+}
 
 fn finish(border: HWND, button: HWND) {
     unsafe {
