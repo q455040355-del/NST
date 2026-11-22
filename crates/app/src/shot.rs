@@ -1281,6 +1281,10 @@ struct Editor {
     base: Bitmap,
     /// 这块图在屏幕上的位置（滚动截图要按这个位置继续抓屏）
     screen: (i32, i32, i32, i32),
+    /// 打开窗口时算出来的「适配缩放」，= 1 倍时的 scale
+    base_scale: f32,
+    /// 用户放大/缩小的倍数（1.0 = 适配）
+    zoom: f32,
     shapes: Vec<Shape>,
     tool: Tool,
     scale: f32,
@@ -1759,6 +1763,53 @@ unsafe fn editor_paint(hwnd: HWND) {
 }
 
 /// 把编辑窗画进任意 DC（窗口用背缓冲，预览用离屏 DIB）
+/// 图片显示区高度（窗口底部留给工具栏和提示条）
+fn editor_view_height(client: RECT) -> i32 {
+    (client.bottom - s(24.0) - s(44.0)).max(0)
+}
+
+/// 缩放之后把图片夹回显示区：比显示区小就居中，比它大就不许整块划出去
+fn clamp_image(editor: &mut Editor, client: RECT) {
+    let view_h = editor_view_height(client);
+    let width = (editor.base.width as f32 * editor.scale) as i32;
+    let height = (editor.base.height as f32 * editor.scale) as i32;
+    if width <= client.right {
+        editor.image_left = (client.right - width) / 2;
+    } else {
+        editor.image_left = editor.image_left.clamp(client.right - width, 0);
+    }
+    if height <= view_h {
+        editor.image_top = (view_h - height) / 2;
+    } else {
+        editor.image_top = editor.image_top.clamp(view_h - height, 0);
+    }
+}
+
+/// 按倍数缩放，锚点（客户区坐标）下的那个像素保持不动
+pub(crate) unsafe fn editor_zoom(hwnd: HWND, factor: f32, anchor: (i32, i32)) {
+    let state = editor_state(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let editor = &mut *state;
+    let old_scale = editor.scale.max(1e-4);
+    let zoom = (editor.zoom * factor).clamp(0.2, 6.0);
+    let new_scale = editor.base_scale * zoom;
+    if (new_scale - old_scale).abs() < 1e-5 {
+        return;
+    }
+    let ratio = new_scale / old_scale;
+    editor.image_left = anchor.0 - ((anchor.0 - editor.image_left) as f32 * ratio) as i32;
+    editor.image_top = anchor.1 - ((anchor.1 - editor.image_top) as f32 * ratio) as i32;
+    editor.zoom = zoom;
+    editor.scale = new_scale;
+
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    clamp_image(editor, client);
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
 unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let toolbar = s(44.0);
     let bg = CreateSolidBrush(crate::theme::ui().bg);
@@ -1770,6 +1821,17 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     };
     FillRect(dc, &all, bg);
     DeleteObject(bg as *mut _);
+
+    // 图片显示区 = 工具栏和提示条上面那块；放大时图片只在这里面显示（超出就裁掉）
+    let hint_h = s(24.0);
+    let view = RECT {
+        left: 0,
+        top: 0,
+        right: client.right,
+        bottom: (client.bottom - hint_h - toolbar).max(0),
+    };
+    let saved = SaveDC(dc);
+    IntersectClipRect(dc, view.left, view.top, view.right, view.bottom);
 
     // 原图只拷一次
     if editor.source.is_none() {
@@ -1790,13 +1852,12 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         );
     }
 
-    // 图片下面那条（工具栏 + 提示）铺底色：图片贴到窗口边上时不会从按钮缝里透出来
+    // 图形画完，恢复裁剪，再把工具栏那条铺上底色
+    RestoreDC(dc, saved);
     let band = CreateSolidBrush(crate::theme::ui().bg);
-    let image_bottom =
-        editor.image_top + (editor.base.height as f32 * editor.scale) as i32;
     let below = RECT {
         left: 0,
-        top: image_bottom.max(0),
+        top: view.bottom,
         right: client.right,
         bottom: client.bottom,
     };
@@ -1854,9 +1915,9 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     // 工具栏：微信那种一条圆角底栏，纯图标（文字靠 hover 小标签提示）
     editor.buttons.clear();
     let ui = crate::theme::ui();
-    let image_h = (editor.base.height as f32 * editor.scale) as i32;
     let bar_h = s(38.0);
-    let bar_top = editor.image_top + image_h + s(3.0);
+    // 工具栏固定在窗口底部，图片缩放不影响它的位置
+    let bar_top = (view.bottom - bar_h - s(3.0)).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -2052,8 +2113,13 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         }
     }
 
-    // 提示
-    let hint = hint_for(editor.tool);
+    // 提示（带当前缩放比例）
+    let hint_text = format!(
+        "{} · {}%",
+        hint_for(editor.tool),
+        (editor.zoom * 100.0).round() as i32
+    );
+    let hint = hint_text.as_str();
     let hint_font = cached_font(8.0, 400);
     let old_hint = SelectObject(dc, hint_font as HGDIOBJ);
     SetTextColor(dc, crate::theme::ui().text3);
@@ -2122,13 +2188,20 @@ pub unsafe fn preview_png(path: &str) -> bool {
         return false;
     }
 
+    let preview_zoom = std::env::var("NST_EDITOR_ZOOM")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0f32)
+        .clamp(0.2, 6.0);
     let mut editor = Editor {
         base,
         screen: (0, 0, width, height),
+        base_scale: 1.0,
+        zoom: preview_zoom,
         shapes: Vec::new(),
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
-        scale: 1.0,
+        scale: preview_zoom,
         image_left: 0,
         image_top: 0,
         drag_from: None,
@@ -2773,6 +2846,8 @@ impl Editor {
             base: self.base.clone(),
             shapes: self.shapes.clone(),
             screen: self.screen,
+            base_scale: self.base_scale,
+            zoom: self.zoom,
             tool: self.tool,
             scale: 1.0,
             image_left: 0,
@@ -3309,9 +3384,15 @@ unsafe fn editor_relayout(hwnd: HWND, suggested: *const RECT) {
     let client_w = image_w.max(s(600.0));
     let client_h = image_h + toolbar + hint;
 
-    editor.scale = scale;
+    // 换屏只更新「适配缩放」，用户当前的放大倍数要保留
+    editor.base_scale = scale;
+    editor.zoom = editor.zoom.clamp(0.2, 6.0);
+    editor.scale = scale * editor.zoom;
     editor.image_left = (client_w - image_w) / 2;
     editor.image_top = 0;
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    clamp_image(editor, client);
 
     let (x, y) = if suggested.is_null() {
         (rect.left, rect.top)
@@ -3446,6 +3527,24 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 }
             }
             InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        WM_MOUSEWHEEL => {
+            // 滚轮 = 缩放（向上放大），锚点就是鼠标所在位置
+            let delta = ((wparam >> 16) as i16) as i32;
+            if delta != 0 {
+                let screen = POINT {
+                    x: (lparam as i32) & 0xFFFF,
+                    y: ((lparam as i32) >> 16) & 0xFFFF,
+                };
+                let mut client = POINT {
+                    x: screen.x,
+                    y: screen.y,
+                };
+                ScreenToClient(hwnd, &mut client);
+                let factor = if delta > 0 { 1.25 } else { 1.0 / 1.25 };
+                editor_zoom(hwnd, factor, (client.x, client.y));
+            }
             0
         }
         WM_MOUSEMOVE => {
@@ -3600,6 +3699,34 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_KEYDOWN => {
             match wparam as u32 {
+                // + / = 放大，- 缩小，0 回到适配大小（锚点取窗口中心）
+                0xBB | 0x6B | 0x6A => {
+                    let mut client: RECT = std::mem::zeroed();
+                    GetClientRect(hwnd, &mut client);
+                    editor_zoom(
+                        hwnd,
+                        1.25,
+                        (client.right / 2, editor_view_height(client) / 2),
+                    );
+                }
+                0xBD | 0x6D => {
+                    let mut client: RECT = std::mem::zeroed();
+                    GetClientRect(hwnd, &mut client);
+                    editor_zoom(
+                        hwnd,
+                        1.0 / 1.25,
+                        (client.right / 2, editor_view_height(client) / 2),
+                    );
+                }
+                0x30 if GetKeyState(0x11) < 0 => {
+                    // Ctrl+0：回到 1 倍
+                    let state = editor_state(hwnd);
+                    if !state.is_null() {
+                        let editor = &mut *state;
+                        let factor = 1.0 / editor.zoom;
+                        editor_zoom(hwnd, factor, (0, 0));
+                    }
+                }
                 0x1B => {
                     // Esc：取消文字输入 → 退出取字框选 → 否则关闭窗口
                     let editor = editor_state(hwnd);
@@ -3777,6 +3904,8 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let state = Box::into_raw(Box::new(Editor {
         base: bitmap,
         screen: rect,
+        base_scale: scale,
+        zoom: 1.0,
         shapes: Vec::new(),
         tool: Tool::None,
         scale,
