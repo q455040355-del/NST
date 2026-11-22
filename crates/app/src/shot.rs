@@ -1531,6 +1531,51 @@ fn draw_pen(dc: HDC, points: &[(i32, i32)], width: i32, scale: f32) {    if poin
     }
 }
 
+/// 让窗口刚好装下「当前缩放下的图 + 底栏 + 提示」。
+/// 缩放、旋转之后都调一次：不然图缩了窗口还留着，底下就是一大片空白。
+unsafe fn fit_window_to_image(hwnd: HWND, editor: &mut Editor) {
+    let toolbar = s(44.0);
+    let hint = s(24.0);
+    let mut cursor = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut cursor);
+    let work = crate::work_area_at(cursor);
+    let max_w = (work.right - work.left - s(24.0)).max(s(320.0));
+    let max_h = ((work.bottom - work.top) - s(48.0)).max(s(240.0));
+
+    let image_w = (editor.base.width as f32 * editor.scale).round() as i32;
+    let image_h = (editor.base.height as f32 * editor.scale).round() as i32;
+    let mut width = image_w.max(s(600.0)).min(max_w);
+    let mut height = image_h + toolbar + hint;
+    if height > max_h {
+        height = max_h;
+    }
+    width = width.max(s(320.0));
+
+    let mut rect: RECT = std::mem::zeroed();
+    GetWindowRect(hwnd, &mut rect);
+    let mut x = rect.left;
+    let mut y = rect.top;
+    if x + width > work.right {
+        x = (work.right - width).max(work.left);
+    }
+    if y + height > work.bottom {
+        y = (work.bottom - height).max(work.top);
+    }
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        x,
+        y,
+        width,
+        height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    clamp_image(editor, client);
+}
+
 /// 顺时针转 90°：图转、图形坐标跟着转、再按显示区重新适配
 unsafe fn rotate_editor(hwnd: HWND, editor: &mut Editor) {
     let (width, height) = (editor.base.width, editor.base.height);
@@ -1588,6 +1633,7 @@ unsafe fn rotate_editor(hwnd: HWND, editor: &mut Editor) {
     editor.drag_from = None;
     editor.drag_to = None;
     editor.pen_points.clear();
+    fit_window_to_image(hwnd, editor);
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -2212,6 +2258,8 @@ pub(crate) unsafe fn editor_zoom(hwnd: HWND, factor: f32, anchor: (i32, i32)) {
     editor.zoom = zoom;
     editor.scale = new_scale;
 
+    // 缩放之后把窗口也调到刚好装下：不然缩小了留一大片空白、放大了又挤
+    fit_window_to_image(hwnd, editor);
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
     clamp_image(editor, client);
@@ -2238,6 +2286,21 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         right: client.right,
         bottom: (client.bottom - hint_h - toolbar).max(0),
     };
+    if std::env::var_os("NST_EDITOR_DEBUG").is_some() {
+        crate::debug_log(&format!(
+            "editor 布局: client={}x{} image={}x{} scale={} left={} top={} view_bottom={} hint={} toolbar={}",
+            client.right,
+            client.bottom,
+            editor.base.width,
+            editor.base.height,
+            editor.scale,
+            editor.image_left,
+            editor.image_top,
+            (client.bottom - hint_h - toolbar).max(0),
+            hint_h,
+            toolbar,
+        ));
+    }
     let saved = SaveDC(dc);
     IntersectClipRect(dc, view.left, view.top, view.right, view.bottom);
 
@@ -2331,7 +2394,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let ui = crate::theme::ui();
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
-    let bar_top = (view.bottom - bar_h - s(3.0)).max(0);
+    // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
+    let bar_top = (view.bottom + ((toolbar - bar_h) / 2).max(0)).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -4147,7 +4211,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     editor.drag_to = Some((ix, iy));
                     SetCapture(hwnd);
                 }
-                Tool::Pen => {
+                Tool::Pen | Tool::Marker => {
                     editor.pen_points = vec![(ix, iy)];
                     SetCapture(hwnd);
                 }
