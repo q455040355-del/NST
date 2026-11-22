@@ -800,6 +800,33 @@ struct ScreenGrabber {
     cursor_hot: (i32, i32),
     /// 上一帧的光标状态（句柄 + 位置）：桌面没变时用它判断能不能整帧跳过
     last_cursor: (usize, i32, i32),
+    /// 连续多少帧 DXGI 给的是黑屏
+    black_frames: u32,
+}
+
+/// DXGI 偶尔会返回一整片黑（HDR 桌面 / 驱动转换失败），抽样判断一下
+unsafe fn bits_look_black(bits: *const u8, width: i32, height: i32) -> bool {
+    if bits.is_null() {
+        return false;
+    }
+    let pixels = (width * height).max(1) as usize;
+    let step = (pixels / 4096).max(1);
+    let mut dark = 0usize;
+    let mut seen = 0usize;
+    let mut index = 0usize;
+    while index < pixels {
+        let offset = index * 4;
+        let mut peak = 0u8;
+        for c in 0..3 {
+            peak = peak.max(*bits.add(offset + c));
+        }
+        if peak < 12 {
+            dark += 1;
+        }
+        seen += 1;
+        index += step;
+    }
+    seen > 0 && dark * 100 >= seen * 98
 }
 
 impl ScreenGrabber {
@@ -904,6 +931,7 @@ impl ScreenGrabber {
                 crop_h,
                 cursor: std::ptr::null_mut(),
                 last_cursor: (0, 0, 0),
+        black_frames: 0,
                 cursor_hot: (0, 0),
             })
         }
@@ -938,14 +966,30 @@ impl ScreenGrabber {
                         lost = true;
                         ((0, 0), self.crop_dc, 0, 0, self.crop_w, self.crop_h)
                     }
-                    crate::dxgi::Grabbed::New => (
-                        duplicator.origin(),
-                        self.crop_dc,
-                        0,
-                        0,
-                        self.crop_w,
-                        self.crop_h,
-                    ),
+                    crate::dxgi::Grabbed::New => {
+                        // 抽检：HDR 桌面/驱动不兼容时 DXGI 会给一整片黑，
+                        // 这时候录出来就是全黑视频，直接回落 GDI
+                        if bits_look_black(self.crop_bits, self.crop_w, self.crop_h) {
+                            self.black_frames += 1;
+                            if self.black_frames >= 2 {
+                                crate::debug_log(
+                                    "rec: DXGI 连续返回黑屏，回落 GDI 采集",
+                                );
+                                self.dxgi = None;
+                                return false;
+                            }
+                        } else {
+                            self.black_frames = 0;
+                        }
+                        (
+                            duplicator.origin(),
+                            self.crop_dc,
+                            0,
+                            0,
+                            self.crop_w,
+                            self.crop_h,
+                        )
+                    }
                     // 桌面这一帧没变：crop DIB 里还是上一帧，光标也没动的话整帧跳过
                     _ => {
                         fresh = false;
