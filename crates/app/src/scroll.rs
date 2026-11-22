@@ -8,10 +8,13 @@
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use std::ffi::c_void;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, PAINTSTRUCT,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+    DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, InvalidateRect, ReleaseDC, SelectObject,
+    SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HALFTONE,
+    HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -32,6 +35,10 @@ const BORDER: i32 = 3;
 const CHIP_W: i32 = 268;
 const CHIP_H: i32 = 62;
 const BORDER_CLASS: &str = "NetSpeedTaskbarRs.ScrollBorder";
+const PREVIEW_CLASS: &str = "NetSpeedTaskbarRs.ScrollPreview";
+/// 右侧缩略图窗口宽 / 高
+const THUMB_W: i32 = 150;
+const PREVIEW_H: i32 = 420;
 const CHIP_CLASS: &str = "NetSpeedTaskbarRs.ScrollChip";
 const HOTKEY_STOP: i32 = 0x5C01;
 
@@ -46,6 +53,10 @@ static CONFIRM: AtomicBool = AtomicBool::new(false);
 static APPENDED: AtomicUsize = AtomicUsize::new(0);
 static CHIP: AtomicIsize = AtomicIsize::new(0);
 static BORDER_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 右侧缩略图窗口
+static PREVIEW: AtomicIsize = AtomicIsize::new(0);
+/// 缩略图像素（宽, 高, BGRA），由抓帧线程写、预览窗口读
+static THUMB: std::sync::Mutex<Option<(i32, i32, Vec<u8>)>> = std::sync::Mutex::new(None);
 /// 胶囊是不是压在选区里
 static INNER: AtomicBool = AtomicBool::new(false);
 static mut PANEL: HWND = std::ptr::null_mut();
@@ -389,6 +400,54 @@ impl Stitcher {
 
 // ---------------------------------------------------------------- 会话
 
+/// 建一块 32 位、行序自顶向下的 DIB（预览窗口画缩略图用）
+unsafe fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
+    let screen = GetDC(std::ptr::null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = width.max(1);
+    info.bmiHeader.biHeight = -height.max(1);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(screen, &info, 0, &mut bits, std::ptr::null_mut(), 0);
+    if !dib.is_null() {
+        SelectObject(dc, dib as HGDIOBJ);
+    }
+    ReleaseDC(std::ptr::null_mut(), screen);
+    (dc, dib, bits as *mut u8)
+}
+
+/// 把当前长图采样成一张小图（最近邻，只要 O(缩略图) 的功夫）
+unsafe fn refresh_thumb(stitcher: &Stitcher, width: i32) {
+    let image = stitcher.image();
+    if image.width <= 0 || image.height <= 0 {
+        return;
+    }
+    let thumb_w = width.clamp(40, 240);
+    let thumb_h = ((image.height as f32 * thumb_w as f32 / image.width as f32) as i32).max(1);
+    let mut pixels = vec![0u8; (thumb_w * thumb_h * 4) as usize];
+    for ty in 0..thumb_h {
+        let sy = (ty * image.height / thumb_h).min(image.height - 1);
+        for tx in 0..thumb_w {
+            let sx = (tx * image.width / thumb_w).min(image.width - 1);
+            let src = ((sy * image.width + sx) * 4) as usize;
+            let dst = ((ty * thumb_w + tx) * 4) as usize;
+            if src + 3 < image.pixels.len() {
+                pixels[dst..dst + 4].copy_from_slice(&image.pixels[src..src + 4]);
+            }
+        }
+    }
+    if let Ok(mut guard) = THUMB.lock() {
+        *guard = Some((thumb_w, thumb_h, pixels));
+    }
+    let preview = PREVIEW.load(Ordering::SeqCst) as HWND;
+    if !preview.is_null() {
+        InvalidateRect(preview, std::ptr::null(), 0);
+    }
+}
+
 /// 抓帧高度：胶囊在里面时只抓到它上沿，那一条留给最后补抓
 unsafe fn capture_height() -> i32 {
     let (_, _, _, h) = REGION;
@@ -413,6 +472,7 @@ unsafe fn burst_push(stitcher: &mut Stitcher, frames: usize) -> bool {
             if let Pushed::Appended = stitcher.push(&frame) {
                 appended = true;
                 APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
+                refresh_thumb(stitcher, THUMB_W);
                 let chip = CHIP.load(Ordering::SeqCst) as HWND;
                 if !chip.is_null() {
                     InvalidateRect(chip, std::ptr::null(), 0);
@@ -426,7 +486,15 @@ unsafe fn burst_push(stitcher: &mut Stitcher, frames: usize) -> bool {
 /// 截图编辑窗点了「滚动截图」之后进来：拿当前这块图 + 屏幕位置开会话
 pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
     if ACTIVE.swap(true, Ordering::SeqCst) {
-        return;
+        // 上一个会话没收拾干净（比如线程 panic 了）：只要胶囊窗口不在了就强制重开，
+        // 否则用户会看到「点了滚动截图，编辑窗没了、也没有任何抓图界面」
+        let chip = CHIP.load(Ordering::SeqCst) as HWND;
+        let alive = !chip.is_null()
+            && windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(chip) != 0;
+        if alive {
+            return;
+        }
+        crate::debug_log("scroll: 发现上一个会话没收干净，强制重开");
     }
     let (x, y, w, h) = rect;
     if w < 32 || h < 32 {
@@ -535,45 +603,116 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
     RegisterHotKey(chip, HOTKEY_STOP, MOD_NOREPEAT, 0x1B); // Esc = 放弃
 
     // 放弃时回原图
+    // 右侧缩略图：优先放在选区右边，右边没地方就放左边
+    let mut preview_x = x + w + 10;
+    let mut preview_y = y;
+    let mut area: RECT = std::mem::zeroed();
+    if windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+        windows_sys::Win32::UI::WindowsAndMessaging::SPI_GETWORKAREA,
+        0,
+        &mut area as *mut RECT as *mut _,
+        0,
+    ) != 0
+    {
+        if preview_x + THUMB_W > area.right {
+            preview_x = x - THUMB_W - 10;
+        }
+        if preview_x < area.left {
+            preview_x = (x + w - THUMB_W - 8).max(area.left);
+        }
+        preview_y = preview_y
+            .min(area.bottom - PREVIEW_H - 8)
+            .max(area.top + 4);
+    }
+    let preview_class = wide(PREVIEW_CLASS);
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(preview_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: instance,
+        hIcon: std::ptr::null_mut(),
+        hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: preview_class.as_ptr(),
+    };
+    RegisterClassW(&wc);
+    let preview = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        preview_class.as_ptr(),
+        wide("滚动截图预览").as_ptr(),
+        WS_POPUP | WS_VISIBLE,
+        preview_x,
+        preview_y,
+        THUMB_W,
+        PREVIEW_H,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    PREVIEW.store(preview as isize, Ordering::SeqCst);
+
     let original = first.clone();
     // 首帧要跟后面抓帧一样高（胶囊在里面时只有上半截），否则高度对不上永远接不了
     let cap_h = (h - if inner { CHIP_H + s(10.0) } else { 0 }).max(32);
     std::thread::spawn(move || {
-        let seed = capture_rect(x, y, w, cap_h).unwrap_or_else(|| {
-            // 抓不到就用传进来的图裁一段
-            let mut copy = first.clone();
-            copy.height = cap_h.min(first.height);
-            copy.pixels.truncate((copy.width * copy.height * 4).max(0) as usize);
-            copy
-        });
-        let mut stitcher = Stitcher::new(seed);
-        while !STOP.load(Ordering::SeqCst) {
-            burst_push(&mut stitcher, 3);
-            if stitcher.full() {
-                crate::debug_log("scroll: 到长图上限，收工");
-                break;
+        // 万一线程里 panic（索引越界之类），ACTIVE 必须清掉，
+        // 否则下一次点「滚动截图」会被当成「已经在跑」直接忽略
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+            let seed = capture_rect(x, y, w, cap_h).unwrap_or_else(|| {
+                // 抓不到就用传进来的图裁一段
+                let mut copy = first.clone();
+                copy.height = cap_h.min(first.height);
+                copy.pixels.truncate((copy.width * copy.height * 4).max(0) as usize);
+                copy
+            });
+            let mut stitcher = Stitcher::new(seed);
+            while !STOP.load(Ordering::SeqCst) {
+                burst_push(&mut stitcher, 3);
+                if stitcher.full() {
+                    crate::debug_log("scroll: 到长图上限，收工");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
             }
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            let confirm = CONFIRM.load(Ordering::SeqCst);
+            crate::debug_log(&format!(
+                "scroll: 收尾 {}x{} 确认={confirm}",
+                stitcher.image().width,
+                stitcher.height()
+            ));
+            // 胶囊压在选区里时先收掉它，补抓一帧完整区域，把被挡住的那条补上
+            if INNER.load(Ordering::SeqCst) {
+                let chip = CHIP.load(Ordering::SeqCst) as HWND;
+                if !chip.is_null() {
+                    PostMessageW(chip, 0x0010, 0, 0); // WM_CLOSE
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let (x, y, w, h) = REGION;
+                if let Some(frame) = capture_rect(x, y, w, h) {
+                    stitcher.push(&frame);
+                }
+            }
+            finish(stitcher.image().clone(), confirm, original);
+            }
+        }));
+        if outcome.is_err() {
+            crate::debug_log("scroll: 线程 panic，已清理");
+            unsafe {
+                ACTIVE.store(false, Ordering::SeqCst);
+                let chip = CHIP.swap(0, Ordering::SeqCst) as HWND;
+                if !chip.is_null() {
+                    PostMessageW(chip, 0x0010, 0, 0);
+                }
+                let preview = PREVIEW.swap(0, Ordering::SeqCst) as HWND;
+                if !preview.is_null() {
+                    PostMessageW(preview, 0x0010, 0, 0);
+                }
+            }
         }
-        let confirm = CONFIRM.load(Ordering::SeqCst);
-        crate::debug_log(&format!(
-            "scroll: 收尾 {}x{} 确认={confirm}",
-            stitcher.image().width,
-            stitcher.height()
-        ));
-        // 胶囊压在选区里时先收掉它，补抓一帧完整区域，把被挡住的那条补上
-        if INNER.load(Ordering::SeqCst) {
-            let chip = CHIP.load(Ordering::SeqCst) as HWND;
-            if !chip.is_null() {
-                PostMessageW(chip, 0x0010, 0, 0); // WM_CLOSE
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let (x, y, w, h) = REGION;
-            if let Some(frame) = capture_rect(x, y, w, h) {
-                stitcher.push(&frame);
-            }
-        }
-        finish(stitcher.image().clone(), confirm, original);
     });
 }
 
@@ -584,6 +723,10 @@ unsafe fn finish(image: Bitmap, confirm: bool, original: Bitmap) {
     if !chip.is_null() {
         UnregisterHotKey(chip, HOTKEY_STOP);
         PostMessageW(chip, 0x0010, 0, 0); // WM_CLOSE
+    }
+    let preview = PREVIEW.swap(0, Ordering::SeqCst) as HWND;
+    if !preview.is_null() {
+        PostMessageW(preview, 0x0010, 0, 0); // WM_CLOSE
     }
     let panel = PANEL;
     if panel.is_null() {
@@ -674,6 +817,104 @@ unsafe extern "system" fn chip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+unsafe extern "system" fn preview_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_preview(hwnd);
+            0
+        }
+        0x0010 => {
+            // WM_CLOSE
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            PREVIEW.store(0, Ordering::SeqCst);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 把缩略图画进右侧那个小窗口：先在底上画一块深色，再把缩略图按比例铺满
+unsafe fn paint_preview(hwnd: HWND) {
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let mut client: RECT = std::mem::zeroed();
+    windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+
+    let ui = crate::theme::ui();
+    let brush = CreateSolidBrush(0x0020_2020);
+    FillRect(dc, &client, brush);
+    DeleteObject(brush as *mut _);
+
+    let snapshot = THUMB.lock().ok().and_then(|guard| guard.clone());
+    if let Some((thumb_w, thumb_h, pixels)) = snapshot {
+        if thumb_w > 0 && thumb_h > 0 {
+            // 按「塞得进窗口」的比例缩放，居中
+            let max_w = (client.right - 8).max(1);
+            let max_h = (client.bottom - 8).max(1);
+            let scale = (max_w as f32 / thumb_w as f32).min(max_h as f32 / thumb_h as f32);
+            let draw_w = (thumb_w as f32 * scale).max(1.0) as i32;
+            let draw_h = (thumb_h as f32 * scale).max(1.0) as i32;
+            let left = 4 + (max_w - draw_w) / 2;
+            let top = 4 + (max_h - draw_h) / 2;
+
+            let (mem, dib, bits) = make_dib(thumb_w, thumb_h);
+            if !mem.is_null() && !dib.is_null() && !bits.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    pixels.as_ptr(),
+                    bits,
+                    (thumb_w * thumb_h * 4) as usize,
+                );
+                SetStretchBltMode(dc, HALFTONE);
+                StretchBlt(
+                    dc,
+                    left,
+                    top,
+                    draw_w,
+                    draw_h,
+                    mem,
+                    0,
+                    0,
+                    thumb_w,
+                    thumb_h,
+                    SRCCOPY,
+                );
+                DeleteObject(dib as *mut _);
+                DeleteDC(mem);
+            }
+        }
+    }
+
+    // 一圈细边框，跟别的小窗保持一致
+    let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, ui.border);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    let old_brush = SelectObject(
+        dc,
+        windows_sys::Win32::Graphics::Gdi::GetStockObject(
+            windows_sys::Win32::Graphics::Gdi::NULL_BRUSH,
+        ),
+    );
+    windows_sys::Win32::Graphics::Gdi::Rectangle(
+        dc,
+        client.left,
+        client.top,
+        client.right,
+        client.bottom,
+    );
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen as *mut _);
+
+    EndPaint(hwnd, &mut ps);
 }
 
 unsafe fn paint_chip(hwnd: HWND) {
