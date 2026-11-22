@@ -422,6 +422,8 @@ struct Overlay {
     cursor: POINT,
     /// 选区强制 1:1（正方形截图，或者拖的时候按 S 切换）
     square: bool,
+    /// 左下角那个「1:1」开关的位置（客户区坐标，每帧算）
+    toggle: RECT,
 }
 
 /// 把整屏画布上某块矩形恢复成「压暗版」像素。
@@ -800,7 +802,82 @@ unsafe fn overlay_paint(hwnd: HWND) {
     BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
     // 放大镜直接画在窗口 DC 上，不去动常驻画布（每帧重画，不会有残影）
     draw_loupe(hdc, state);
+    // 底部中间那个「1:1」开关
+    draw_square_toggle(hdc, state);
     EndPaint(hwnd, &mut ps);
+}
+
+/// 截图遮罩底部中间的「▢ 1:1」开关：点一下进/出正方形模式，状态一眼可见。
+unsafe fn draw_square_toggle(dc: HDC, state: &mut Overlay) {
+    let width = s(76.0);
+    let height = s(26.0);
+    let left = (state.shot.width - width) / 2;
+    let top = state.shot.height - height - s(40.0);
+    let rect = RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    state.toggle = rect;
+
+    let ui = crate::theme::ui();
+    let fill = if state.square { ui.accent } else { 0x0018_1818 };
+    let ink = 0x00FF_FFFF;
+    let brush = CreateSolidBrush(fill);
+    let pen = CreatePen(0, 1, fill);
+    let old_brush = SelectObject(dc, brush as HGDIOBJ);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    windows_sys::Win32::Graphics::Gdi::RoundRect(
+        dc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        s(13.0),
+        s(13.0),
+    );
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(pen as *mut _);
+    DeleteObject(brush as *mut _);
+
+    // 左边一个小方块当图标
+    let square = s(5.0);
+    let bx = rect.left + s(12.0);
+    let by = (rect.top + rect.bottom) / 2;
+    let box_pen = CreatePen(0, s(1.4).max(1), ink);
+    let old_box_pen = SelectObject(dc, box_pen as HGDIOBJ);
+    let old_box_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    windows_sys::Win32::Graphics::Gdi::Rectangle(
+        dc,
+        bx - square,
+        by - square,
+        bx + square,
+        by + square,
+    );
+    SelectObject(dc, old_box_brush);
+    SelectObject(dc, old_box_pen);
+    DeleteObject(box_pen as *mut _);
+
+    let font = cached_font(9.0, 600);
+    let old_font = SelectObject(dc, font as HGDIOBJ);
+    SetBkMode(dc, TRANSPARENT as i32);
+    SetTextColor(dc, ink);
+    let mut text = RECT {
+        left: bx + square + s(7.0),
+        top: rect.top,
+        right: rect.right - s(8.0),
+        bottom: rect.bottom,
+    };
+    DrawTextW(
+        dc,
+        wide("1:1").as_ptr(),
+        -1,
+        &mut text,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+    );
+    SelectObject(dc, old_font);
 }
 
 /// 微信那种放大镜：光标附近放大 8 倍、画格子、标中心像素，下面给坐标和色值
@@ -992,6 +1069,24 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 let mut point = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut point);
                 let state = &mut *state;
+
+                // 先看是不是点在「1:1」开关上：是就只切模式，不开始框选
+                let local = POINT {
+                    x: point.x - state.origin.0,
+                    y: point.y - state.origin.1,
+                };
+                let toggle = state.toggle;
+                if toggle.right > toggle.left
+                    && local.x >= toggle.left
+                    && local.x <= toggle.right
+                    && local.y >= toggle.top
+                    && local.y <= toggle.bottom
+                {
+                    state.square = !state.square;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+
                 let press = POINT {
                     x: (point.x - state.origin.0).clamp(0, state.shot.width),
                     y: (point.y - state.origin.1).clamp(0, state.shot.height),
@@ -1222,6 +1317,12 @@ pub unsafe fn begin(panel: HWND) {
         last_label: None,
         cursor: POINT { x: vw / 2, y: vh / 2 },
         square: SQUARE_CAPTURE.swap(false, Ordering::Relaxed),
+        toggle: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
     }));
 
     let hwnd = CreateWindowExW(
@@ -2307,7 +2408,8 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
 // 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
 
 const PACK_CELL: u32 = 176;
-const PACK_COUNT: usize = 16;
+/// 16 枚来自设计稿 + 2 枚补画（贴图 / 置顶）
+const PACK_COUNT: usize = 18;
 
 struct IconPack {
     /// 每格 PACK_CELL×PACK_CELL 的灰度蒙版（0=透明，255=实心）
@@ -2377,7 +2479,9 @@ fn pack_index(action: Action) -> Option<usize> {
         Action::Tool(Tool::Ocr) => 8,
         Action::Undo => 10,
         Action::Save => 11,
+        // 贴图用设计稿的 13 号图钉；17 号是按设计稿画法补的「窗口+上箭头」给置顶用
         Action::Pin => 12,
+        Action::Topmost => 17,
         Action::Close => 14,
         Action::Done => 15,
         _ => return None,
