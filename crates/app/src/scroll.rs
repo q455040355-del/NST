@@ -166,21 +166,23 @@ impl Stitcher {
         self.image.height >= self.max_rows
     }
 
-    /// 重叠区里「明显不一样」的像素占比（隔行隔列采样）：
-    /// 对齐时只有抗锯齿边缘会超阈值，差几行就会一大片，比平均差好区分
-    fn pixel_mismatch(&self, frame: &Bitmap, k: i32) -> f32 {
+    /// 重叠区里「明显不一样」的像素占比（隔行隔列采样）。
+    /// image_row / frame_row 是两边比较的起始行，rows 是比较多少行。
+    fn mismatch_at(&self, frame: &Bitmap, image_row: i32, frame_row: i32, rows: i32) -> f32 {
         const HARD: i32 = 40;
         let width = self.width;
-        if k <= 0 || k > self.image.height {
+        if rows <= 0 || image_row < 0 || frame_row < 0 {
             return 1.0;
         }
-        let top = self.image.height - k;
+        if image_row + rows > self.image.height || frame_row + rows > frame.height {
+            return 1.0;
+        }
         let mut bad = 0u64;
         let mut count = 0u64;
         let mut y = 0;
-        while y < k {
-            let a_row = ((top + y) * width) as usize * 4;
-            let b_row = (y * width) as usize * 4;
+        while y < rows {
+            let a_row = ((image_row + y) * width) as usize * 4;
+            let b_row = ((frame_row + y) * width) as usize * 4;
             let mut x = 0;
             while x < width {
                 let a = a_row + x as usize * 4;
@@ -207,12 +209,53 @@ impl Stitcher {
         }
     }
 
+    /// 在候选重叠里挑最像的：先用行签名相关系数粗筛，再比真实像素占比
+    fn best_overlap<F, G>(
+        &self,
+        min_overlap: i32,
+        max_overlap: i32,
+        corr_of: F,
+        mismatch_of: G,
+    ) -> Option<(f32, i32)>
+    where
+        F: Fn(i32) -> f32,
+        G: Fn(i32) -> f32,
+    {
+        let mut candidates: Vec<(f32, i32)> = Vec::new();
+        for k in min_overlap..=max_overlap {
+            let corr = corr_of(k);
+            if corr > 0.5 {
+                candidates.push((corr, k));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(8);
+
+        let mut scored: Vec<(f32, i32)> = candidates
+            .iter()
+            .map(|(_, k)| (mismatch_of(*k), *k))
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((best_ratio, best_k)) = scored.first().copied() else {
+            return None;
+        };
+        let second = scored
+            .iter()
+            .filter(|(_, k)| (k - best_k).abs() > 12)
+            .map(|(ratio, _)| *ratio)
+            .next()
+            .unwrap_or(1.0);
+        // 明显不一样的像素超过 8%，或者和第二名拉不开 1.4 倍，都算没对准
+        if best_ratio > 0.08 || second < best_ratio * 1.4 {
+            return None;
+        }
+        Some((best_ratio, best_k))
+    }
+
     pub fn push(&mut self, frame: &Bitmap) -> Pushed {
         if frame.width != self.width {
             return Pushed::Lost;
         }
-        // 允许帧高不一样：胶囊压在选区里时每次只抓上半截，
-        // 收尾那次是全高；重叠只按两边都有的高度算，新行照样全接。
         let compare_h = frame.height.min(self.frame_h);
         if compare_h < 24 {
             return Pushed::Lost;
@@ -233,56 +276,59 @@ impl Stitcher {
             }
         }
 
-        // 第一步：相关系数粗筛，留几个候选（重复内容会有好几个峰）
-        let max_overlap = (compare_h - 8).min(total);
-        let min_overlap = (compare_h / 4).max(32).min(max_overlap);
-        let mut candidates: Vec<(f32, i32)> = Vec::new();
-        for k in min_overlap..=max_overlap {
-            let tail = &self.sigs[(total - k) as usize..];
-            let corr = correlation(tail, &fresh, k);
-            if corr > 0.5 {
-                candidates.push((corr, k));
+        let max_overlap = (compare_h - 8).min(total.min(frame.height));
+        let min_overlap = (compare_h / 4).max(32);
+        if max_overlap <= min_overlap {
+            return Pushed::Lost;
+        }
+
+        // 往下滚：长图尾部 == 新帧头部
+        let down = self.best_overlap(
+            min_overlap,
+            max_overlap,
+            |k| {
+                let total = self.sigs.len() as i32;
+                correlation(&self.sigs[(total - k) as usize..], &fresh, k)
+            },
+            |k| {
+                let total = self.sigs.len() as i32;
+                self.mismatch_at(frame, total - k, 0, k)
+            },
+        );
+        // 往上滚：长图头部 == 新帧尾部
+        let up = self.best_overlap(
+            min_overlap,
+            max_overlap,
+            |k| {
+                let end = frame.height;
+                correlation(&self.sigs[..k as usize], &fresh[(end - k) as usize..], k)
+            },
+            |k| self.mismatch_at(frame, 0, frame.height - k, k),
+        );
+        // 两个方向都试过了，取更像的那个（周期内容两个方向都能对上时别猜错）
+        match (down, up) {
+            (Some((down_ratio, k)), Some((up_ratio, _))) => {
+                if down_ratio <= up_ratio {
+                    self.append_rows(frame, &fresh, k)
+                } else {
+                    let (_, k) = up.unwrap_or((0.0, 0));
+                    self.prepend_rows(frame, &fresh, k)
+                }
             }
+            (Some((_, k)), None) => self.append_rows(frame, &fresh, k),
+            (None, Some((_, k))) => self.prepend_rows(frame, &fresh, k),
+            (None, None) => Pushed::Lost,
         }
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(8);
+    }
 
-        // 第二步：候选里比真实像素（文字重排会有抗锯齿差异，绝对值不会很小，
-        // 所以看「最好的那个是不是明显比第二好的更好」）
-        let mut scored: Vec<(f32, i32)> = candidates
-            .iter()
-            .map(|(_, k)| (self.pixel_mismatch(frame, *k), *k))
-            .collect();
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let Some((best_ratio, best_k)) = scored.first().copied() else {
-            self.last_best = None;
-            return Pushed::Lost;
-        };
-        let second = scored
-            .iter()
-            .filter(|(_, k)| (k - best_k).abs() > 12)
-            .map(|(ratio, _)| *ratio)
-            .next()
-            .unwrap_or(1.0);
-        self.last_best = Some((best_k, (best_ratio * 1000.0) as u32));
-
-        if best_k >= frame.height {
-            return Pushed::Unchanged;
-        }
-        // 明显不一样的像素超过 8%，或者和第二名拉不开 1.4 倍，都算没对准
-        if best_ratio > 0.08 || second < best_ratio * 1.4 {
-            return Pushed::Lost;
-        }
-        let k = best_k;
-
+    /// 下滚：把新帧 k 之后的行接到长图末尾
+    fn append_rows(&mut self, frame: &Bitmap, fresh: &[[u8; SIG]], k: i32) -> Pushed {
         let new_rows = frame.height - k;
         let room = self.max_rows - self.image.height;
         let take = new_rows.min(room.max(0));
         if take <= 0 {
             return Pushed::Unchanged;
         }
-
-        // 追加之前先把像素缓冲扩到新高度（不扩的话新行根本写不进去）
         let target_len = ((self.image.height + take) * self.width * 4) as usize;
         if self.image.pixels.len() < target_len {
             self.image.pixels.resize(target_len, 0);
@@ -298,8 +344,44 @@ impl Stitcher {
             self.sigs.push(fresh[src_row as usize]);
             self.image.height += 1;
         }
+        self.frame_h = frame.height;
+        Pushed::Appended
+    }
 
-        // 下一帧按这次的高度来比（收尾那次是全高，别的都是半高）
+    /// 上滚：把新帧前面那几行插到长图最前面（整块像素往下挪）
+    fn prepend_rows(&mut self, frame: &Bitmap, fresh: &[[u8; SIG]], k: i32) -> Pushed {
+        let add = frame.height - k;
+        if add <= 0 {
+            return Pushed::Unchanged;
+        }
+        let room = self.max_rows - self.image.height;
+        let add = add.min(room.max(0));
+        if add <= 0 {
+            return Pushed::Unchanged;
+        }
+        let row_bytes = (self.width * 4) as usize;
+        let new_len = ((self.image.height + add) * self.width * 4) as usize;
+        self.image.pixels.resize(new_len, 0);
+        // 先把已有像素整体往后挪 add 行，再把新帧的开头拷进去
+        self.image
+            .pixels
+            .copy_within(0..new_len - add as usize * row_bytes, add as usize * row_bytes);
+        for row in 0..add {
+            let src = ((row * self.width) * 4) as usize;
+            let dst = ((row * self.width) * 4) as usize;
+            let len = row_bytes;
+            if src + len <= frame.pixels.len() && dst + len <= self.image.pixels.len() {
+                self.image.pixels[dst..dst + len].copy_from_slice(&frame.pixels[src..src + len]);
+            }
+        }
+        // 签名也要在前面补上
+        let mut sigs = Vec::with_capacity(self.sigs.len() + add as usize);
+        for row in 0..add {
+            sigs.push(fresh[row as usize]);
+        }
+        sigs.extend_from_slice(&self.sigs);
+        self.sigs = sigs;
+        self.image.height += add;
         self.frame_h = frame.height;
         Pushed::Appended
     }
@@ -834,25 +916,38 @@ mod tests {
         bitmap
     }
 
-    /// 造一张「像截图」的图：白底 + 一行行深浅不一的横条（模拟文字行）+ 轻噪声
+    /// 造一张「像截图」的图：白底 + 一行行深浅不一的墨块（模拟文字行）+ 轻噪声。
+    /// 每一行的墨块位置由「文档行号」播种，行与行之间没有周期性，
+    /// 这样才能测出「会不会对错行」。
     fn text_like(width: i32, height: i32, top_row: i32) -> Bitmap {
         let mut bitmap = Bitmap {
             width,
             height,
             pixels: vec![0; (width * height * 4) as usize],
         };
-        let mut seed = 0x1234_5678u32;
         for y in 0..height {
             let doc_row = top_row + y;
+            let mut seed = (doc_row as u32).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
             let in_line = (doc_row % 24) < 16;
+            // 这一行的墨块：起点和长度都由行号决定
+            let mut ink = vec![(0i32, 0i32); 6];
+            for slot in ink.iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let x0 = (seed >> 8) % (width as u32) as u32;
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let len = 10 + (seed >> 20) % 80;
+                *slot = (x0 as i32, len as i32);
+            }
             for x in 0..width {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let noise = ((seed >> 28) as i32 - 8).clamp(-6, 6);
                 let mut value = 246i32;
                 if in_line {
-                    let h = (doc_row * 31 + x / 7) % 11;
-                    if h < 6 {
-                        value = 60 + ((doc_row * 7 + x) % 40) as i32;
+                    for (x0, len) in &ink {
+                        if x >= *x0 && x < *x0 + *len {
+                            value = 70;
+                            break;
+                        }
                     }
                 }
                 let v = (value + noise).clamp(0, 255) as u8;
@@ -906,6 +1001,26 @@ mod tests {
             assert!(matches!(stitcher.push(&next), Pushed::Appended));
         }
         assert_eq!(stitcher.height(), 120 + 5 * 40);
+    }
+
+
+    #[test]
+    fn scrolling_up_prepends_rows() {
+        for step in [19, 40, 113] {
+            let first = text_like(600, 500, 400); // 文档第 400..900 行
+            let mut stitcher = Stitcher::new(first);
+            let up = text_like(600, 500, 400 - step); // 往上滚：上面多出 step 行
+            match stitcher.push(&up) {
+                Pushed::Appended => {
+                    assert_eq!(stitcher.height(), 500 + step, "step={step}");
+                    // 新接上的应该是文档最上面的那 step 行
+                    let expect = text_like(600, step, 400 - step);
+                    let got = &stitcher.image().pixels[..(600 * step * 4) as usize];
+                    assert_eq!(got, &expect.pixels[..], "step={step} 头部内容不对");
+                }
+                _ => panic!("往上滚 step={step} 没接上"),
+            }
+        }
     }
 
     #[test]
