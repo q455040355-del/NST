@@ -5,7 +5,7 @@
 //! → 用户自己往下滚，程序每 80ms 抓一帧、用行签名 + 逐像素比对找重叠，只接新行
 //! → 点 ✓ 用拼好的长图回到编辑窗；点 × 把原来那张截图还回去。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use std::ffi::c_void;
@@ -17,6 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT,
 };
@@ -63,6 +64,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static CONFIRM: AtomicBool = AtomicBool::new(false);
 /// 已拼到多少行（UI 上显示）
 static APPENDED: AtomicUsize = AtomicUsize::new(0);
+/// 胶囊上那句提示：0 = 等你滚，1 = 正在接，2 = 对不上要回滚，3 = 到上限
+static HINT: AtomicU8 = AtomicU8::new(0);
 static CHIP: AtomicIsize = AtomicIsize::new(0);
 static BORDER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 右侧缩略图窗口
@@ -697,6 +700,7 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
     STOP.store(false, Ordering::SeqCst);
     CONFIRM.store(false, Ordering::SeqCst);
     APPENDED.store(h as usize, Ordering::SeqCst);
+    HINT.store(0, Ordering::SeqCst);
     crate::debug_log(&format!("scroll start: {x},{y} {w}x{h}（手动滚动）"));
 
     let instance = GetModuleHandleW(std::ptr::null());
@@ -795,26 +799,58 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
 
     // 放弃时回原图
     // 右侧缩略图：优先放在选区右边，右边没地方就放左边
-    let mut preview_x = x + w + 10;
-    let mut preview_y = y;
+    // 缩略图只在选区外面找位置。哪儿都放不下就挪到屏幕外（等于不显示）——
+    // 宁可少个预览，也不能把自己的窗录进长图里
     let mut area: RECT = std::mem::zeroed();
     if windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
         windows_sys::Win32::UI::WindowsAndMessaging::SPI_GETWORKAREA,
         0,
         &mut area as *mut RECT as *mut _,
         0,
-    ) != 0
+    ) == 0
     {
-        if preview_x + THUMB_W > area.right {
-            preview_x = x - THUMB_W - 10;
-        }
-        if preview_x < area.left {
-            preview_x = (x + w - THUMB_W - 8).max(area.left);
-        }
-        preview_y = preview_y
-            .min(area.bottom - PREVIEW_H - 8)
-            .max(area.top + 4);
+        area = RECT {
+            left: 0,
+            top: 0,
+            right: GetSystemMetrics(SM_CXSCREEN),
+            bottom: GetSystemMetrics(SM_CYSCREEN),
+        };
     }
+    let selection = RECT {
+        left: x - 6,
+        top: y - 6,
+        right: x + w + 6,
+        bottom: y + h + 6,
+    };
+    let candidates_preview = [
+        (x + w + 10, y),
+        (x - THUMB_W - 10, y),
+        (x + w + 10, y + h - PREVIEW_H),
+        (x - THUMB_W - 10, y + h - PREVIEW_H),
+        (area.left + 8, area.top + 8),
+        (area.right - THUMB_W - 8, area.bottom - PREVIEW_H - 8),
+    ];
+    let (preview_x, preview_y) = candidates_preview
+        .into_iter()
+        .map(|(px, py)| {
+            (
+                px.clamp(area.left, (area.right - THUMB_W).max(area.left)),
+                py.clamp(area.top + 4, (area.bottom - PREVIEW_H - 4).max(area.top + 4)),
+            )
+        })
+        .find(|(px, py)| {
+            let rect = RECT {
+                left: *px,
+                top: *py,
+                right: px + THUMB_W,
+                bottom: py + PREVIEW_H,
+            };
+            rect.left >= selection.right
+                || rect.right <= selection.left
+                || rect.top >= selection.bottom
+                || rect.bottom <= selection.top
+        })
+        .unwrap_or((-10000, -10000));
     let preview_class = wide(PREVIEW_CLASS);
     let wc = WNDCLASSW {
         style: 0,
@@ -875,6 +911,17 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
                     let outcome = stitcher.push(frame);
                     cost_us = captured.duration_since(tick).as_micros() as u64
                         + captured.elapsed().as_micros() as u64;
+                    let hint = match outcome {
+                        Pushed::Appended => 1u8,
+                        Pushed::Lost => 2,
+                        Pushed::Unchanged => HINT.load(Ordering::SeqCst),
+                    };
+                    if HINT.swap(hint, Ordering::SeqCst) != hint {
+                        let chip = CHIP.load(Ordering::SeqCst) as HWND;
+                        if !chip.is_null() {
+                            InvalidateRect(chip, std::ptr::null(), 0);
+                        }
+                    }
                     if matches!(outcome, Pushed::Appended) {
                         APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
                         refresh_thumb(&stitcher, THUMB_W);
@@ -886,6 +933,12 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
                 }
                 if stitcher.full() {
                     crate::debug_log("scroll: 到长图上限，收工");
+                    if HINT.swap(3, Ordering::SeqCst) != 3 {
+                        let chip = CHIP.load(Ordering::SeqCst) as HWND;
+                        if !chip.is_null() {
+                            InvalidateRect(chip, std::ptr::null(), 0);
+                        }
+                    }
                     break;
                 }
                 interval_us = next_interval_us(interval_us, cost_us);
@@ -1245,9 +1298,15 @@ unsafe fn paint_chip(hwnd: HWND) {
         right: rect.right - s(96.0),
         bottom: 32,
     };
+    let hint = match HINT.load(Ordering::SeqCst) {
+        1 => "继续往下滚",
+        2 => "重叠不足，往回滚一点",
+        3 => "到上限了，点 ✓ 结束",
+        _ => "把鼠标放进选区慢滚",
+    };
     DrawTextW(
         dc,
-        wide("用滚轮往下滚").as_ptr(),
+        wide(hint).as_ptr(),
         -1,
         &mut title,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
