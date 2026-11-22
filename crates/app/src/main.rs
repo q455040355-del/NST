@@ -130,7 +130,6 @@ const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
 const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
-const ID_SCROLL: usize = 1306;
 const ID_OCR: usize = 1303;
 const ID_GIF: usize = 1304;
 const ID_QUIT: usize = 1099;
@@ -1316,7 +1315,6 @@ fn show_menu(hwnd: HWND) {
     rows.push(menu::Entry::separator());
     if panel.settings.shot_enabled {
         rows.push(menu::Entry::hotkey(ID_SHOT, "截图…", panel.settings.shot_hotkey.clone()));
-        rows.push(menu::Entry::item(ID_SCROLL, "滚动截图（长图）…"));
     }
     if panel.settings.ocr_enabled {
         rows.push(menu::Entry::hotkey(
@@ -1365,9 +1363,6 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_SHOT => {
                 shot::request(hwnd);
-            }
-            ID_SCROLL => {
-                shot::request_scroll(hwnd);
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);

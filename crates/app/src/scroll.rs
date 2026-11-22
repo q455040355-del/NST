@@ -571,11 +571,6 @@ unsafe fn paint_chip(hwnd: HWND) {
     DeleteObject(font as *mut _);
 }
 
-/// 滚动截图是不是在进行中（菜单里改文案用）
-pub fn is_active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

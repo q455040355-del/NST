@@ -85,7 +85,6 @@ enum Mode {
     Edit,
     Ocr,
     Gif,
-    Scroll,
 }
 
 static mut MODE: Mode = Mode::Edit;
@@ -100,14 +99,6 @@ static GIF_SECONDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
     start(panel, Mode::Edit);
-}
-
-/// 滚动截图：框好区域后边滚边截，最后拼成一张长图丢进编辑窗。
-pub fn request_scroll(panel: HWND) {
-    if crate::scroll::is_active() {
-        return;
-    }
-    start(panel, Mode::Scroll);
 }
 
 /// 截图后直接取字（PaddleOCR）
@@ -168,7 +159,6 @@ unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
             GIF_QUALITY.load(Ordering::Relaxed),
             GIF_SECONDS.load(Ordering::Relaxed),
         ),
-        Mode::Scroll => crate::scroll::start(panel, bitmap, GIF_RECT),
         Mode::Edit => open_editor(panel, bitmap, GIF_RECT),
     }
 }
@@ -1272,6 +1262,8 @@ enum Action {
     Copy,
     Save,
     Pin,
+    /// 滚动截图：拿当前这块的区域继续往下滚，拼成长图
+    Scroll,
     /// 完成：复制到剪贴板 + 关窗（微信那条栏最右边的 ✓）
     Done,
     Minimize,
@@ -1287,6 +1279,8 @@ struct TextEdit {
 
 struct Editor {
     base: Bitmap,
+    /// 这块图在屏幕上的位置（滚动截图要按这个位置继续抓屏）
+    screen: (i32, i32, i32, i32),
     shapes: Vec<Shape>,
     tool: Tool,
     scale: f32,
@@ -1358,6 +1352,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Stroke => "浓淡",
         Action::Topmost => "置顶",
         Action::Pin => "贴图",
+        Action::Scroll => "滚动截图",
         Action::Done => "完成",
         Action::Minimize => "最小化",
         Action::Close => "取消",
@@ -1878,6 +1873,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Mosaic), false),
         (Action::Tool(Tool::Text), false),
         (Action::Tool(Tool::Ocr), false),
+        (Action::Scroll, false),
         (Action::Stroke, true),
         (Action::Undo, false),
         (Action::Topmost, true),
@@ -2128,6 +2124,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
 
     let mut editor = Editor {
         base,
+        screen: (0, 0, width, height),
         shapes: Vec::new(),
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
@@ -2350,6 +2347,7 @@ fn pack_index(action: Action) -> Option<usize> {
         Action::Tool(Tool::Mosaic) => 5,
         Action::Tool(Tool::Text) => 6,
         Action::Tool(Tool::Ocr) => 8,
+        Action::Scroll => 9,
         Action::Undo => 10,
         Action::Save => 11,
         // 贴图用设计稿的 13 号图钉；17 号是按设计稿画法补的「窗口+上箭头」给置顶用
@@ -2774,6 +2772,7 @@ impl Editor {
         Editor {
             base: self.base.clone(),
             shapes: self.shapes.clone(),
+            screen: self.screen,
             tool: self.tool,
             scale: 1.0,
             image_left: 0,
@@ -3240,6 +3239,15 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
         }
         Action::Minimize => {
             ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        Action::Scroll => {
+            commit_text(hwnd);
+            let editor = &*editor;
+            let bitmap = editor.base.clone();
+            let screen = editor.screen;
+            let panel = PANEL;
+            DestroyWindow(hwnd);
+            crate::scroll::start(panel, bitmap, screen);
         }
         Action::Done => {
             // 微信的 ✓：复制到剪贴板然后直接收工
@@ -3768,6 +3776,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
 
     let state = Box::into_raw(Box::new(Editor {
         base: bitmap,
+        screen: rect,
         shapes: Vec::new(),
         tool: Tool::None,
         scale,
