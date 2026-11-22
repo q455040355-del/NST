@@ -85,6 +85,7 @@ enum Mode {
     Edit,
     Ocr,
     Gif,
+    Scroll,
 }
 
 static mut MODE: Mode = Mode::Edit;
@@ -99,6 +100,14 @@ static GIF_SECONDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
     start(panel, Mode::Edit);
+}
+
+/// 滚动截图：框好区域后边滚边截，最后拼成一张长图丢进编辑窗。
+pub fn request_scroll(panel: HWND) {
+    if crate::scroll::is_active() {
+        return;
+    }
+    start(panel, Mode::Scroll);
 }
 
 /// 截图后直接取字（PaddleOCR）
@@ -159,6 +168,7 @@ unsafe fn deliver(panel: HWND, bitmap: Bitmap) {
             GIF_QUALITY.load(Ordering::Relaxed),
             GIF_SECONDS.load(Ordering::Relaxed),
         ),
+        Mode::Scroll => crate::scroll::start(panel, bitmap, GIF_RECT),
         Mode::Edit => open_editor(panel, bitmap, GIF_RECT),
     }
 }
@@ -227,7 +237,7 @@ fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
     }
 }
 
-fn capture_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Bitmap> {
+pub(crate) fn capture_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Bitmap> {
     if width <= 0 || height <= 0 {
         return None;
     }

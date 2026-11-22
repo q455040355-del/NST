@@ -15,6 +15,7 @@ mod ocr;
 mod ocr_ui;
 mod panel;
 mod settings_ui;
+mod scroll;
 mod shot;
 mod theme;
 mod tray;
@@ -54,6 +55,7 @@ const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
 pub(crate) const WM_APP_GIF_DONE: u32 = WM_APP + 9;
+pub(crate) const WM_APP_SCROLL_DONE: u32 = WM_APP + 10;
 const WM_APP_ANIM: u32 = WM_APP + 6;
 /// 另一个实例启动时叫醒已有面板（单实例互斥体挡住重复启动，但得给点反馈）
 const WM_APP_REVEAL: u32 = WM_APP + 7;
@@ -128,6 +130,7 @@ const ID_SETTINGS: usize = 1301;
 const ID_PANEL_HIDE: usize = 1200;
 const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
+const ID_SCROLL: usize = 1306;
 const ID_OCR: usize = 1303;
 const ID_GIF: usize = 1304;
 const ID_QUIT: usize = 1099;
@@ -1189,6 +1192,14 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_APP_SCROLL_DONE => {
+            let pointer = wparam as *mut (shot::Bitmap, RECT);
+            if !pointer.is_null() {
+                let (bitmap, rect) = *Box::from_raw(pointer);
+                shot::open_editor(hwnd, bitmap, (rect.left, rect.top, rect.right, rect.bottom));
+            }
+            0
+        }
         WM_APP_OCR_READY => {
             let pointer = wparam as *mut ocr::OcrOutcome;
             if !pointer.is_null() {
@@ -1305,6 +1316,7 @@ fn show_menu(hwnd: HWND) {
     rows.push(menu::Entry::separator());
     if panel.settings.shot_enabled {
         rows.push(menu::Entry::hotkey(ID_SHOT, "截图…", panel.settings.shot_hotkey.clone()));
+        rows.push(menu::Entry::item(ID_SCROLL, "滚动截图（长图）…"));
     }
     if panel.settings.ocr_enabled {
         rows.push(menu::Entry::hotkey(
@@ -1353,6 +1365,9 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_SHOT => {
                 shot::request(hwnd);
+            }
+            ID_SCROLL => {
+                shot::request_scroll(hwnd);
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);
