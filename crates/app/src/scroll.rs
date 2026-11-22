@@ -589,7 +589,7 @@ mod tests {
         // 每行用「绝对行号」派生的伪随机花纹：滚动后同一行还是同一串像素，
         // 但不同行之间没有线性关系（用 (行号*7)%251 这种会混叠，测不出真问题）
         for y in 0..height {
-            let mut seed = (top_row + y) as u32 * 2_654_435_761;
+            let mut seed = ((top_row + y) as u32).wrapping_mul(2_654_435_761);
             for x in 0..width {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let value = (seed >> 24) as u8;
