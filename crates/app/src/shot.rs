@@ -2301,20 +2301,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let saved = SaveDC(dc);
     IntersectClipRect(dc, view.left, view.top, view.right, view.bottom);
 
-    // 图片四周一圈极淡的描边：让「图」和窗口底色分开，知道边界在哪
-    {
-        let (left, top) = (editor.image_left, editor.image_top);
-        let right = left + (editor.base.width as f32 * editor.scale) as i32;
-        let bottom = top + (editor.base.height as f32 * editor.scale) as i32;
-        let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00DA_DDE2);
-        let old = SelectObject(dc, pen as HGDIOBJ);
-        let brush = SelectObject(dc, GetStockObject(5) as HGDIOBJ); // NULL_BRUSH
-        windows_sys::Win32::Graphics::Gdi::Rectangle(dc, left - 1, top - 1, right + 1, bottom + 1);
-        SelectObject(dc, brush);
-        SelectObject(dc, old);
-        DeleteObject(pen as *mut _);
-    }
-
     // 原图只拷一次
     if editor.source.is_none() {
         editor.source = source_dc(&editor.base);
@@ -2399,6 +2385,28 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
 
     SetViewportOrgEx(dc, old_origin.x, old_origin.y, std::ptr::null_mut());
+
+    // 图片四周一圈极淡的描边：让「图」和窗口底色分开，知道边界在哪。
+    // 画在图片边界「里面」并夹进客户区：图片贴着窗口左边/上边时，画外面会被裁掉，
+    // 于是只剩右、下两条边（就是之前那个「只有右边和下边有描边」的 bug）。
+    {
+        let left = editor.image_left.max(0);
+        let top = editor.image_top.max(0);
+        let right = (editor.image_left + (editor.base.width as f32 * editor.scale) as i32)
+            .min(client.right - 1);
+        let bottom = (editor.image_top + (editor.base.height as f32 * editor.scale) as i32)
+            .min(view.bottom.saturating_sub(1));
+        if right > left && bottom > top {
+            let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00DA_DDE2);
+            let old = SelectObject(dc, pen as HGDIOBJ);
+            let brush = SelectObject(dc, GetStockObject(5) as HGDIOBJ); // NULL_BRUSH
+            // 描边画在图片边界的「内侧」1px：图贴着窗口左边/上边时也能看见
+            windows_sys::Win32::Graphics::Gdi::Rectangle(dc, left, top, right - 1, bottom - 1);
+            SelectObject(dc, brush);
+            SelectObject(dc, old);
+            DeleteObject(pen as *mut _);
+        }
+    }
 
     // 工具栏：微信那种一条圆角底栏，纯图标（文字靠 hover 小标签提示）
     editor.buttons.clear();
