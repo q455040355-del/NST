@@ -829,6 +829,24 @@ unsafe fn bits_look_black(bits: *const u8, width: i32, height: i32) -> bool {
     seen > 0 && dark * 100 >= seen * 98
 }
 
+/// 一张 BGRA 图的平均亮度（每 64 个像素采一个）
+fn mean_luma(pixels: &[u8]) -> f32 {
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    let mut index = 0usize;
+    while index + 2 < pixels.len() {
+        let pixel = &pixels[index..index + 3];
+        sum += (pixel[0] as u64 + pixel[1] as u64 + pixel[2] as u64) / 3;
+        count += 1;
+        index += 4 * 64;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum as f32 / count as f32
+    }
+}
+
 impl ScreenGrabber {
     /// `width/height` 是屏幕上的选区大小，`out_w/out_h` 是实际写进 GIF 的尺寸（缩放过）
     fn new(x: i32, y: i32, width: i32, height: i32, out_w: i32, out_h: i32) -> Option<Self> {
@@ -939,6 +957,40 @@ impl ScreenGrabber {
 
     /// 抓一帧到 `out`；如果和 `prev` 一模一样就返回 false，连拷贝都省了。
     /// 返回 false 也可能是抓屏失败——两种情况在录制循环里处理方式相同（这一帧不要）。
+    /// 开录前校验一次：DXGI 到底有没有画面。
+    /// 有些机器（HDR 桌面 / 驱动）DXGI 会一直返回「没变化」+ 全黑缓冲，
+    /// 表现出来就是录出来全黑视频，而日志里连一帧变化都没有。
+    unsafe fn validate_dxgi(&mut self, x: i32, y: i32) -> bool {
+        if self.dxgi.is_none() {
+            return true;
+        }
+        // GDI 当参照物
+        let Some(reference) = crate::shot::capture_rect(x, y, self.crop_w, self.crop_h) else {
+            return true;
+        };
+        let gdi_mean = mean_luma(&reference.pixels);
+        // DXGI 抓一帧看看
+        let mut dxgi_mean = 0.0f32;
+        if let Some(duplicator) = self.dxgi.as_mut() {
+            let stride = (self.crop_w * 4) as usize;
+            if let crate::dxgi::Grabbed::New = duplicator.grab(self.crop_bits, stride) {
+                let len = (self.crop_w * self.crop_h * 4).max(1) as usize;
+                let slice = std::slice::from_raw_parts(self.crop_bits, len);
+                dxgi_mean = mean_luma(slice);
+            }
+        }
+        crate::debug_log(&format!(
+            "rec: DXGI 校验 GDI={gdi_mean:.1} DXGI={dxgi_mean:.1}"
+        ));
+        // GDI 有画面、DXGI 一片黑 -> 直接弃用 DXGI
+        if gdi_mean > 20.0 && dxgi_mean < 12.0 {
+            crate::debug_log("rec: DXGI 取不到画面，改用 GDI 采集");
+            self.dxgi = None;
+            return false;
+        }
+        true
+    }
+
     fn grab_if_changed(&mut self, x: i32, y: i32, prev: &[u8], out: &mut Vec<u8>) -> bool {
         unsafe {
             // 光标状态先取：静态画面时要用它决定能不能整帧跳过
@@ -1137,6 +1189,8 @@ unsafe fn run(
         finish(border, button);
         return;
     };
+    // 开录前先确认 DXGI 真能出画（HDR/驱动问题会让它一直给黑帧）
+    grabber.validate_dxgi(x, y);
 
     // 只拍一帧当动画的底图。以前拍 5 帧是为了算 GIF 的全局调色板——WebP 没有调色板，
     // 多拍的那 4 帧纯粹是白等 160ms、白编 4 次，还可能把深度 4 的队列提前塞满。
