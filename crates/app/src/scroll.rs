@@ -84,6 +84,192 @@ static mut REGION: (i32, i32, i32, i32) = (0, 0, 0, 0);
 
 // ---------------------------------------------------------------- 拼接
 
+
+// ---------------------------------------------------------------- 位移匹配
+//
+// 下面这段是 LightScroll 的匹配器思路（MIT，Copyright (c) 2026 kodaihaoshen-chn，
+// https://github.com/kodaihaoshen-chn/lightscroll ，src/CaptureCore.cs），按我们这边的
+// Bitmap 重写：每行抽 24~96 段灰度做签名、对比度不足的行不参与打分、误差按像素截断
+// 再加坏行惩罚、粗搜一遍再精算一遍，并且**歧义时明确拒绝**而不是瞎猜一个位移。
+
+/// 一帧的行签名：每行若干段灰度 + 这一行「有没有内容」
+struct Signature {
+    columns: usize,
+    pixels: Vec<u8>,
+    active: Vec<bool>,
+}
+
+impl Signature {
+    fn from_bitmap(bitmap: &Bitmap) -> Self {
+        let width = bitmap.width.max(1) as usize;
+        let height = bitmap.height.max(0) as usize;
+        let columns = (width / 3).clamp(24, 96);
+        let mut pixels = vec![0u8; height * columns];
+        let mut active = vec![false; height];
+        for y in 0..height {
+            let row = y * width * 4;
+            let mut lo = 255i32;
+            let mut hi = 0i32;
+            for x in 0..columns {
+                let sx = 3 + x * width.saturating_sub(7) / (columns - 1).max(1);
+                let mut sum = 0i32;
+                for k in -1i32..=1 {
+                    let px = (sx as i32 + k).clamp(0, width as i32 - 1) as usize;
+                    let i = row + px * 4;
+                    let b = bitmap.pixels.get(i).copied().unwrap_or(0) as i32;
+                    let g = bitmap.pixels.get(i + 1).copied().unwrap_or(0) as i32;
+                    let r = bitmap.pixels.get(i + 2).copied().unwrap_or(0) as i32;
+                    sum += (b * 29 + g * 150 + r * 77) >> 8;
+                }
+                let v = (sum / 3).clamp(0, 255) as u8;
+                pixels[y * columns + x] = v;
+                lo = lo.min(v as i32);
+                hi = hi.max(v as i32);
+            }
+            active[y] = hi - lo >= 16;
+        }
+        Self {
+            columns,
+            pixels,
+            active,
+        }
+    }
+
+    fn height(&self) -> i32 {
+        self.active.len() as i32
+    }
+}
+
+/// 这一帧相对上一帧的结论
+enum Motion {
+    /// 没动
+    Same,
+    /// 内容往上走（往下滚）了多少行，误差
+    Down(i32, f32),
+    /// 用户往回滚了（不给位移量，只用来判断"别接内容"）
+    Up(f32),
+    /// 重复行导致两个位移分不清，宁可拒绝
+    Ambiguous(f32),
+    /// 对不上
+    Lost(f32),
+}
+
+/// 两段签名在给定位移下的误差（越小越像）
+fn signature_score(a: &Signature, b: &Signature, shift: i32, samples: i32) -> (f32, i32) {
+    if a.columns != b.columns || a.pixels.len() != b.pixels.len() {
+        return (1000.0, 0);
+    }
+    let height = a.height();
+    let overlap = height - shift.abs();
+    if overlap < 8 {
+        return (1000.0, 0);
+    }
+    let ay = shift.max(0) as usize;
+    let by = (-shift).max(0) as usize;
+    let step = (((overlap - 8) / samples.max(1)).max(1)) as usize;
+    let columns = a.columns;
+    let mut sum = 0f64;
+    let mut bad = 0i32;
+    let mut informative = 0i32;
+    let mut first = -1i32;
+    let mut last = 0i32;
+    let mut y = 4usize;
+    let end = (overlap - 4) as usize;
+    while y < end {
+        let ai = (ay + y) * columns;
+        let bi = (by + y) * columns;
+        if !a.active[ay + y] && !b.active[by + y] {
+            y += step;
+            continue;
+        }
+        let mut diff = 0i64;
+        for x in 0..columns {
+            let d = a.pixels[ai + x] as i64 - b.pixels[bi + x] as i64;
+            diff += d.unsigned_abs().min(60) as i64;
+        }
+        let row = diff as f64 / columns as f64;
+        sum += row;
+        if row > 5.0 {
+            bad += 1;
+        }
+        informative += 1;
+        if first < 0 {
+            first = y as i32;
+        }
+        last = y as i32;
+        y += step;
+    }
+    if informative < 4 || last - first < 40.min(overlap / 3) {
+        return (1000.0, informative);
+    }
+    (
+        (sum / informative as f64 + bad as f64 / informative as f64 * 2.0) as f32,
+        informative,
+    )
+}
+
+/// 判断这一帧相对上一帧滚了没有、往哪滚、滚了多少
+fn find_motion(a: &Signature, b: &Signature) -> Motion {
+    if a.columns != b.columns || a.pixels.len() != b.pixels.len() {
+        return Motion::Lost(1000.0);
+    }
+    let (same, _) = signature_score(a, b, 0, 100);
+    if same < 0.55 {
+        return Motion::Same;
+    }
+    // 整片空白的两帧：签名全是同一个值，直接当没动
+    if same >= 1000.0 {
+        let mut diff = 0u64;
+        for i in (0..a.pixels.len()).step_by(3) {
+            diff += (a.pixels[i] as i32 - b.pixels[i] as i32).unsigned_abs() as u64;
+        }
+        if diff < (a.pixels.len() / 3) as u64 {
+            return Motion::Same;
+        }
+    }
+    let height = a.height();
+    let maximum = height - 100.max(height / 4);
+    if maximum <= 0 {
+        return Motion::Lost(1000.0);
+    }
+    let mut scores = vec![1000f32; (maximum + 1) as usize];
+    let mut best = 1000f32;
+    let mut displacement = 0;
+    for d in 1..=maximum {
+        let (error, _) = signature_score(a, b, d, 64);
+        scores[d as usize] = error;
+        if error < best {
+            best = error;
+            displacement = d;
+        }
+    }
+    if best < 3.2 && best + 0.35 < same {
+        let mut alternative = 1000f32;
+        for d in 1..=maximum {
+            if (d - displacement).abs() > 4 {
+                alternative = alternative.min(scores[d as usize]);
+            }
+        }
+        // 重复行：两个位移一样像，就不猜
+        if alternative < best + 0.65 {
+            return Motion::Ambiguous(best);
+        }
+        let (precise, _) = signature_score(a, b, displacement, 180);
+        if precise < 3.2 {
+            return Motion::Down(displacement, precise);
+        }
+    }
+    let mut reverse = 1000f32;
+    for d in 1..=maximum {
+        let (error, _) = signature_score(a, b, -d, 40);
+        reverse = reverse.min(error);
+    }
+    if reverse < 2.2 && reverse + 0.5 < same {
+        return Motion::Up(reverse);
+    }
+    Motion::Lost(best)
+}
+
 fn row_sig(bitmap: &Bitmap, row: i32) -> [u8; SIG] {
     let mut out = [0u8; SIG];
     let width = bitmap.width.max(1);
@@ -182,6 +368,8 @@ pub struct Stitcher {
     /// 有了它才知道「这一帧看到的内容有多少是新的」：往下滚越过长图底部才多出新行，
     /// 往上滚越过长图顶部才多出新行；中间那段来回滚都是已经拼过的，不能再接一遍。
     offset: i32,
+    /// 上一帧的签名（和 prev 配套：省得每帧都重算上一帧的签名）
+    prev_signature: Option<Signature>,
     /// 累计统计（收尾时打一条日志）
     pub stats: StitchStats,
 }
@@ -194,6 +382,7 @@ impl Stitcher {
         let sigs = (0..first.height).map(|y| row_sig(&first, y)).collect();
         // 首帧本身就是「上一帧」，这样第一次 push 就能算位移
         let prev = Some(first.clone());
+        let prev_signature = Some(Signature::from_bitmap(&first));
         Self {
             width,
             frame_h,
@@ -203,6 +392,7 @@ impl Stitcher {
             last_best: None,
             prev,
             offset: 0,
+            prev_signature,
             stats: StitchStats::default(),
         }
     }
@@ -217,71 +407,6 @@ impl Stitcher {
 
     pub fn full(&self) -> bool {
         self.image.height >= self.max_rows
-    }
-
-    /// 算当前帧相对上一帧的位移：正数 = 内容往上走（往下滚），负数 = 往上滚。
-    fn signed_shift(&self, prev: &Bitmap, frame: &Bitmap, fresh: &[[u8; SIG]]) -> Option<(i32, f32)> {
-        let prev_sigs: Vec<[u8; SIG]> = (0..prev.height).map(|y| row_sig(prev, y)).collect();
-        let compare_h = frame.height.min(prev.height);
-        if compare_h < 32 {
-            return None;
-        }
-        // 完全没动（帧间差极小）直接判定为没滚动
-        let still = self.mismatch_prev(prev, 0, frame, 0, compare_h);
-        if still < 0.02 {
-            return Some((0, still));
-        }
-        let max_shift = compare_h - 8;
-        let min_shift = 6;
-
-        let mut candidates: Vec<(f32, i32)> = Vec::new();
-        for raw in min_shift..=max_shift {
-            let rows = (compare_h - raw) as usize;
-            if rows < 16 {
-                continue;
-            }
-            let shift = raw as usize;
-            let down = correlation(&prev_sigs[shift..shift + rows], &fresh[..rows], rows as i32);
-            if down > 0.5 {
-                candidates.push((down, raw));
-            }
-            let up = correlation(&prev_sigs[..rows], &fresh[shift..shift + rows], rows as i32);
-            if up > 0.5 {
-                candidates.push((up, -raw));
-            }
-        }
-        if candidates.is_empty() {
-            return None;
-        }
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(10);
-
-        let mut scored: Vec<(f32, i32)> = candidates
-            .iter()
-            .map(|(_, shift)| {
-                let shift = *shift;
-                let rows = compare_h - shift.abs();
-                let ratio = if shift >= 0 {
-                    // 往下滚：上一帧 shift 之后 对上 当前帧开头
-                    self.mismatch_prev(prev, prev.height - rows, frame, 0, rows)
-                } else {
-                    self.mismatch_prev(prev, 0, frame, -shift, rows)
-                };
-                (ratio, shift)
-            })
-            .collect();
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (best_ratio, best_shift) = scored[0];
-        let second = scored
-            .iter()
-            .filter(|(_, shift)| (*shift - best_shift).abs() > 8)
-            .map(|(ratio, _)| *ratio)
-            .next()
-            .unwrap_or(1.0);
-        if best_ratio > 0.08 || second < best_ratio * 1.3 {
-            return None;
-        }
-        Some((best_shift, best_ratio))
     }
 
     /// 两张图之间比「明显不一样」的像素占比
@@ -336,35 +461,44 @@ impl Stitcher {
 
     pub fn push(&mut self, frame: Bitmap) -> Pushed {
         self.stats.frames += 1;
-        if frame.width != self.width {
+        if frame.width != self.width || frame.height < 24 {
             self.stats.lost += 1;
             return Pushed::Lost;
         }
-        if frame.height < 24 {
-            self.stats.lost += 1;
-            return Pushed::Lost;
-        }
+        let signature = Signature::from_bitmap(&frame);
         let fresh: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(&frame, y)).collect();
 
-        // 和上一帧比位移：方向、滚了多少都是算出来的，不用猜
-        let shift = match self.prev.as_ref() {
-            Some(prev) => self.signed_shift(prev, &frame, &fresh),
-            None => None,
+        // 1) 先看这一帧相对上一帧有没有动、往哪动、动了多少
+        let motion = self
+            .prev_signature
+            .as_ref()
+            .map(|previous| find_motion(previous, &signature));
+        let motion_error = match &motion {
+            Some(Motion::Down(_, error))
+            | Some(Motion::Up(error))
+            | Some(Motion::Ambiguous(error))
+            | Some(Motion::Lost(error)) => Some(*error),
+            _ => None,
         };
-        if let Some((value, ratio)) = shift {
-            self.last_best = Some((value.abs(), (ratio * 1000.0) as u32));
-        }
-        // 完全没动：省掉下面那次「去长图里找位置」的开销
-        if let Some((0, _)) = shift {
+
+        // 没动：直接收工（省掉下面找位置的功夫）
+        if matches!(motion, Some(Motion::Same)) {
             self.prev = Some(frame);
+            self.prev_signature = Some(signature);
             self.stats.unchanged += 1;
             return Pushed::Unchanged;
         }
 
-        // 先按相邻帧算「这一帧顶端该落在长图第几行」，再去长图里核对；
-        // 相邻帧对不上（滚太快/掉帧）或者两者差太多，就用长图里的绝对位置兜底。
-        let guess = shift.map(|(value, _)| self.offset + value);
-        let top = match (guess, self.anchor_top(&frame, &fresh)) {
+        // 2) 按位移量算出「这一帧顶端应该在长图第几行」，再去长图里核对
+        let guess = match &motion {
+            Some(Motion::Down(shift, ratio)) => {
+                self.last_best = Some((*shift, (ratio * 1000.0) as u32));
+                Some(self.offset + shift)
+            }
+            _ => None,
+        };
+        let anchored = self.anchor_top(&frame, &fresh);
+        let top = match (guess, anchored) {
             (Some(guess), Some((anchor, ratio))) => {
                 if (anchor - guess).abs() <= 6 || ratio <= 0.02 {
                     anchor
@@ -378,12 +512,31 @@ impl Stitcher {
                 anchor
             }
             (None, None) => {
-                self.last_best = None;
                 self.prev = Some(frame);
+                self.prev_signature = Some(signature);
+                match &motion {
+                    // 往回滚但定位不了：保持锚点就行，不算丢帧（用户回滚找重叠是正常操作）
+                    Some(Motion::Up(_)) => {
+                        self.stats.unchanged += 1;
+                        return Pushed::Unchanged;
+                    }
+                    // 内容重复（同一段出现两次），两个位移一样像：不猜，等下一帧
+                    Some(Motion::Ambiguous(_)) => {
+                        self.last_best =
+                            motion_error.map(|error| (0, (error * 1000.0) as u32));
+                        crate::debug_log("scroll: 位移有歧义（内容重复），这一帧不接");
+                    }
+                    Some(Motion::Lost(_)) => {
+                        self.last_best =
+                            motion_error.map(|error| (0, (error * 1000.0) as u32));
+                    }
+                    _ => self.last_best = None,
+                }
                 self.stats.lost += 1;
                 return Pushed::Lost;
             }
         };
+
         let outcome = self.apply_top(&frame, top);
         match outcome {
             Pushed::Appended => self.stats.appended += 1,
@@ -393,6 +546,7 @@ impl Stitcher {
         // 这一帧成为新的「上一帧」，下次跟它比（所有权转移，不拷贝）
         let frame_height = frame.height;
         self.prev = Some(frame);
+        self.prev_signature = Some(signature);
         if matches!(outcome, Pushed::Appended) {
             self.frame_h = frame_height;
         }
@@ -401,54 +555,86 @@ impl Stitcher {
 
     /// 在已经拼好的长图里找「这一帧的顶端落在第几行」。
     ///
-    /// 相邻两帧对不上时（滚太快、中间掉帧）光靠位移量是补不回来的：那一帧只能丢掉，
-    /// 后面的内容也跟着错位。拿这一帧的头几行到长图尾部去对，就能算出绝对位置，
-    /// 大半内容还能救回来，也不至于把已经拼好的行再拼一遍。
+    /// 正数 = 落在长图里；负数 = 落在长图**上面**（往上滚越过了起点，那几行是新内容）。
+    /// 只在两处找：长图顶部一带（含负数，处理往上越顶）和底部一带（正常往下滚）。
     fn anchor_top(&self, frame: &Bitmap, frame_sigs: &[[u8; SIG]]) -> Option<(i32, f32)> {
         const PROBE: i32 = 48;
-        let reach = (frame.height * 2).max(PROBE);
-        let low = (self.image.height - reach).max(0);
-        let high = self.image.height - 8;
-        if high <= low {
+        if self.image.height < 16 || frame.height < 24 {
             return None;
         }
+        let reach = (frame.height * 2).max(PROBE);
         let mut best: Option<(f32, i32)> = None;
         let mut runner_up = 1.0f32;
-        let mut top = low;
-        while top <= high {
-            let rows = PROBE.min(self.image.height - top).min(frame.height);
-            if rows < 12 {
-                break;
+
+        let consider = |top: i32, best: &mut Option<(f32, i32)>, runner_up: &mut f32| {
+            let (image_row, frame_row, rows) = if top >= 0 {
+                (
+                    top,
+                    0,
+                    PROBE.min(self.image.height - top).min(frame.height),
+                )
+            } else {
+                (0, -top, PROBE.min(self.image.height).min(frame.height + top))
+            };
+            if rows < 12
+                || frame_row < 0
+                || image_row < 0
+                || frame_row + rows > frame.height
+                || image_row + rows > self.image.height
+            {
+                return;
             }
             let corr = correlation(
-                &self.sigs[top as usize..(top + rows) as usize],
-                &frame_sigs[..rows as usize],
+                &self.sigs[image_row as usize..(image_row + rows) as usize],
+                &frame_sigs[frame_row as usize..(frame_row + rows) as usize],
                 rows,
             );
-            if corr > 0.75 {
-                let ratio = self.mismatch_prev(&self.image, top, frame, 0, rows);
-                if ratio < 0.06 {
-                    match best {
-                        Some((best_ratio, best_top)) if ratio < best_ratio => {
-                            if (top - best_top).abs() > 16 {
-                                runner_up = runner_up.min(best_ratio);
-                            }
-                            best = Some((ratio, top));
-                        }
-                        Some((best_ratio, best_top)) => {
-                            if (top - best_top).abs() > 16 {
-                                runner_up = runner_up.min(ratio);
-                                let _ = best_ratio;
-                            }
-                        }
-                        None => best = Some((ratio, top)),
+            if corr <= 0.75 {
+                return;
+            }
+            let ratio = self.mismatch_prev(&self.image, image_row, frame, frame_row, rows);
+            if ratio >= 0.06 {
+                return;
+            }
+            match *best {
+                Some((best_ratio, best_top)) if ratio < best_ratio => {
+                    if (top - best_top).abs() > 16 {
+                        *runner_up = runner_up.min(best_ratio);
+                    }
+                    *best = Some((ratio, top));
+                }
+                Some((_, best_top)) => {
+                    if (top - best_top).abs() > 16 {
+                        *runner_up = runner_up.min(ratio);
                     }
                 }
+                None => *best = Some((ratio, top)),
             }
-            top += 2;
+        };
+
+        // 顶部一带：负数区间处理「往上滚越过起点」
+        let mut top = -((frame.height - PROBE).max(0));
+        let top_high = reach.min(self.image.height - 8);
+        while top <= top_high {
+            consider(top, &mut best, &mut runner_up);
+            top += 1;
+        }
+        // 底部一带：正常往下滚，新内容接在长图末尾
+        let bottom_low = (self.image.height - reach).max(0);
+        let bottom_high = self.image.height - 8;
+        let mut top = bottom_low;
+        while top <= bottom_high {
+            consider(top, &mut best, &mut runner_up);
+            top += 1;
+        }
+
+        // 步长是 2，奇数位移可能正好被跳过：对着目前最好的位置再核对左右各一格
+        if let Some((_, center)) = best {
+            consider(center - 1, &mut best, &mut runner_up);
+            consider(center + 1, &mut best, &mut runner_up);
         }
         let (ratio, top) = best?;
-        // 内容重复（同一段话出现两次）时会撞上两个一样好的位置，宁可放弃
+        // 内容重复时会撞上两个一样好的位置：宁可不接，也不硬塞
         if ratio > 0.01 && runner_up < ratio * 1.5 {
             return None;
         }
@@ -1893,6 +2079,62 @@ mod tests {
         assert_eq!(slow, (MIN_SCROLL_INTERVAL_US * 3 + 75_000) / 4);
     }
 
+    /// 整片一样的画面：签名没有信息量，必须判成「没动」，不能当成滚动去拼
+    #[test]
+    fn blank_frames_are_unchanged() {
+        let blank = Bitmap {
+            width: 400,
+            height: 300,
+            pixels: vec![246; (400 * 300 * 4) as usize],
+        };
+        let a = Signature::from_bitmap(&blank);
+        let b = Signature::from_bitmap(&blank);
+        assert!(matches!(find_motion(&a, &b), Motion::Same), "空白页不该被判成滚动");
+    }
+
+    /// 周期性内容（同一行反复出现）：多个位移一样像，必须拒绝而不是猜一个
+    #[test]
+    fn repeating_rows_are_ambiguous_not_guessed() {
+        let period = 40;
+        let doc = |top: i32| {
+            let mut bitmap = Bitmap {
+                width: 400,
+                height: 300,
+                pixels: vec![255; (400 * 300 * 4) as usize],
+            };
+            for y in 0..300 {
+                let phase = (top + y) % period;
+                let shade = 60 + (phase * 4) as u8;
+                for x in 0..400 {
+                    // 只在固定的一段里落墨，形成周期 40 的重复行
+                    if (30..170).contains(&(x + phase)) {
+                        let offset = ((y * 400 + x) * 4) as usize;
+                        bitmap.pixels[offset] = shade;
+                        bitmap.pixels[offset + 1] = shade;
+                        bitmap.pixels[offset + 2] = shade;
+                    }
+                }
+            }
+            bitmap
+        };
+        let a = Signature::from_bitmap(&doc(0));
+        // 位移 13：和 13+40k 全都一样像
+        let b = Signature::from_bitmap(&doc(13));
+        match find_motion(&a, &b) {
+            Motion::Ambiguous(_) => {}
+            other => panic!(
+                "周期性内容应该判成歧义，实际是 {}",
+                match other {
+                    Motion::Same => "same".to_string(),
+                    Motion::Down(d, e) => format!("down({d},{e})"),
+                    Motion::Up(e) => format!("up({e})"),
+                    Motion::Lost(e) => format!("lost({e})"),
+                    Motion::Ambiguous(e) => format!("ambiguous({e})"),
+                }
+            ),
+        }
+    }
+
     #[test]
     fn stats_count_what_happened_to_each_frame() {
         let width = 400;
@@ -1917,3 +2159,7 @@ mod tests {
         assert_eq!(stitcher.stats.gap_rows, 0);
     }
 }
+
+
+
+
