@@ -1195,6 +1195,8 @@ enum Tool {
     /// 直线
     Line,
     Pen,
+    /// 高亮笔：半透明黄，压在字上面还能看清
+    Marker,
     /// 序号：点一下放一个自动递增的圆标
     Numbered,
     /// 橡皮：点哪条删哪条
@@ -1230,6 +1232,10 @@ enum Shape {
     Line {
         a: (i32, i32),
         b: (i32, i32),
+        stroke: u8,
+    },
+    Marker {
+        points: Vec<(i32, i32)>,
         stroke: u8,
     },
     Numbered {
@@ -1371,6 +1377,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::Square) => "正方形",
         Action::Tool(Tool::Ellipse) => "椭圆",
         Action::Tool(Tool::Line) => "直线",
+        Action::Tool(Tool::Marker) => "高亮",
         Action::Tool(Tool::Numbered) => "序号",
         Action::Tool(Tool::Eraser) => "橡皮",
         Action::Tool(Tool::Pen) => "画笔",
@@ -1515,6 +1522,23 @@ fn shape_bounds(shape: &Shape) -> (i32, i32, i32, i32) {
         | Shape::Ellipse { a, b, .. }
         | Shape::Line { a, b, .. }
         | Shape::Mosaic { a, b, .. } => (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
+        Shape::Marker { points, .. } => {
+            let mut left = i32::MAX;
+            let mut top = i32::MAX;
+            let mut right = i32::MIN;
+            let mut bottom = i32::MIN;
+            for (x, y) in points {
+                left = left.min(*x);
+                top = top.min(*y);
+                right = right.max(*x);
+                bottom = bottom.max(*y);
+            }
+            if points.is_empty() {
+                (0, 0, 0, 0)
+            } else {
+                (left, top, right, bottom)
+            }
+        }
         Shape::Numbered { at, .. } => (at.0 - 12, at.1 - 12, at.0 + 12, at.1 + 12),
         Shape::Text { at, .. } => (at.0, at.1, at.0 + 80, at.1 + 24),
         Shape::Pen { points, .. } => {
@@ -1560,6 +1584,125 @@ fn draw_line(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
         SelectObject(dc, old);
         DeleteObject(pen as *mut _);
     }
+}
+
+/// 高亮笔：把笔迹铺进一张自带 alpha 的图层，再 AlphaBlend 上去。
+/// 这样不管画到后台缓冲还是导出用的 composite 上，都能透出下面的字。
+unsafe fn draw_marker(dc: HDC, editor: &Editor, points: &[(i32, i32)], stroke: u8) {
+    if points.len() < 2 {
+        return;
+    }
+    let scale = editor.scale;
+    let pen_width = ((9.0 * STROKE_FACTORS[stroke.min(2) as usize]).round() * scale)
+        .max(4.0) as i32;
+    let pts: Vec<POINT> = points
+        .iter()
+        .map(|p| {
+            let (x, y) = scaled(*p, scale);
+            POINT {
+                x: x + editor.image_left,
+                y: y + editor.image_top,
+            }
+        })
+        .collect();
+
+    let half = pen_width / 2 + 1;
+    let mut left = i32::MAX;
+    let mut top = i32::MAX;
+    let mut right = i32::MIN;
+    let mut bottom = i32::MIN;
+    for p in &pts {
+        left = left.min(p.x - half);
+        top = top.min(p.y - half);
+        right = right.max(p.x + half);
+        bottom = bottom.max(p.y + half);
+    }
+    if right - left < 1 || bottom - top < 1 {
+        return;
+    }
+    let width = right - left;
+    let height = bottom - top;
+
+    // 掩码：白线画在黑色上
+    let (mask_dc, mask_bmp, mask_bits) = make_dib(width, height);
+    if mask_dc.is_null() || mask_bits.is_null() {
+        if !mask_bmp.is_null() {
+            DeleteObject(mask_bmp as *mut _);
+        }
+        if !mask_dc.is_null() {
+            DeleteDC(mask_dc);
+        }
+        return;
+    }
+    let black = CreateSolidBrush(0);
+    let area = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    FillRect(mask_dc, &area, black);
+    DeleteObject(black as *mut _);
+    let white = CreatePen(0, pen_width, 0x00FF_FFFF);
+    let old_pen = SelectObject(mask_dc, white as HGDIOBJ);
+    let shifted: Vec<POINT> = pts
+        .iter()
+        .map(|p| POINT {
+            x: p.x - left,
+            y: p.y - top,
+        })
+        .collect();
+    Polyline(mask_dc, shifted.as_ptr(), shifted.len() as i32);
+    SelectObject(mask_dc, old_pen);
+    DeleteObject(white as *mut _);
+
+    // 图层：掩码处填预乘过的黄色，alpha 约 42%
+    const ALPHA: u32 = 108;
+    let (layer_dc, layer_bmp, layer_bits) = make_dib(width, height);
+    if layer_dc.is_null() || layer_bits.is_null() {
+        if !layer_bmp.is_null() {
+            DeleteObject(layer_bmp as *mut _);
+        }
+        if !layer_dc.is_null() {
+            DeleteDC(layer_dc);
+        }
+        DeleteObject(mask_bmp as *mut _);
+        DeleteDC(mask_dc);
+        return;
+    }
+    std::ptr::write_bytes(layer_bits, 0, (width * height * 4) as usize);
+    // 预乘：0xFF/0xE6/0x66 的黄 × alpha/255
+    let pre = |v: u32| ((v * ALPHA) / 255) as u8;
+    // BGR 顺序：黄是 R=0xFF G=0xE6 B=0x66
+    let (b, g, r) = (pre(0x66), pre(0xE6), pre(0xFF));
+    for y in 0..height {
+        for x in 0..width {
+            let m = *mask_bits.add(((y * width + x) * 4) as usize);
+            if m == 0 {
+                continue;
+            }
+            let pixel = layer_bits.add(((y * width + x) * 4) as usize);
+            *pixel = b;
+            *pixel.add(1) = g;
+            *pixel.add(2) = r;
+            *pixel.add(3) = ALPHA.min(m as u32) as u8;
+        }
+    }
+
+    let blend = windows_sys::Win32::Graphics::Gdi::BLENDFUNCTION {
+        BlendOp: windows_sys::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: windows_sys::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
+    };
+    windows_sys::Win32::Graphics::Gdi::AlphaBlend(
+        dc, left, top, width, height, layer_dc, 0, 0, width, height, blend,
+    );
+
+    DeleteObject(layer_bmp as *mut _);
+    DeleteDC(layer_dc);
+    DeleteObject(mask_bmp as *mut _);
+    DeleteDC(mask_dc);
 }
 
 /// 序号：红底白字的圆标，圆心就是点下去的位置
@@ -1777,6 +1920,7 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::Square => "拖出正方形（宽高始终一样）· Esc 取消",
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
         Tool::Line => "拖一条直线 · Esc 取消",
+        Tool::Marker => "按住拖，高亮一块（半透明）",
         Tool::Numbered => "点一下放一个序号（自动递增）",
         Tool::Eraser => "点一下删掉那条标注",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
@@ -1803,6 +1947,9 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
             Shape::Line { a, b, stroke } => {
                 draw_line(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
+            Shape::Marker { points, stroke } => unsafe {
+                draw_marker(dc, editor, points, *stroke)
+            },
             Shape::Numbered { at, n } => draw_numbered(dc, *at, *n, scale),
             Shape::Pen { points, stroke } => {
                 draw_pen(dc, points, stroke_width(scale, *stroke), scale)
@@ -2022,6 +2169,9 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     if editor.tool == Tool::Pen && editor.pen_points.len() > 1 {
         draw_pen(dc, &editor.pen_points, width, editor.scale);
     }
+    if editor.tool == Tool::Marker && editor.pen_points.len() > 1 {
+        draw_marker(dc, editor, &editor.pen_points, editor.stroke);
+    }
 
     // 正在输入文字：把位置框出来，免得白底白字看不见输入框在哪
     if let Some(text) = &editor.text {
@@ -2062,6 +2212,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Tool(Tool::Line), false),
         (Action::Tool(Tool::Arrow), false),
         (Action::Tool(Tool::Pen), false),
+        (Action::Tool(Tool::Marker), false),
         (Action::Tool(Tool::Numbered), false),
         (Action::Tool(Tool::Mosaic), false),
         (Action::Tool(Tool::Eraser), false),
@@ -2768,6 +2919,10 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
                         icon_dot(dc, cx + r - dot, ly - dot, cx + r + dot, ly + dot, color);
                     }
                 }
+            }
+            // 一条粗斜笔迹（和细线区分开）
+            Action::Tool(Tool::Marker) => {
+                icon_line(dc, cx - r, cy + r - s(2.0), cx + r, cy - r + s(2.0), s(4.0).max(2), color);
             }
             // ╱ 一条斜线
             Action::Tool(Tool::Line) => {
@@ -3793,7 +3948,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
 
-            if editor.tool == Tool::Pen {
+            if matches!(editor.tool, Tool::Pen | Tool::Marker) {
                 if let Some(last) = editor.pen_points.last() {
                     if (last.0 - point.0).abs() + (last.1 - point.1).abs() >= 2 {
                         editor.pen_points.push(point);
@@ -3867,13 +4022,21 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
 
-            if editor.tool == Tool::Pen {
+            if matches!(editor.tool, Tool::Pen | Tool::Marker) {
                 if editor.pen_points.len() > 1 {
                     let points = std::mem::take(&mut editor.pen_points);
-                    editor.push_shape(Shape::Pen {
-                        points,
-                        stroke: editor.stroke,
-                    });
+                    let shape = if editor.tool == Tool::Marker {
+                        Shape::Marker {
+                            points,
+                            stroke: editor.stroke,
+                        }
+                    } else {
+                        Shape::Pen {
+                            points,
+                            stroke: editor.stroke,
+                        }
+                    };
+                    editor.push_shape(shape);
                 } else {
                     editor.pen_points.clear();
                 }
