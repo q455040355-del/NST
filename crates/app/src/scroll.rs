@@ -315,27 +315,38 @@ impl Stitcher {
             Some(prev) => self.signed_shift(prev, &frame, &fresh),
             None => None,
         };
-        let outcome = match shift {
-            None => {
-                self.last_best = None;
-                Pushed::Lost
-            }
-            Some((shift, ratio)) => {
-                self.last_best = Some((shift.abs(), (ratio * 1000.0) as u32));
-                if shift == 0 {
-                    Pushed::Unchanged
+        if let Some((value, ratio)) = shift {
+            self.last_best = Some((value.abs(), (ratio * 1000.0) as u32));
+        }
+        // 完全没动：省掉下面那次「去长图里找位置」的开销
+        if let Some((0, _)) = shift {
+            self.prev = Some(frame);
+            return Pushed::Unchanged;
+        }
+
+        // 先按相邻帧算「这一帧顶端该落在长图第几行」，再去长图里核对；
+        // 相邻帧对不上（滚太快/掉帧）或者两者差太多，就用长图里的绝对位置兜底。
+        let guess = shift.map(|(value, _)| self.offset + value);
+        let top = match (guess, self.anchor_top(&frame, &fresh)) {
+            (Some(guess), Some((anchor, ratio))) => {
+                if (anchor - guess).abs() <= 6 || ratio <= 0.02 {
+                    anchor
                 } else {
-                    let moved = shift.abs().min(frame.height);
-                    if moved < 2 {
-                        Pushed::Unchanged
-                    } else if shift > 0 {
-                        self.scroll_down(&frame, moved)
-                    } else {
-                        self.scroll_up(&frame, moved)
-                    }
+                    guess
                 }
             }
+            (Some(guess), None) => guess,
+            (None, Some((anchor, ratio))) => {
+                self.last_best = Some((anchor.abs(), (ratio * 1000.0) as u32));
+                anchor
+            }
+            (None, None) => {
+                self.last_best = None;
+                self.prev = Some(frame);
+                return Pushed::Lost;
+            }
         };
+        let outcome = self.apply_top(&frame, top);
         // 这一帧成为新的「上一帧」，下次跟它比（所有权转移，不拷贝）
         let frame_height = frame.height;
         self.prev = Some(frame);
@@ -345,30 +356,83 @@ impl Stitcher {
         outcome
     }
 
-    /// 往下滚：显示区在长图里下移 moved 行。
-    /// 只有越过长图底部的那几行是新内容；如果这一下只是从上面滚回来、
-    /// 底部还没超出已经拼好的部分，那就一行都不用接（以前会整段再接一遍，于是重复）。
-    fn scroll_down(&mut self, frame: &Bitmap, moved: i32) -> Pushed {
-        self.offset += moved;
-        let need = self.offset + frame.height - self.image.height;
+    /// 在已经拼好的长图里找「这一帧的顶端落在第几行」。
+    ///
+    /// 相邻两帧对不上时（滚太快、中间掉帧）光靠位移量是补不回来的：那一帧只能丢掉，
+    /// 后面的内容也跟着错位。拿这一帧的头几行到长图尾部去对，就能算出绝对位置，
+    /// 大半内容还能救回来，也不至于把已经拼好的行再拼一遍。
+    fn anchor_top(&self, frame: &Bitmap, frame_sigs: &[[u8; SIG]]) -> Option<(i32, f32)> {
+        const PROBE: i32 = 48;
+        let reach = (frame.height * 2).max(PROBE);
+        let low = (self.image.height - reach).max(0);
+        let high = self.image.height - 8;
+        if high <= low {
+            return None;
+        }
+        let mut best: Option<(f32, i32)> = None;
+        let mut runner_up = 1.0f32;
+        let mut top = low;
+        while top <= high {
+            let rows = PROBE.min(self.image.height - top).min(frame.height);
+            if rows < 12 {
+                break;
+            }
+            let corr = correlation(
+                &self.sigs[top as usize..(top + rows) as usize],
+                &frame_sigs[..rows as usize],
+                rows,
+            );
+            if corr > 0.75 {
+                let ratio = self.mismatch_prev(&self.image, top, frame, 0, rows);
+                if ratio < 0.06 {
+                    match best {
+                        Some((best_ratio, best_top)) if ratio < best_ratio => {
+                            if (top - best_top).abs() > 16 {
+                                runner_up = runner_up.min(best_ratio);
+                            }
+                            best = Some((ratio, top));
+                        }
+                        Some((best_ratio, best_top)) => {
+                            if (top - best_top).abs() > 16 {
+                                runner_up = runner_up.min(ratio);
+                                let _ = best_ratio;
+                            }
+                        }
+                        None => best = Some((ratio, top)),
+                    }
+                }
+            }
+            top += 2;
+        }
+        let (ratio, top) = best?;
+        // 内容重复（同一段话出现两次）时会撞上两个一样好的位置，宁可放弃
+        if ratio > 0.01 && runner_up < ratio * 1.5 {
+            return None;
+        }
+        Some((top, ratio))
+    }
+
+    /// 把这一帧按「顶端落在长图第 top 行」拼进去
+    fn apply_top(&mut self, frame: &Bitmap, top: i32) -> Pushed {
+        if top < 0 {
+            let need = (-top).min(frame.height);
+            self.offset = 0;
+            return self.prepend_rows_count(frame, need);
+        }
+        self.offset = top;
+        let need = top + frame.height - self.image.height;
         if need <= 0 {
             return Pushed::Unchanged;
         }
+        // 帧和长图之间有空档：中间那几行一帧都没抓到（滚太快）。记一笔，方便排查漏内容
+        if top > self.image.height {
+            crate::debug_log(&format!(
+                "scroll: 漏了 {} 行（两帧之间没重叠，滚太快）",
+                top - self.image.height
+            ));
+        }
         let need = need.min(frame.height);
         self.append_rows_from(frame, frame.height - need)
-    }
-
-    /// 往上滚：显示区在长图里上移 moved 行。
-    /// 只有越过长图顶部的那几行是新内容；没越过去就说明这一段早就拼过了，
-    /// 直接丢掉（以前是整段往前面塞，所以「往下滚再往上滚」会出现两份内容）。
-    fn scroll_up(&mut self, frame: &Bitmap, moved: i32) -> Pushed {
-        self.offset -= moved;
-        if self.offset >= 0 {
-            return Pushed::Unchanged;
-        }
-        let need = (-self.offset).min(frame.height);
-        self.offset = 0;
-        self.prepend_rows_count(frame, need)
     }
 
     /// 把这一帧的 from_row 之后的行接在长图末尾
@@ -1467,6 +1531,70 @@ mod tests {
             assert_eq!(stitcher.image().pixels, expect, "滚到 {top} 时内容重复/错行");
         }
         assert_eq!(stitcher.height(), 1150);
+    }
+
+    #[test]
+    fn recovers_position_from_image_when_previous_frame_is_unusable() {
+        // 中间掉了一帧：没有「上一帧」可比位移，只能去长图里对位置，把内容捞回来
+        let width = 500;
+        let window = 600;
+        let doc = text_like(width, 2400, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        assert!(matches!(stitcher.push(crop(300)), Pushed::Appended));
+        assert_eq!(stitcher.height(), 900);
+
+        // 上一帧没了：位移算不出来，但这帧其实和长图有 300 行重叠
+        stitcher.prev = None;
+        assert!(
+            matches!(stitcher.push(crop(600)), Pushed::Appended),
+            "应该靠长图把位置找回来"
+        );
+        assert_eq!(stitcher.height(), 1200);
+        let expect = &doc.pixels[..(1200 * width * 4) as usize];
+        assert_eq!(stitcher.image().pixels, expect, "掉帧后内容错位/漏行");
+    }
+
+    #[test]
+    fn anchor_finds_row_and_rejects_foreign_frame() {
+        let width = 500;
+        let window = 600;
+        let doc = text_like(width, 2400, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        assert!(matches!(stitcher.push(crop(300)), Pushed::Appended)); // 长图 0..900
+
+        for top in [0, 60, 240, 300] {
+            let frame = crop(top);
+            let sigs: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(&frame, y)).collect();
+            let (found, ratio) = stitcher.anchor_top(&frame, &sigs).expect("应该找得到位置");
+            assert_eq!(found, top, "回找的行号不对");
+            assert!(ratio < 0.02, "差异率太高: {ratio}");
+        }
+
+        // 完全不搭界的一帧：必须拒绝，不能硬塞一个位置
+        let mut foreign = crop(0);
+        for (index, byte) in foreign.pixels.iter_mut().enumerate() {
+            if index % 4 != 3 {
+                *byte = ((index * 37 + 11) % 255) as u8;
+            }
+        }
+        let sigs: Vec<[u8; SIG]> = (0..foreign.height).map(|y| row_sig(&foreign, y)).collect();
+        assert!(stitcher.anchor_top(&foreign, &sigs).is_none(), "不该给无关帧找到位置");
     }
 
     #[test]
