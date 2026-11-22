@@ -14,7 +14,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_LEFT, DT_SINGLELINE, DT_VCENTER, HGDIOBJ, PAINTSTRUCT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassW, WindowFromPoint,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassW, SetForegroundWindow,
+    WindowFromPoint,
     IDC_ARROW, WM_DESTROY, WM_LBUTTONUP, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
@@ -22,7 +23,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_MOUSEWHEEL};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, PostMessageW, SetCursorPos, WM_MOUSEWHEEL};
 
 use crate::shot::{capture_rect, s, Bitmap};
 use crate::theme::wide;
@@ -35,6 +36,8 @@ const CHIP_H: i32 = 58;
 const BORDER_CLASS: &str = "NetSpeedTaskbarRs.ScrollBorder";
 const CHIP_CLASS: &str = "NetSpeedTaskbarRs.ScrollChip";
 const HOTKEY_STOP: i32 = 0x5C01;
+/// 一格滚轮 = 120
+const WHEEL_DELTA: i32 = 120;
 
 /// 每行抽 16 段算一个灰度签名：比整行逐像素稳，滚动时亚像素抖动也认得出
 const SIG: usize = 16;
@@ -80,9 +83,6 @@ fn sig_diff(a: &[u8; SIG], b: &[u8; SIG]) -> u32 {
         .sum()
 }
 
-/// 两行算「同一行」的阈值：16 段平均差 <= 6 灰阶
-const ROW_MATCH: u32 = SIG as u32 * 6;
-
 pub enum Pushed {
     /// 接进去了新内容
     Appended,
@@ -92,6 +92,44 @@ pub enum Pushed {
     Lost,
 }
 
+/// 两段行签名（取前 k 行）的去均值相关系数，每 4 行取一行降开销
+fn correlation(a: &[[u8; SIG]], b: &[[u8; SIG]], k: i32) -> f32 {
+    let mut sa = 0f64;
+    let mut sb = 0f64;
+    let mut saa = 0f64;
+    let mut sbb = 0f64;
+    let mut sab = 0f64;
+    let mut n = 0f64;
+    let mut row = 0usize;
+    for (x, y) in a.iter().zip(b.iter()).take(k as usize) {
+        row += 1;
+        if row % 4 != 0 {
+            continue;
+        }
+        for (p, q) in x.iter().zip(y.iter()) {
+            let (p, q) = (*p as f64, *q as f64);
+            sa += p;
+            sb += q;
+            saa += p * p;
+            sbb += q * q;
+            sab += p * q;
+            n += 1.0;
+        }
+    }
+    if n < 1.0 {
+        return 0.0;
+    }
+    let ma = sa / n;
+    let mb = sb / n;
+    let va = (saa / n - ma * ma).max(0.0);
+    let vb = (sbb / n - mb * mb).max(0.0);
+    if va < 1e-6 || vb < 1e-6 {
+        return 0.0;
+    }
+    let cov = sab / n - ma * mb;
+    (cov / (va.sqrt() * vb.sqrt())) as f32
+}
+
 pub struct Stitcher {
     width: i32,
     frame_h: i32,
@@ -99,6 +137,8 @@ pub struct Stitcher {
     sigs: Vec<[u8; SIG]>,
     /// 长图最多这么多行，超了就收工（省内存）
     max_rows: i32,
+    /// 上一次 push 找到的重叠（行数, 总差异），排查用
+    pub last_best: Option<(i32, u32)>,
 }
 
 impl Stitcher {
@@ -113,6 +153,7 @@ impl Stitcher {
             image: first,
             sigs,
             max_rows,
+            last_best: None,
         }
     }
 
@@ -128,6 +169,41 @@ impl Stitcher {
         self.image.height >= self.max_rows
     }
 
+    /// 重叠区逐像素平均差（隔行隔列采样，够快也够准）
+    fn pixel_diff(&self, frame: &Bitmap, k: i32) -> f32 {
+        let width = self.width;
+        if k <= 0 || k > self.image.height {
+            return 255.0;
+        }
+        let top = self.image.height - k;
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        let mut y = 0;
+        while y < k {
+            let a_row = ((top + y) * width) as usize * 4;
+            let b_row = (y * width) as usize * 4;
+            let mut x = 0;
+            while x < width {
+                let a = a_row + x as usize * 4;
+                let b = b_row + x as usize * 4;
+                if a + 2 < self.image.pixels.len() && b + 2 < frame.pixels.len() {
+                    for c in 0..3 {
+                        let d = self.image.pixels[a + c] as i32 - frame.pixels[b + c] as i32;
+                        sum += d.unsigned_abs() as u64;
+                        count += 1;
+                    }
+                }
+                x += 2;
+            }
+            y += 2;
+        }
+        if count == 0 {
+            255.0
+        } else {
+            sum as f32 / count as f32
+        }
+    }
+
     pub fn push(&mut self, frame: &Bitmap) -> Pushed {
         if frame.width != self.width || frame.height != self.frame_h {
             return Pushed::Lost;
@@ -135,52 +211,51 @@ impl Stitcher {
         let fresh: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(frame, y)).collect();
         let total = self.sigs.len() as i32;
 
-        // 完全没动
+        // 完全没动：和上一帧逐行比，整体几乎一样就算没滚
         if total >= self.frame_h {
             let tail = &self.sigs[(total - self.frame_h) as usize..];
-            if tail
-                .iter()
-                .zip(fresh.iter())
-                .all(|(a, b)| sig_diff(a, b) <= ROW_MATCH / 2)
-            {
+            let mut sum = 0u64;
+            for (a, b) in tail.iter().zip(fresh.iter()) {
+                sum += sig_diff(a, b) as u64;
+            }
+            let rows = self.frame_h as u64 * SIG as u64;
+            if sum * 100 < rows * 6 {
                 return Pushed::Unchanged;
             }
         }
 
-        // 找重叠：不再「从大到小第一个通过就收」，而是取整段差最小的那个
-        // （纯色 / 表格这类重复内容，k 偏大会把旧的重复内容多接一截）
-        let max_overlap = (self.frame_h - 4).min(total);
-        let min_overlap = (self.frame_h / 4).max(24).min(max_overlap);
-        let mut best: Option<(i32, u32)> = None;
-        for k in (min_overlap..=max_overlap).rev() {
+        // 用「去均值相关系数」找重叠：真实截图整行逐像素比对噪音太大
+        // （抗锯齿、字体次像素渲染都会变），相关系数只看形状，稳得多。
+        let max_overlap = (self.frame_h - 8).min(total);
+        let min_overlap = (self.frame_h / 4).max(32).min(max_overlap);
+        // 第一步：相关系数粗筛，留几个候选（重复内容会有好几个峰）
+        let mut candidates: Vec<(f32, i32)> = Vec::new();
+        for k in min_overlap..=max_overlap {
             let tail = &self.sigs[(total - k) as usize..];
-            let mut sum = 0u32;
-            let mut ok = true;
-            for (a, b) in tail.iter().zip(fresh.iter()) {
-                let diff = sig_diff(a, b);
-                if diff > ROW_MATCH {
-                    ok = false;
-                    break;
-                }
-                sum += diff;
-                // 已经不可能比当前最优更好就停
-                if let Some((_, best_sum)) = best {
-                    if sum >= best_sum {
-                        ok = false;
-                        break;
-                    }
-                }
+            let corr = correlation(tail, &fresh, k);
+            if corr > 0.5 {
+                candidates.push((corr, k));
             }
-            if ok {
-                best = Some((k, sum));
+        }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(8);
+
+        // 第二步：候选里用逐像素平均差定夺，挑差异最小的那个
+        let mut best: Option<(f32, i32)> = None;
+        for (_, k) in &candidates {
+            let diff = self.pixel_diff(frame, *k);
+            if best.map_or(true, |(best_diff, _)| diff < best_diff) {
+                best = Some((diff, *k));
             }
         }
 
-        let Some((k, _)) = best else {
+        self.last_best = best.map(|(diff, k)| (k, (diff * 100.0) as u32));
+        let Some((diff, k)) = best else {
             return Pushed::Lost;
         };
-        if k >= self.frame_h {
-            return Pushed::Unchanged;
+        // 平均差超过 8 灰阶就认为对不上（真实截图同一位置一般 0~4）
+        if diff > 8.0 || k >= self.frame_h {
+            return if diff > 8.0 { Pushed::Lost } else { Pushed::Unchanged };
         }
 
         let new_rows = self.frame_h - k;
@@ -190,7 +265,13 @@ impl Stitcher {
             return Pushed::Unchanged;
         }
 
-        // 把 frame 的第 k..k+take 行接上去
+        // 把 frame 的第 k..k+take 行接上去。
+        // 先把像素缓冲扩到新高度 —— 否则后面的行写不进去（之前就是这个 bug：
+        // 高度涨了、像素没长，拼出来的长图其实只有第一帧）
+        let target_len = ((self.image.height + take) * self.width * 4) as usize;
+        if self.image.pixels.len() < target_len {
+            self.image.pixels.resize(target_len, 0);
+        }
         for row in 0..take {
             let src_row = k + row;
             let src = ((src_row * self.width) * 4) as usize;
@@ -331,62 +412,64 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
     };
     let target_usize = WindowFromPoint(center) as usize;
 
+    // 0 = SendInput（真输入），1 = PostMessage（兜底）
+    let mut method = 0u8;
+    // 记住用户原来的鼠标位置，结束后还回去
+    let mut origin_cursor = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut origin_cursor);
+
     std::thread::spawn(move || {
         let mut stitcher = Stitcher::new(first);
-        // 已经滚过的轮数、这一轮里连续「没新内容」的帧数
-        let mut scrolls = 0u32;
-        let mut idle = 0u32;
-        let mut ticks = 0u32;
+        // 每步滚多少：先从一格开始，跨太大就减半，滚不动就加倍
+        let mut delta = -WHEEL_DELTA;
+        let mut idle_rounds = 0u32;
         loop {
             if STOP.load(Ordering::SeqCst) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            let (x, y, w, h) = REGION;
+            let region = REGION;
             let cap_h = capture_height();
-            if let Some(frame) = capture_rect(x, y, w, cap_h) {
-                match stitcher.push(&frame) {
-                    Pushed::Appended => {
-                        idle = 0;
-                        APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
-                        let chip = CHIP.load(Ordering::SeqCst) as HWND;
-                        if !chip.is_null() {
-                            InvalidateRect(chip, std::ptr::null(), 0);
-                        }
-                    }
-                    Pushed::Unchanged | Pushed::Lost => idle += 1,
+            let (cx, cy) = (region.0 + region.2 / 2, region.1 + region.3 / 2);
+            if AUTO.load(Ordering::SeqCst) {
+                match method {
+                    0 => wheel_input(cx, cy, delta),
+                    1 => vscroll_message(target_usize as HWND),
+                    _ => wheel_message(target_usize as HWND, cx, cy, delta),
                 }
             }
+            let grew = burst_push(&mut stitcher, region, cap_h, 7);
             if stitcher.full() {
+                crate::debug_log("scroll: 到长图上限，收工");
                 break;
             }
-            if !AUTO.load(Ordering::SeqCst) {
-                continue;
+            if grew {
+                idle_rounds = 0;
+                delta = (delta * 2).clamp(-WHEEL_DELTA * 3, -40);
+            } else {
+                idle_rounds += 1;
+                // 走完一整步还是没接上：先缩步长；缩到最小还不行就收工
+                if delta >= -30 {
+                    crate::debug_log(&format!("scroll: 步长 {delta} 没接上，收工"));
+                    break;
+                }
+                delta = (delta / 2).max(-30);
+                if idle_rounds >= 8 {
+                    crate::debug_log("scroll: 连续 8 步没有新内容，收工");
+                    break;
+                }
             }
-            // 每 ~6 帧（0.7 秒）滚一次；上一轮滚完一整轮都没有新内容 = 已经到底
-            ticks += 1;
-            if ticks < 6 {
-                continue;
+            if idle_rounds >= 2 && method < 2 {
+                // 这一步没接上：换一种发送方式再试（真输入 -> WM_VSCROLL -> 投消息）
+                method += 1;
+                idle_rounds = 0;
+                crate::debug_log(&format!("scroll: 换发送方式 method={method}"));
             }
-            ticks = 0;
-            if scrolls > 0 && idle >= 6 {
-                break;
-            }
-            let target = target_usize as HWND;
-            if target.is_null() {
-                break;
-            }
-            // 负的 delta = 向下滚
-            let wheel = 0xFF88u32 << 16;
-            PostMessageW(
-                target,
-                WM_MOUSEWHEEL,
-                wheel as WPARAM,
-                (((y + h / 2) << 16 | (x + w / 2)) as isize) as LPARAM,
-            );
-            scrolls += 1;
-            idle = 0;
         }
+        crate::debug_log(&format!(
+            "scroll: 收尾 {}x{}",
+            stitcher.image().width,
+            stitcher.height()
+        ));
         // 收尾：胶囊压在选区里时，先把它收掉，补抓一帧完整区域，
         // 这样最后那条（被胶囊挡住的高度）也不会缺
         if INNER.load(Ordering::SeqCst) {
@@ -400,8 +483,76 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
                 stitcher.push(&frame);
             }
         }
+        SetCursorPos(origin_cursor.x, origin_cursor.y);
         finish(stitcher);
     });
+}
+
+/// 真输入滚轮：先把光标挪进去，再发 MOUSEEVENTF_WHEEL（走系统输入栈，浏览器也吃）
+unsafe fn wheel_input(x: i32, y: i32, delta: i32) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    };
+    SetCursorPos(x, y);
+    let mut input: INPUT = std::mem::zeroed();
+    input.r#type = INPUT_MOUSE;
+    input.Anonymous.mi = MOUSEINPUT {
+        dx: 0,
+        dy: 0,
+        mouseData: delta as u32,
+        dwFlags: MOUSEEVENTF_WHEEL,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+}
+
+/// 兜底二：直接投 WM_VSCROLL(SB_LINEDOWN)，经典 Win32 控件一行一行滚，步长正好够重叠
+unsafe fn vscroll_message(target: HWND) {
+    const WM_VSCROLL: u32 = 0x0115;
+    const SB_LINEDOWN: usize = 1;
+    PostMessageW(target, WM_VSCROLL, SB_LINEDOWN as WPARAM, 0);
+}
+
+/// 兜底：直接往目标窗口投 WM_MOUSEWHEEL（有些窗口只认消息）
+unsafe fn wheel_message(target: HWND, x: i32, y: i32, delta: i32) {
+    let wheel = ((delta as i16 as u16) as u32) << 16;
+    PostMessageW(
+        target,
+        WM_MOUSEWHEEL,
+        wheel as WPARAM,
+        ((y << 16) | (x & 0xFFFF)) as isize as LPARAM,
+    );
+}
+
+/// 滚一次之后连拍几帧：平滑滚动的程序（浏览器）在动画中间会有重叠，
+/// 一直抓不到重叠就是「一步跨太大」，把步长减半再试。
+unsafe fn burst_push(
+    stitcher: &mut Stitcher,
+    region: (i32, i32, i32, i32),
+    cap_h: i32,
+    frames: usize,
+) -> bool {
+    let (x, y, _, _) = region;
+    let w = region.2;
+    let mut appended = false;
+    for _ in 0..frames {
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        if let Some(frame) = capture_rect(x, y, w, cap_h) {
+            if let Pushed::Appended = stitcher.push(&frame) {
+                appended = true;
+                APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
+                let chip = CHIP.load(Ordering::SeqCst) as HWND;
+                if !chip.is_null() {
+                    InvalidateRect(chip, std::ptr::null(), 0);
+                }
+            }
+        }
+    }
+    appended
 }
 
 /// 抓帧高度：胶囊在里面时只抓到它上沿，那一条留给最后补抓
@@ -571,6 +722,78 @@ unsafe fn paint_chip(hwnd: HWND) {
     DeleteObject(font as *mut _);
 }
 
+/// 自测：在给定屏幕区域上跑一遍完整流程（抓帧 + 真输入滚轮 + 拼接），把长图存成 PNG。
+///
+/// 用来在没人盯着屏幕的情况下验证「滚轮真的能滚、重叠真的能拼」：
+///   NST_SCROLL_TEST="x,y,w,h,out.png" netspeed.exe
+pub unsafe fn selftest(spec: &str) -> bool {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let x: i32 = parts[0].trim().parse().unwrap_or(0);
+    let y: i32 = parts[1].trim().parse().unwrap_or(0);
+    let w: i32 = parts[2].trim().parse().unwrap_or(0);
+    let h: i32 = parts[3].trim().parse().unwrap_or(0);
+    let path = parts[4].trim();
+    if w < 32 || h < 32 || path.is_empty() {
+        return false;
+    }
+
+    let center = POINT {
+        x: x + w / 2,
+        y: y + h / 2,
+    };
+    let target = WindowFromPoint(center);
+    let focused = SetForegroundWindow(target);
+    crate::debug_log(&format!(
+        "scroll test: 目标窗口 {target:?} 前台={focused}"
+    ));
+
+    let Some(first) = capture_rect(x, y, w, h) else {
+        return false;
+    };
+    let mut stitcher = Stitcher::new(first);
+    let mut delta = -WHEEL_DELTA;
+    for method in 0..3 {
+        for round in 0..4 {
+            match method {
+                0 => wheel_input(center.x, center.y, delta),
+                1 => vscroll_message(target),
+                _ => wheel_message(target, center.x, center.y, delta),
+            }
+            let grew = burst_push(&mut stitcher, (x, y, w, h), h, 5);
+            if grew {
+                delta = (delta * 2).clamp(-WHEEL_DELTA * 3, -40);
+                crate::debug_log(&format!(
+                    "scroll test: method {method} round {round} 接上 -> {} 行",
+                    stitcher.height()
+                ));
+            } else {
+
+                delta = (delta / 2).max(-30);
+                crate::debug_log(&format!(
+                    "scroll test: method {method} round {round} 没接上 (best={:?})",
+                    stitcher.last_best
+                ));
+            }
+        }
+    }
+
+    let image = stitcher.image();
+    let mut rgba = Vec::with_capacity((image.width * image.height * 4) as usize);
+    for pixel in image.pixels.chunks_exact(4) {
+        rgba.push(pixel[2]);
+        rgba.push(pixel[1]);
+        rgba.push(pixel[0]);
+        rgba.push(255);
+    }
+    match image::RgbaImage::from_raw(image.width as u32, image.height as u32, rgba) {
+        Some(buffer) => buffer.save(path).is_ok(),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +819,56 @@ mod tests {
             }
         }
         bitmap
+    }
+
+
+    /// 造一张「像截图」的图：白底 + 一行行深浅不一的横条（模拟文字行）+ 轻噪声
+    fn text_like(width: i32, height: i32, top_row: i32) -> Bitmap {
+        let mut bitmap = Bitmap {
+            width,
+            height,
+            pixels: vec![0; (width * height * 4) as usize],
+        };
+        let mut seed = 0x1234_5678u32;
+        for y in 0..height {
+            let doc_row = top_row + y;
+            // 每 24 行一个文本行，行内有若干深色小块
+            let in_line = (doc_row % 24) < 16;
+            for x in 0..width {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((seed >> 28) as i32 - 8).clamp(-6, 6);
+                let mut value = 246i32;
+                if in_line {
+                    // 用 doc_row 决定墨块位置，保证滚动后同一行一致
+                    let h = (doc_row * 31 + x / 7) % 11;
+                    if h < 6 {
+                        value = 60 + ((doc_row * 7 + x) % 40) as i32;
+                    }
+                }
+                let v = (value + noise).clamp(0, 255) as u8;
+                let offset = ((y * width + x) * 4) as usize;
+                bitmap.pixels[offset] = v;
+                bitmap.pixels[offset + 1] = v;
+                bitmap.pixels[offset + 2] = v;
+                bitmap.pixels[offset + 3] = 255;
+            }
+        }
+        bitmap
+    }
+
+    #[test]
+    fn realistic_text_stitches_for_various_scroll_steps() {
+        for step in [19, 37, 113, 240] {
+            let first = text_like(600, 500, 0);
+            let mut stitcher = Stitcher::new(first);
+            let next = text_like(600, 500, step);
+            match stitcher.push(&next) {
+                Pushed::Appended => {
+                    assert_eq!(stitcher.height(), 500 + step, "step={step} 应该只接上 {step} 行");
+                }
+                other => panic!("step={step} 没接上（{:?}）", matches!(other, Pushed::Lost)),
+            }
+        }
     }
 
     #[test]
