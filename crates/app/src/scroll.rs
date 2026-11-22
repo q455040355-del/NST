@@ -45,6 +45,14 @@ const HOTKEY_STOP: i32 = 0x5C01;
 /// 每行抽 16 段算一个灰度签名
 const SIG: usize = 16;
 
+/// 长图能占多少内存（BGRA）。原来按「1200 万像素」卡死，窄选区能拼 2 万行、
+/// 宽选区只有 6 千行；改成按字节预算后，宽度只影响能拼多长，不再有固定的行数上限。
+const MAX_CANVAS_BYTES: i64 = 256 * 1024 * 1024;
+
+/// 接缝混合用的重叠行数：接新内容前，把这 N 行和长图最后 N 行按权重混一下，
+/// 误差不到 1px 的接缝就不会出现一条硬线（完全对齐时混合结果和原值相同，不会糊）
+const SEAM_BLEND_ROWS: i32 = 3;
+
 /// 滚动抓帧的节奏上下限：最快 30fps、最慢 8fps（滚得慢的时候没必要空转）
 const MIN_SCROLL_INTERVAL_US: u64 = 33_000;
 const MAX_SCROLL_INTERVAL_US: u64 = 125_000;
@@ -179,7 +187,7 @@ impl Stitcher {
     pub fn new(first: Bitmap) -> Self {
         let width = first.width;
         let frame_h = first.height;
-        let max_rows = ((12_000_000 / width.max(1)).clamp(2000, 20_000)) as i32;
+        let max_rows = ((MAX_CANVAS_BYTES / (width.max(1) as i64 * 4)).clamp(2000, 300_000)) as i32;
         let sigs = (0..first.height).map(|y| row_sig(&first, y)).collect();
         // 首帧本身就是「上一帧」，这样第一次 push 就能算位移
         let prev = Some(first.clone());
@@ -466,6 +474,36 @@ impl Stitcher {
         self.append_rows_from(frame, frame.height - need)
     }
 
+    /// 接缝混合：长图最后 `SEAM_BLEND_ROWS` 行 和 这一帧里与之重叠的那几行，
+    /// 按线性权重混一次（越靠接缝越偏向新帧）。两边本来就一样时结果不变。
+    fn blend_seam(&mut self, frame: &Bitmap, from_row: i32) {
+        let rows = SEAM_BLEND_ROWS.min(self.image.height).min(from_row);
+        if rows <= 0 {
+            return;
+        }
+        let stride = (self.width * 4) as usize;
+        let weight_sum = (rows + 1) as u32;
+        for index in 0..rows {
+            let image_row = self.image.height - rows + index;
+            // 这一帧里和 image_row 重叠的那一行
+            let frame_row = from_row - rows + index;
+            let src = (frame_row as usize) * stride;
+            let dst = (image_row as usize) * stride;
+            if src + stride > frame.pixels.len() || dst + stride > self.image.pixels.len() {
+                continue;
+            }
+            // index 越大越靠近接缝 → 新帧权重越大
+            let new_weight = (index + 1) as u32;
+            let old_weight = weight_sum - new_weight;
+            for offset in 0..stride {
+                let old = self.image.pixels[dst + offset] as u32;
+                let new = frame.pixels[src + offset] as u32;
+                self.image.pixels[dst + offset] =
+                    ((old * old_weight + new * new_weight) / weight_sum) as u8;
+            }
+        }
+    }
+
     /// 把这一帧的 from_row 之后的行接在长图末尾
     fn append_rows_from(&mut self, frame: &Bitmap, from_row: i32) -> Pushed {
         if from_row < 0 || from_row >= frame.height {
@@ -477,6 +515,8 @@ impl Stitcher {
         if take <= 0 {
             return Pushed::Unchanged;
         }
+        // 接缝：进新行之前，先把「长图最后几行」和「这一帧对应的那几行」按权重混一遍
+        self.blend_seam(frame, from_row);
         let target_len = ((self.image.height + take) * self.width * 4) as usize;
         if self.image.pixels.len() < target_len {
             self.image.pixels.resize(target_len, 0);
@@ -1728,6 +1768,45 @@ mod tests {
                 _ => panic!("step={step} 没接上"),
             }
         }
+    }
+
+    #[test]
+    fn seam_blend_mixes_only_the_overlap_band() {
+        let width = 40;
+        let image = Bitmap {
+            width,
+            height: 30,
+            pixels: vec![100; (width * 30 * 4) as usize],
+        };
+        let mut stitcher = Stitcher::new(image);
+        // 这一帧和长图末尾重叠 5 行，重叠的那几行是 200（模拟一点点错位）
+        let frame = Bitmap {
+            width,
+            height: 30,
+            pixels: vec![200; (width * 30 * 4) as usize],
+        };
+        stitcher.blend_seam(&frame, 5);
+
+        let stride = (width * 4) as usize;
+        let sample = |row: i32| stitcher.image().pixels[row as usize * stride] as i32;
+        let (a, b, c) = (sample(27), sample(28), sample(29));
+        assert!(a > 100 && b > a && c > b, "越靠近接缝越偏向新帧: {a} {b} {c}");
+        assert!(c < 200, "接缝处不该整行被新帧替换");
+        assert_eq!(sample(0), 100, "重叠带以外的行不能动");
+        assert_eq!(sample(26), 100, "重叠带以外的行不能动");
+    }
+
+    #[test]
+    fn canvas_budget_scales_with_width() {
+        // 按字节预算：窄选区能拼得更长，宽选区短一些，但都至少 2000 行
+        let narrow = Stitcher::new(text_like(200, 100, 0));
+        let wide = Stitcher::new(text_like(2000, 100, 0));
+        assert!(narrow.max_rows > wide.max_rows, "窄选区应该能拼更长");
+        assert!(wide.max_rows >= 2000, "再宽也要留够 2000 行");
+        assert!(
+            wide.max_rows as i64 * 2000 * 4 <= MAX_CANVAS_BYTES + 2000 * 4,
+            "宽选区的上限要落在字节预算内"
+        );
     }
 
     #[test]
