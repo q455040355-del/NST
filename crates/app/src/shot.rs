@@ -2290,7 +2290,7 @@ unsafe fn editor_paint(hwnd: HWND) {
 /// 把编辑窗画进任意 DC（窗口用背缓冲，预览用离屏 DIB）
 /// 图片显示区高度（窗口底部留给工具栏和提示条）
 fn editor_view_height(client: RECT) -> i32 {
-    // 窗口现在就等于图片，底栏改成浮在图片上，不再占高度
+    // 底部留一条带子给工具栏（那条带子会被窗口区域裁掉，看起来是透明的）
     client.bottom.max(0)
 }
 
@@ -2307,11 +2307,12 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
     // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
-    let margin = editor.top_margin;
-    if height >= view_h - margin {
-        editor.image_top = editor.image_top.clamp((view_h - height).min(margin), margin);
+    // 带子在底部：图片贴顶，只有比显示区高才允许往上滚
+    let view_h = (view_h - editor.top_margin).max(0);
+    if height >= view_h {
+        editor.image_top = editor.image_top.clamp(view_h - height, 0);
     } else {
-        editor.image_top = margin;
+        editor.image_top = 0;
     }
 }
 
@@ -2360,7 +2361,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         left: 0,
         top: 0,
         right: client.right,
-        bottom: client.bottom,
+        bottom: (client.bottom - editor.top_margin).max(0),
     };
     if std::env::var_os("NST_EDITOR_DEBUG").is_some() {
         crate::debug_log(&format!(
@@ -2493,9 +2494,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    // 工具栏放在图片上方那条透明带里，水平居中；不压图
-    let strip_height = editor.image_top.max(0);
-    let bar_top = ((strip_height - bar_h) / 2).max(0);
+    // 工具栏放在图片下方那条透明带里，水平居中；不压图
+    let bar_top = view.bottom + (((client.bottom - view.bottom) - bar_h) / 2).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -4775,7 +4775,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let client_h = (strip + image_h).max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = strip;
+    let mut image_top = 0;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1;
     if !fits_in_place(scale) {
