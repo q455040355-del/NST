@@ -1285,6 +1285,8 @@ struct Editor {
     base_scale: f32,
     /// 用户放大/缩小的倍数（1.0 = 适配）
     zoom: f32,
+    /// 左键拖拽平移：起点 + 起始的 image_left/top
+    pan: Option<((i32, i32), (i32, i32))>,
     shapes: Vec<Shape>,
     tool: Tool,
     scale: f32,
@@ -2198,6 +2200,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         screen: (0, 0, width, height),
         base_scale: 1.0,
         zoom: preview_zoom,
+        pan: None,
         shapes: Vec::new(),
         // 选一个正在用的工具、一个 hover 项：一张图里能同时看到「选中」和「悬停提示」
         tool: Tool::Rect,
@@ -2848,6 +2851,7 @@ impl Editor {
             screen: self.screen,
             base_scale: self.base_scale,
             zoom: self.zoom,
+            pan: None,
             tool: self.tool,
             scale: 1.0,
             image_left: 0,
@@ -3509,7 +3513,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
             let _ = &mut point;
             match editor.tool {
-                Tool::None => {}
+                Tool::None => {
+                    // 没选工具：左键拖拽就是平移（放大之后用它看别处）
+                    editor.pan = Some(((point.x, point.y), (editor.image_left, editor.image_top)));
+                    SetCapture(hwnd);
+                }
                 Tool::Text | Tool::Ocr => {
                     // 文字 / 取字都先拖一个框，框住要处理的区域
                     editor.drag_from = Some((ix, iy));
@@ -3576,6 +3584,16 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let iy = ((((lparam as i32) >> 16) & 0xFFFF) - editor.image_top) as f32 / editor.scale;
             let point = (ix as i32, iy as i32);
 
+            if let Some(((start_x, start_y), (left, top))) = editor.pan {
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                editor.image_left = left + (cursor_point.x - start_x);
+                editor.image_top = top + (cursor_point.y - start_y);
+                clamp_image(editor, client);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+
             if editor.tool == Tool::Pen {
                 if let Some(last) = editor.pen_points.last() {
                     if (last.0 - point.0).abs() + (last.1 - point.1).abs() >= 2 {
@@ -3605,6 +3623,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
             let editor = &mut *editor;
+
+            if editor.pan.take().is_some() {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
 
             // 按钮：松开时还停在同一个按钮上才算点击
             if let Some(action) = editor.pressed.take() {
@@ -3906,6 +3929,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         screen: rect,
         base_scale: scale,
         zoom: 1.0,
+        pan: None,
         shapes: Vec::new(),
         tool: Tool::None,
         scale,
