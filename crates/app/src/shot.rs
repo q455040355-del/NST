@@ -2236,8 +2236,14 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     } else {
         editor.image_left = editor.image_left.clamp(client.right - width, 0);
     }
-    // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应
-    editor.image_top = editor.image_top.clamp(view_h - height, 0);
+    // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
+    // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
+    // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
+    if height >= view_h {
+        editor.image_top = editor.image_top.clamp(view_h - height, 0);
+    } else {
+        editor.image_top = 0;
+    }
 }
 
 /// 按倍数缩放，锚点（客户区坐标）下的那个像素保持不动
