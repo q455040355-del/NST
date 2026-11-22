@@ -96,17 +96,8 @@ static GIF_QUALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// 录制时长上限（秒）
 static GIF_SECONDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
 
-/// 这一次截图要不要强制 1:1（菜单点「正方形截图」时置位，`begin` 取走）
-static SQUARE_CAPTURE: AtomicBool = AtomicBool::new(false);
-
 /// 触发一次截图：先把任务栏面板藏起来（别把自己拍进去），稍等一下再抓屏。
 pub fn request(panel: HWND) {
-    start(panel, Mode::Edit);
-}
-
-/// 1:1 正方形截图：选区强制等比（拖的时候宽高始终一样），框完就是正方形。
-pub fn request_square(panel: HWND) {
-    SQUARE_CAPTURE.store(true, Ordering::Relaxed);
     start(panel, Mode::Edit);
 }
 
@@ -420,10 +411,6 @@ struct Overlay {
     last_label: Option<RECT>,
     /// 放大镜取色用的鼠标位置（截图坐标）
     cursor: POINT,
-    /// 选区强制 1:1（正方形截图，或者拖的时候按 S 切换）
-    square: bool,
-    /// 左下角那个「1:1」开关的位置（客户区坐标，每帧算）
-    toggle: RECT,
 }
 
 /// 把整屏画布上某块矩形恢复成「压暗版」像素。
@@ -468,56 +455,10 @@ unsafe fn dim_pixels(shot: &Bitmap) -> Vec<u8> {
 
 fn selection(overlay: &Overlay) -> Option<RECT> {
     // 还没开始拖：用鼠标下自动聚焦的窗口当默认选区（微信那种「点一下截这个窗口」）
-    let Some(mut start) = overlay.start else {
-        let rect = overlay.hover?;
-        if !overlay.square {
-            return Some(rect);
-        }
-        // 正方形模式点窗口：以窗口中心为心截一个正方形（边长取长边），夹进屏幕
-        let side = (rect.right - rect.left).max(rect.bottom - rect.top);
-        let cx = (rect.left + rect.right) / 2;
-        let cy = (rect.top + rect.bottom) / 2;
-        let left = (cx - side / 2).clamp(0, (overlay.shot.width - side).max(0));
-        let top = (cy - side / 2).clamp(0, (overlay.shot.height - side).max(0));
-        return Some(RECT {
-            left,
-            top,
-            right: left + side,
-            bottom: top + side,
-        });
+    let Some(start) = overlay.start else {
+        return overlay.hover;
     };
-    let mut current = overlay.current;
-    if overlay.square {
-        // 1:1：边长取长边，方向跟着鼠标；贴边时整块往里挪，保证框还是正方形
-        let dx = current.x - start.x;
-        let dy = current.y - start.y;
-        let side = dx.abs().max(dy.abs());
-        let (ux, uy) = (if dx < 0 { -1 } else { 1 }, if dy < 0 { -1 } else { 1 });
-        let (mut x0, mut y0) = (start.x, start.y);
-        let (mut x1, mut y1) = (start.x + ux * side, start.y + uy * side);
-        if x1 < 0 {
-            let shift = -x1;
-            x0 += shift;
-            x1 += shift;
-        }
-        if y1 < 0 {
-            let shift = -y1;
-            y0 += shift;
-            y1 += shift;
-        }
-        if x1 > overlay.shot.width {
-            let shift = x1 - overlay.shot.width;
-            x0 -= shift;
-            x1 -= shift;
-        }
-        if y1 > overlay.shot.height {
-            let shift = y1 - overlay.shot.height;
-            y0 -= shift;
-            y1 -= shift;
-        }
-        start = POINT { x: x0, y: y0 };
-        current = POINT { x: x1, y: y1 };
-    }
+    let current = overlay.current;
     let left = start.x.min(current.x).max(0);
     let top = start.y.min(current.y).max(0);
     let right = start.x.max(current.x).min(overlay.shot.width);
@@ -736,15 +677,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
         SelectObject(dc, old_pen);
         DeleteObject(pen as *mut _);
 
-        let label = if state.square {
-            format!(
-                "{} × {} · 1:1",
-                rect.right - rect.left,
-                rect.bottom - rect.top
-            )
-        } else {
-            format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top)
-        };
+        let label = format!("{} × {}", rect.right - rect.left, rect.bottom - rect.top);
         let font = cached_font(9.0, 700);
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let text_w = wide_width(dc, &label);
@@ -802,82 +735,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
     BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
     // 放大镜直接画在窗口 DC 上，不去动常驻画布（每帧重画，不会有残影）
     draw_loupe(hdc, state);
-    // 底部中间那个「1:1」开关
-    draw_square_toggle(hdc, state);
     EndPaint(hwnd, &mut ps);
-}
-
-/// 截图遮罩底部中间的「▢ 1:1」开关：点一下进/出正方形模式，状态一眼可见。
-unsafe fn draw_square_toggle(dc: HDC, state: &mut Overlay) {
-    let width = s(76.0);
-    let height = s(26.0);
-    let left = (state.shot.width - width) / 2;
-    let top = state.shot.height - height - s(40.0);
-    let rect = RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + height,
-    };
-    state.toggle = rect;
-
-    let ui = crate::theme::ui();
-    let fill = if state.square { ui.accent } else { 0x0018_1818 };
-    let ink = 0x00FF_FFFF;
-    let brush = CreateSolidBrush(fill);
-    let pen = CreatePen(0, 1, fill);
-    let old_brush = SelectObject(dc, brush as HGDIOBJ);
-    let old_pen = SelectObject(dc, pen as HGDIOBJ);
-    windows_sys::Win32::Graphics::Gdi::RoundRect(
-        dc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        s(13.0),
-        s(13.0),
-    );
-    SelectObject(dc, old_pen);
-    SelectObject(dc, old_brush);
-    DeleteObject(pen as *mut _);
-    DeleteObject(brush as *mut _);
-
-    // 左边一个小方块当图标
-    let square = s(5.0);
-    let bx = rect.left + s(12.0);
-    let by = (rect.top + rect.bottom) / 2;
-    let box_pen = CreatePen(0, s(1.4).max(1), ink);
-    let old_box_pen = SelectObject(dc, box_pen as HGDIOBJ);
-    let old_box_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    windows_sys::Win32::Graphics::Gdi::Rectangle(
-        dc,
-        bx - square,
-        by - square,
-        bx + square,
-        by + square,
-    );
-    SelectObject(dc, old_box_brush);
-    SelectObject(dc, old_box_pen);
-    DeleteObject(box_pen as *mut _);
-
-    let font = cached_font(9.0, 600);
-    let old_font = SelectObject(dc, font as HGDIOBJ);
-    SetBkMode(dc, TRANSPARENT as i32);
-    SetTextColor(dc, ink);
-    let mut text = RECT {
-        left: bx + square + s(7.0),
-        top: rect.top,
-        right: rect.right - s(8.0),
-        bottom: rect.bottom,
-    };
-    DrawTextW(
-        dc,
-        wide("1:1").as_ptr(),
-        -1,
-        &mut text,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-    );
-    SelectObject(dc, old_font);
 }
 
 /// 微信那种放大镜：光标附近放大 8 倍、画格子、标中心像素，下面给坐标和色值
@@ -1052,7 +910,7 @@ unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
     };
     DrawTextW(
         dc,
-        wide("按 Ctrl+C 复制色值 · 按 S 切 1:1").as_ptr(),
+        wide("按 Ctrl+C 复制色值").as_ptr(),
         -1,
         &mut hint,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
@@ -1069,24 +927,6 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 let mut point = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut point);
                 let state = &mut *state;
-
-                // 先看是不是点在「1:1」开关上：是就只切模式，不开始框选
-                let local = POINT {
-                    x: point.x - state.origin.0,
-                    y: point.y - state.origin.1,
-                };
-                let toggle = state.toggle;
-                if toggle.right > toggle.left
-                    && local.x >= toggle.left
-                    && local.x <= toggle.right
-                    && local.y >= toggle.top
-                    && local.y <= toggle.bottom
-                {
-                    state.square = !state.square;
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
-
                 let press = POINT {
                     x: (point.x - state.origin.0).clamp(0, state.shot.width),
                     y: (point.y - state.origin.1).clamp(0, state.shot.height),
@@ -1184,13 +1024,6 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_KEYDOWN => {
             match wparam as u32 {
                 // S：就地切成「1:1 正方形」选区（菜单里的「正方形截图」是直接带着这个状态进来）
-                0x53 => {
-                    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Overlay;
-                    if !state.is_null() {
-                        (*state).square = !(*state).square;
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                    }
-                }
                 // Esc / 右键 = 取消
                 0x1B => {
                     DestroyWindow(hwnd);
@@ -1316,13 +1149,6 @@ pub unsafe fn begin(panel: HWND) {
         last_rect: None,
         last_label: None,
         cursor: POINT { x: vw / 2, y: vh / 2 },
-        square: SQUARE_CAPTURE.swap(false, Ordering::Relaxed),
-        toggle: RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        },
     }));
 
     let hwnd = CreateWindowExW(
@@ -3993,75 +3819,6 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn overlay(square: bool, start: (i32, i32), current: (i32, i32)) -> Overlay {
-        Overlay {
-            shot: Bitmap::new(1920, 1080),
-            dimmed: Vec::new(),
-            origin: (0, 0),
-            start: Some(POINT {
-                x: start.0,
-                y: start.1,
-            }),
-            press: None,
-            current: POINT {
-                x: current.0,
-                y: current.1,
-            },
-            hover: None,
-            canvas: None,
-            last_rect: None,
-            last_label: None,
-            cursor: POINT { x: 0, y: 0 },
-            square,
-            toggle: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
-        }
-    }
-
-    #[test]
-    fn square_selection_uses_long_side() {
-        let state = overlay(true, (100, 100), (400, 250));
-        let rect = selection(&state).expect("应该有选区");
-        assert_eq!(rect.right - rect.left, 300);
-        assert_eq!(rect.bottom - rect.top, 300);
-        assert_eq!((rect.left, rect.top), (100, 100));
-    }
-
-    #[test]
-    fn square_selection_handles_reverse_drag() {
-        let state = overlay(true, (500, 500), (300, 300));
-        let rect = selection(&state).expect("应该有选区");
-        assert_eq!(rect.right - rect.left, 200);
-        assert_eq!(rect.bottom - rect.top, 200);
-        assert_eq!((rect.left, rect.top), (300, 300));
-    }
-
-    #[test]
-    fn square_selection_clamps_at_screen_edge() {
-        let state = overlay(true, (1800, 900), (1920, 1080));
-        let rect = selection(&state).expect("应该有选区");
-        assert_eq!(rect.right - rect.left, rect.bottom - rect.top);
-        assert!(rect.right <= 1920 && rect.bottom <= 1080);
-        assert!(rect.left >= 0 && rect.top >= 0);
-    }
-
-    #[test]
-    fn normal_selection_keeps_free_ratio() {
-        let state = overlay(false, (100, 100), (400, 250));
-        let rect = selection(&state).expect("应该有选区");
-        assert_eq!(rect.right - rect.left, 300);
-        assert_eq!(rect.bottom - rect.top, 150);
     }
 }
 
