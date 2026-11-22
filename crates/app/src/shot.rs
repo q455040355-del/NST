@@ -2232,11 +2232,8 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     } else {
         editor.image_left = editor.image_left.clamp(client.right - width, 0);
     }
-    if height <= view_h {
-        editor.image_top = (view_h - height) / 2;
-    } else {
-        editor.image_top = editor.image_top.clamp(view_h - height, 0);
-    }
+    // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应
+    editor.image_top = editor.image_top.clamp(view_h - height, 0);
 }
 
 /// 按倍数缩放，锚点（客户区坐标）下的那个像素保持不动
@@ -2303,6 +2300,20 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
     let saved = SaveDC(dc);
     IntersectClipRect(dc, view.left, view.top, view.right, view.bottom);
+
+    // 图片四周一圈极淡的描边：让「图」和窗口底色分开，知道边界在哪
+    {
+        let (left, top) = (editor.image_left, editor.image_top);
+        let right = left + (editor.base.width as f32 * editor.scale) as i32;
+        let bottom = top + (editor.base.height as f32 * editor.scale) as i32;
+        let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00DA_DDE2);
+        let old = SelectObject(dc, pen as HGDIOBJ);
+        let brush = SelectObject(dc, GetStockObject(5) as HGDIOBJ); // NULL_BRUSH
+        windows_sys::Win32::Graphics::Gdi::Rectangle(dc, left - 1, top - 1, right + 1, bottom + 1);
+        SelectObject(dc, brush);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
+    }
 
     // 原图只拷一次
     if editor.source.is_none() {
@@ -2395,7 +2406,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    let bar_top = (view.bottom + ((toolbar - bar_h) / 2).max(0)).max(0);
+    let bar_top = (view.bottom + ((toolbar - bar_h) / 2).max(0) + s(1.0)).max(0);
     let bar_bottom = bar_top + bar_h;
     let mut item = s(30.0);
     let mut gap = s(2.0);
@@ -2461,6 +2472,28 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
     let bar_w = measure(item, gap, sep_w);
     let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
+
+    // 底栏投影：比背板大一圈的浅灰圆角，制造「浮起来」的感觉
+    {
+        let shadow = CreateSolidBrush(0x00EE_F1F4);
+        let old_brush = SelectObject(dc, shadow as HGDIOBJ);
+        let old_pen = SelectObject(
+            dc,
+            windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00EE_F1F4) as HGDIOBJ,
+        );
+        windows_sys::Win32::Graphics::Gdi::RoundRect(
+            dc,
+            bar_left - s(2.0),
+            bar_top - s(1.0),
+            bar_left + bar_w + s(2.0),
+            bar_bottom + s(3.0),
+            s(15.0),
+            s(15.0),
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(shadow as *mut _);
+    }
 
     // 底栏背板：圆角 + 1px 描边
     {
@@ -4192,11 +4225,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             commit_text(hwnd);
 
             let editor = &mut *editor;
-            let ix = ((point.x - editor.image_left) as f32 / editor.scale) as i32;
-            let iy = ((point.y - editor.image_top) as f32 / editor.scale) as i32;
-            if ix < 0 || iy < 0 || ix > editor.base.width || iy > editor.base.height {
-                return 0;
-            }
+            // 边缘外一点点也要能起笔（用户按在图片边上是很常见的），夹到边界里就行
+            let ix = (((point.x - editor.image_left) as f32 / editor.scale) as i32)
+                .clamp(0, editor.base.width);
+            let iy = (((point.y - editor.image_top) as f32 / editor.scale) as i32)
+                .clamp(0, editor.base.height);
 
             let _ = &mut point;
             match editor.tool {
