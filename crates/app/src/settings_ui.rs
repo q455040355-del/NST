@@ -1254,7 +1254,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         p.text(
-            "截区域为 WebP",
+            "截区域录 MP4",
             state.fonts.label,
             if state.gif_enabled { c.text } else { c.text2 },
             pad + p.s(4.0),
@@ -1264,7 +1264,7 @@ unsafe fn paint(hwnd: HWND) {
             DT_LEFT,
         );
         p.text(
-            "框一块区域录成 WebP 动图",
+            "框一块区域录成 MP4 视频",
             state.fonts.small,
             c.text3,
             pad + p.s(4.0),

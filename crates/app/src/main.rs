@@ -162,7 +162,7 @@ fn main() {
             return;
         }
 
-        // 调试用：录一段 webp 直接落盘，验证编码输出（画面/alpha）
+        // 调试用：录一段 mp4 直接落盘，验证编码输出（画面/方向）
         if let Some(spec) = std::env::var_os("NST_REC_TEST") {
             let ok = gifrec::selftest(&spec.to_string_lossy());
             crate::debug_log(&format!("rec test -> {ok}"));
@@ -1193,14 +1193,14 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_APP_GIF_DONE => {
-            let pointer = wparam as *mut Vec<u8>;
+            let pointer = wparam as *mut gifrec::RecOutput;
             if !pointer.is_null() {
-                let bytes = *Box::from_raw(pointer);
+                let output = *Box::from_raw(pointer);
                 // 1 = 复制到剪贴板（默认），2 = 另存为
                 if lparam == 2 {
-                    gifrec::save_and_notify(hwnd, bytes);
+                    gifrec::save_and_notify(hwnd, output);
                 } else {
-                    gifrec::copy_to_clipboard(hwnd, bytes);
+                    gifrec::copy_to_clipboard(hwnd, output);
                 }
             }
             0
@@ -1340,7 +1340,7 @@ fn show_menu(hwnd: HWND) {
     if panel.settings.gif_enabled {
         rows.push(menu::Entry::hotkey(
             ID_GIF,
-            if gifrec::is_recording() { "结束 WebP 录制" } else { "录制区域 WebP…" },
+            if gifrec::is_recording() { "结束 MP4 录制" } else { "录制区域 MP4…" },
             panel.settings.gif_hotkey.clone(),
         ));
     }

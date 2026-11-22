@@ -1,12 +1,8 @@
-//! 截一块屏幕区域录成动图 GIF。
+//! 截一块屏幕区域录成 MP4（H.264）。
 //!
-//! 体积优先的三件事：
-//! 1. **全局调色板**：整段共用一个 255 色的 NeuQuant 调色板（第 256 号留给透明），
-//!    帧里不再塞各自的局部色表；
-//! 2. **帧间差分**：和上一帧没变化的像素写透明色，dispose = Keep，静止画面几乎不占字节；
-//! 3. **重复帧合并**：连续完全相同的帧不写新帧，只把延迟累加到前一帧上。
-//!
-//! 采集和编码在同一个后台线程里，边拍边写进内存，不会攒几千张整帧位图。
+//! 采集走 DXGI 桌面复制，没变化就跳过（静止画面不重复编码）；编码交给系统自带的
+//! Media Foundation——有核显/独显时是硬件编码器，1080p60 也不用抓帧线程等它。
+//! 文件边录边写，内存里只有当前这一帧，不攒整段帧。
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
@@ -21,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     COLORONCOLOR, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, RGN_DIFF, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
@@ -40,7 +36,7 @@ const CF_DIB: u32 = 8;
 const CF_HDROP: u32 = 15;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-/// 边框画在选区**外面**这么多像素（不然会被录进 GIF）
+/// 边框画在选区**外面**这么多像素（不然会被录进画面）
 const BORDER: i32 = 3;
 /// 浮动操作条：左边「保存」，右边「✔（结束并复制到剪贴板）」
 const BAR_W: i32 = 150;
@@ -188,7 +184,7 @@ pub unsafe fn start(
     let border = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         border_class.as_ptr(),
-        wide("GIF 录制区域").as_ptr(),
+        wide("录制区域").as_ptr(),
         WS_POPUP | WS_VISIBLE,
         x - BORDER,
         y - BORDER,
@@ -488,42 +484,10 @@ fn s_round() -> i32 {
     12
 }
 
-/// 录完复制到剪贴板：CF_DIB（首帧静态图）+ 文件（动画本体，能贴进聊天窗口）
-pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
-    if bytes.is_empty() {
-        return;
-    }
-
-    // 动画 WebP 先落到临时文件，剪贴板里放文件路径，微信/QQ/浏览器都认
-    let mut stamp: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
-    windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut stamp);
-    let dir = std::env::temp_dir().join("NST");
-    let _ = std::fs::create_dir_all(&dir);
-    // 只留最新的一条：剪贴板里放着上一个文件就够了，缓存别越攒越多
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("Rec_") && name.ends_with(".webp") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    let path = dir.join(format!(
-        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}_{}.webp",
-        stamp.wYear,
-        stamp.wMonth,
-        stamp.wDay,
-        stamp.wHour,
-        stamp.wMinute,
-        stamp.wSecond,
-        stamp.wMilliseconds
-    ));
-    if std::fs::write(&path, &bytes).is_err() {
-        return;
-    }
-
-    // 首帧解出来放 CF_DIB：不支持文件拖放的编辑器也能直接粘贴
-    let dib = first_frame_dib(&bytes);
+/// 录完复制到剪贴板：CF_DIB（首帧静态图）+ 文件（mp4，能贴进聊天窗口）
+pub unsafe fn copy_to_clipboard(owner: HWND, output: RecOutput) {
+    // 首帧拼成 CF_DIB：不支持文件拖放的编辑器也能直接粘一张图
+    let dib = dib_from_bgra(&output.first, output.width, output.height);
 
     // 剪贴板可能被别的程序占着，重试几次
     let mut opened = 0;
@@ -552,8 +516,9 @@ pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
         }
     }
 
-    // CF_HDROP：一个文件路径
-    let wide_path: Vec<u16> = path
+    // CF_HDROP：一个 mp4 文件路径，微信/QQ/浏览器都认
+    let wide_path: Vec<u16> = output
+        .path
         .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -575,22 +540,8 @@ pub unsafe fn copy_to_clipboard(owner: HWND, bytes: Vec<u8>) {
         }
     }
 
-    // 自定义格式：浏览器 / Electron 里能直接当图片粘
-    let format = RegisterClipboardFormatW(wide("image/webp").as_ptr());
-    if format != 0 {
-        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
-        if !handle.is_null() {
-            let lock = GlobalLock(handle) as *mut u8;
-            if !lock.is_null() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), lock, bytes.len());
-                GlobalUnlock(handle);
-                SetClipboardData(format, handle as *mut _);
-            }
-        }
-    }
-
     CloseClipboard();
-    show_toast("已复制到剪贴板");
+    show_toast("已复制到剪贴板（MP4）");
 }
 
 /// CF_HDROP 的 DROPFILES 头（字段名沿用 Win32）
@@ -601,67 +552,6 @@ struct DropFiles {
     pt: [i32; 2],
     fNC: i32,
     fWide: i32,
-}
-
-/// 解出动画的第一帧，直接拼成 CF_DIB（32 位、行序自下而上）。
-/// 解码器给的是 BGRA + 行序自顶向下，正好是 DIB 的字节序，只需要按行倒过来拷。
-fn first_frame_dib(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
-    unsafe {
-        let mut options: libwebp_sys::WebPAnimDecoderOptions = std::mem::zeroed();
-        if libwebp_sys::WebPAnimDecoderOptionsInitInternal(
-            &mut options,
-            libwebp_sys::WEBP_DEMUX_ABI_VERSION as i32,
-        ) == 0
-        {
-            return None;
-        }
-        options.color_mode = libwebp_sys::WEBP_CSP_MODE::MODE_BGRA;
-        options.use_threads = 0;
-        let data = libwebp_sys::WebPData {
-            bytes: bytes.as_ptr(),
-            size: bytes.len(),
-        };
-        let decoder = libwebp_sys::WebPAnimDecoderNewInternal(
-            &data,
-            &options,
-            libwebp_sys::WEBP_DEMUX_ABI_VERSION as i32,
-        );
-        if decoder.is_null() {
-            crate::debug_log("webp: 解码器创建失败（首帧 DIB 跳过）");
-            return None;
-        }
-
-        let mut info: libwebp_sys::WebPAnimInfo = std::mem::zeroed();
-        let mut frame: *mut u8 = std::ptr::null_mut();
-        let mut timestamp = 0i32;
-        let ok = libwebp_sys::WebPAnimDecoderGetInfo(decoder, &mut info) != 0
-            && libwebp_sys::WebPAnimDecoderGetNext(decoder, &mut frame, &mut timestamp) != 0
-            && !frame.is_null();
-        let mut dib = None;
-        if ok {
-            let w = info.canvas_width as usize;
-            let h = info.canvas_height as usize;
-            if w > 0 && h > 0 {
-                let stride = w * 4;
-                let size = 40 + stride * h;
-                let src = std::slice::from_raw_parts(frame, stride * h);
-                let mut out = vec![0u8; size];
-                out[0..4].copy_from_slice(&40u32.to_le_bytes());
-                out[4..8].copy_from_slice(&(w as i32).to_le_bytes());
-                out[8..12].copy_from_slice(&(h as i32).to_le_bytes());
-                out[12..14].copy_from_slice(&1u16.to_le_bytes());
-                out[14..16].copy_from_slice(&(32u16).to_le_bytes());
-                for row in 0..h {
-                    let src_row = (h - 1 - row) * stride;
-                    let dst = 40 + row * stride;
-                    out[dst..dst + stride].copy_from_slice(&src[src_row..src_row + stride]);
-                }
-                dib = Some((out, size));
-            }
-        }
-        libwebp_sys::WebPAnimDecoderDelete(decoder);
-        dib
-    }
 }
 
 /// 复制成功的小提示：屏幕中上方一个深色胶囊，1.3 秒后自己消失
@@ -848,7 +738,7 @@ fn mean_luma(pixels: &[u8]) -> f32 {
 }
 
 impl ScreenGrabber {
-    /// `width/height` 是屏幕上的选区大小，`out_w/out_h` 是实际写进 GIF 的尺寸（缩放过）
+    /// `width/height` 是屏幕上的选区大小，`out_w/out_h` 是实际写进视频的尺寸（缩放过）
     fn new(x: i32, y: i32, width: i32, height: i32, out_w: i32, out_h: i32) -> Option<Self> {
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
@@ -1192,24 +1082,22 @@ unsafe fn run(
     // 开录前先确认 DXGI 真能出画（HDR/驱动问题会让它一直给黑帧）
     grabber.validate_dxgi(x, y);
 
-    // 只拍一帧当动画的底图。以前拍 5 帧是为了算 GIF 的全局调色板——WebP 没有调色板，
-    // 多拍的那 4 帧纯粹是白等 160ms、白编 4 次，还可能把深度 4 的队列提前塞满。
+    // 只拍一帧当视频的底图（后面每帧都跟它比，没变化就不重复送）
     let mut first = Vec::new();
     if !grabber.grab_if_changed(x, y, &[], &mut first) {
         finish(border, button);
         return;
     }
 
-    // 编码放到单独线程：libwebp 编一帧要十几到几十毫秒，留在抓帧线程里会把节奏拖垮（看着卡）。
+    // 编码放到单独线程：MF 的 H.264 编码器多半走硬件，但接口调用还是别塞进抓帧线程。
     // 队列只放 4 帧，编不过来就丢帧，时间戳照样按真实时间走，所以不会拖长时长。
     let started_at = std::time::Instant::now();
     let stamp = |now: std::time::Instant| now.duration_since(started_at).as_millis() as i32;
 
-    // fps = 0 表示「自动」：交给下面的吞吐上限 + 闭环自己去收敛
-    let fps = if fps == 0 { FPS_MAX } else { fps };
+    // fps = 0 表示「自动」：H.264 编码很快，直接按 30fps 走
+    let fps = if fps == 0 { 30 } else { fps.clamp(1, 60) };
     let pixels = (out_w as i64) * (out_h as i64);
-    let (method, mpix_per_sec) = pick_method(pixels, fps);
-    let fps = fps.min(fps_cap(pixels, mpix_per_sec));
+    let output_path = new_output_path();
 
     // 每帧耗时的统计窗口：编码线程写、抓帧线程读
     ENCODE_EMA_US.store(0, Ordering::Relaxed);
@@ -1219,30 +1107,34 @@ unsafe fn run(
     CAPTURES.store(0, Ordering::Relaxed);
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, i32)>(4);
-    // 编码线程用完的 Vec 还回来直接复用：8MB 一块，省一次分配就省一次内存抖动
+    // 编码线程用完的 Vec 还回来直接复用：几 MB 一块，省一次分配就省一次内存抖动
     let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let encode_path = output_path.clone();
     let encoder = std::thread::spawn(move || {
-        let Some(mut streamer) = WebpStreamer::new(out_w, out_h, quality as f32, method) else {
-            crate::debug_log("webp: 编码器创建失败");
-            return Vec::new();
+        let Some(mut writer) = Mp4Writer::new(&encode_path, out_w, out_h, fps, quality) else {
+            crate::debug_log("mp4: 编码器创建失败");
+            return 0u64;
         };
+        let mut wrote = 0u32;
         for (frame, timestamp) in receiver {
             let t = std::time::Instant::now();
-            streamer.add(&frame, timestamp);
-            note_encode_time(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
-            ENCODED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            if writer.write(&frame, timestamp) {
+                wrote += 1;
+                note_encode_time(t.elapsed().as_micros().min(u32::MAX as u128) as u32);
+                ENCODED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = recycle_tx.send(frame);
         }
-        streamer.finish()
+        crate::debug_log(&format!("mp4: 共写入 {wrote} 帧"));
+        writer.finish()
     });
 
-    // 底图以 0ms 进编码器，动画才有第一帧
+    // 底图以 0ms 进编码器，视频才有第一帧
     let _ = sender.try_send((first.clone(), 0));
     let mut prev = first;
 
     crate::debug_log(&format!(
-        "rec: 起手 {fps}fps（{pixels} 像素，method {method}，quality {quality}，预测 {:.1}ms/帧）",
-        encode_ms_per_frame(pixels, mpix_per_sec)
+        "rec: 起手 {fps}fps（{pixels} 像素，quality {quality}，mp4 编码）"
     ));
 
     let user_interval = std::time::Duration::from_micros(1_000_000 / fps.max(1) as u64);
@@ -1304,7 +1196,7 @@ unsafe fn run(
     drop(sender);
 
     let mode = STOP_MODE.load(Ordering::SeqCst);
-    let bytes = encoder.join().unwrap_or_default();
+    let bytes = encoder.join().unwrap_or(0);
     let encoded = ENCODED_FRAMES.load(Ordering::Relaxed);
     let dropped = DROPPED_FRAMES.load(Ordering::Relaxed);
     let captures = CAPTURES.load(Ordering::Relaxed);
@@ -1312,38 +1204,73 @@ unsafe fn run(
     let worst_ms = ENCODE_WORST_US.load(Ordering::Relaxed) as f64 / 1000.0;
     let secs = started.elapsed().as_secs_f64().max(0.001);
     crate::debug_log(&format!(
-        "rec done: bytes={} size={out_w}x{out_h} (src {width}x{height}) 抓 {captures} 次 / 入队 {encoded} 帧 / 丢 {dropped} 帧 \
+        "rec done: bytes={bytes} size={out_w}x{out_h} (src {width}x{height}) 抓 {captures} 次 / 写入 {encoded} 帧 / 丢 {dropped} 帧 \
          {avg_ms:.1}ms/帧(最差 {worst_ms:.1}ms) {secs:.1}s → 抓帧 {:.1}fps、编码 {:.1}fps",
-        bytes.len(),
         captures as f64 / secs,
         encoded as f64 / secs
     ));
     finish(border, button);
 
-    if bytes.is_empty() {
+    if bytes == 0 {
         crate::debug_log(&format!("rec empty: mode={mode}"));
+        let _ = std::fs::remove_file(&output_path);
         show_toast("录制失败：编码器没有输出");
         return;
     }
-    if !bytes.is_empty() {
-        unsafe {
-            let pointer = Box::into_raw(Box::new(bytes));
-            let target = panel as HWND;
-            if !target.is_null() {
-                // lparam 告诉主窗口：1 = 复制到剪贴板，2 = 另存为
-                PostMessageW(target, crate::WM_APP_GIF_DONE, pointer as WPARAM, mode as LPARAM);
-            } else {
-                drop(Box::from_raw(pointer));
-            }
+    unsafe {
+        let output = RecOutput {
+            path: output_path,
+            bytes,
+            width: out_w,
+            height: out_h,
+            first: prev,
+        };
+        let pointer = Box::into_raw(Box::new(output));
+        let target = panel as HWND;
+        if !target.is_null() {
+            // lparam 告诉主窗口：1 = 复制到剪贴板，2 = 另存为
+            PostMessageW(target, crate::WM_APP_GIF_DONE, pointer as WPARAM, mode as LPARAM);
+        } else {
+            drop(Box::from_raw(pointer));
         }
     }
 }
 
-/// BGRA → RGBA（libwebp 的动画编码器只吃 RGB / RGBA）
-// ---------------------------------------------------------------- 流式 WebP 编码
+// ---------------------------------------------------------------- MP4 编码（Media Foundation）
 //
-// 不再把整段帧攒在内存里：每抓一帧就 WebPAnimEncoderAdd 进去，
-// 内存只占当前这一帧，所以 20 秒 / 60fps / 全屏都扛得住。
+// 录出来的东西直接是 H.264 / MP4：编码交给系统自带的 Media Foundation（机器有核显/独显时
+// 走硬件编码器），不再靠 libwebp 在后台线程里追帧率。文件边录边写，内存只占当前这一帧。
+
+use windows::core::PCWSTR;
+use windows::Win32::Media::MediaFoundation::{
+    eAVEncH264VProfile_High, IMFAttributes, IMFMediaType, IMFSample,
+    IMFSinkWriter,
+    MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFShutdown, MFStartup,
+    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32,
+    MFVideoInterlace_Progressive, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_VERSION, MFSTARTUP_NOSOCKET,
+};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+/// 一次录制的产物：文件已经落在磁盘上，顺带把首帧带上（剪贴板里放静态图用）
+pub struct RecOutput {
+    pub path: std::path::PathBuf,
+    pub bytes: u64,
+    pub width: i32,
+    pub height: i32,
+    /// 首帧 BGRA（行序自顶向下）
+    pub first: Vec<u8>,
+}
+
+impl RecOutput {
+    pub fn size_mb(&self) -> f64 {
+        self.bytes as f64 / (1024.0 * 1024.0)
+    }
+}
 
 /// 编码线程实测的单帧耗时（微秒，指数平均）；0 = 还没测到第一帧
 fn encode_ema_us() -> Option<u64> {
@@ -1365,191 +1292,372 @@ fn note_encode_time(micros: u32) {
     ENCODE_EMA_US.store(next, Ordering::Relaxed);
 }
 
-/// 编码吞吐（百万像素/秒）。i5-12400 实测（libwebp 编译时带 WEBP_USE_THREAD、
-/// thread_level = 1，即"宏块分段分析"多开一个线程）：
-///   method 2（原来的设置）1080p 31.4ms、720p 15.2ms ≈ 66 MPixel/s
-///   method 1            1080p 25.3ms、720p 12.5ms ≈ 82 MPixel/s
-/// 这里各留约 15% 余量给更弱的机器（i5-12400 已经是 2022 年的中端桌面 U）。
-const ENCODE_MPIX_M2: f64 = 56.0;
-const ENCODE_MPIX_M1: f64 = 70.0;
-/// 每帧另有约 1.5ms 与像素数无关的固定开销（ARGB 导入、帧头、熵编码收尾）
-const ENCODE_FIXED_MS: f64 = 1.5;
-/// 用户能选的最高帧率
-const FPS_MAX: u32 = 120;
-
-/// 这块区域编码一帧大约要多久（毫秒）
-fn encode_ms_per_frame(pixels: i64, mpix_per_sec: f64) -> f64 {
-    ENCODE_FIXED_MS + pixels as f64 / 1e6 * 1000.0 / mpix_per_sec
-}
-
-/// 该 method 能稳定吃下的帧率上限（超过就只能丢帧）
-fn fps_cap(pixels: i64, mpix_per_sec: f64) -> u32 {
-    (1000.0 / encode_ms_per_frame(pixels, mpix_per_sec))
-        .floor()
-        .clamp(1.0, FPS_MAX as f64) as u32
-}
-
-/// 选 method：method 2 体积更小（同样画面小 10~20%），用户选的帧率它吃得下就用它；
-/// 吃不消才降到 method 1（单帧快约 20~30%，体积 +10~20%）。
-/// 于是"小区域保持画质、大区域保帧率"是算出来的，不是拍脑袋的像素阈值：
-///   600×400 / 120fps、960×540 / 60fps → method 2
-///   1280×720 / 60fps、1600×900 / 60fps、1920×1080 / 30fps → method 1
-fn pick_method(pixels: i64, fps: u32) -> (i32, f64) {
-    let fits = (fps as f64) <= 1000.0 / encode_ms_per_frame(pixels, ENCODE_MPIX_M2);
-    if fits {
-        (2, ENCODE_MPIX_M2)
-    } else {
-        (1, ENCODE_MPIX_M1)
+/// 本次录制的输出文件：%TEMP%\NST\Rec_<时间戳>.mp4，顺手清掉上一次留下的
+fn new_output_path() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("NST");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("Rec_") && (name.ends_with(".mp4") || name.ends_with(".webp")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
+    let mut stamp: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut stamp);
+    }
+    dir.join(format!(
+        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}_{}.mp4",
+        stamp.wYear,
+        stamp.wMonth,
+        stamp.wDay,
+        stamp.wHour,
+        stamp.wMinute,
+        stamp.wSecond,
+        stamp.wMilliseconds
+    ))
 }
 
+/// H.264 码率：屏幕内容按「每像素 0.08~0.16 bit」估，quality 越高给得越多。
+/// 1080p30 / quality 65 ≈ 5 Mbps，文字边缘能压得住；再低就开始糊。
+fn h264_bitrate(pixels: i64, fps: u32, quality: u32) -> u32 {
+    let bpp = 0.06 + (quality.min(100) as f64 / 100.0) * 0.10;
+    let raw = pixels as f64 * fps.max(1) as f64 * bpp;
+    raw.clamp(600_000.0, 24_000_000.0) as u32
+}
 
-struct WebpStreamer {
-    encoder: *mut libwebp_sys::WebPAnimEncoder,
-    config: libwebp_sys::WebPConfig,
+/// 流式 MP4 写入器：一个视频流，输入 NV12，编码交给 MF
+struct Mp4Writer {
+    writer: IMFSinkWriter,
+    stream: u32,
     width: i32,
     height: i32,
+    path: std::path::PathBuf,
+    duration: i64,
+    last_ts: i64,
+    started: bool,
 }
 
-impl WebpStreamer {
-    fn new(width: i32, height: i32, quality: f32, method: i32) -> Option<Self> {
+impl Mp4Writer {
+    fn new(
+        path: &std::path::Path,
+        width: i32,
+        height: i32,
+        fps: u32,
+        quality: u32,
+    ) -> Option<Self> {
+        // H.264 要求宽高是偶数（NV12 的色度是 2×2 抽样）
+        let width = (width.max(2)) & !1;
+        let height = (height.max(2)) & !1;
+        let fps = fps.clamp(1, 60);
+        let bitrate = h264_bitrate(width as i64 * height as i64, fps, quality);
+
         unsafe {
-            let mut options: libwebp_sys::WebPAnimEncoderOptions = std::mem::zeroed();
-            if libwebp_sys::WebPAnimEncoderOptionsInitInternal(
-                &mut options,
-                libwebp_sys::WEBP_MUX_ABI_VERSION as i32,
-            ) == 0
-            {
+            // 编码线程自己起 COM（MTA）+ MF
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
+                crate::debug_log("mp4: MFStartup 失败");
                 return None;
             }
-            options.anim_params.loop_count = 0;
-            // minimize_size = 1 是 libwebp 的"多试几种 dispose/blend 组合"，实测纯亏：
-            // 同一段内容编码慢 18~42%（1080p 面板 25.2→22.4ms、整屏滚动 67.6→39.7ms），
-            // 最差帧 46→24ms，而体积几乎一样（0~1.6%）。所以关掉。
-            options.minimize_size = 0;
+            let mut attrs: Option<IMFAttributes> = None;
+            if MFCreateAttributes(&mut attrs, 2).is_err() {
+                crate::debug_log("mp4: MFCreateAttributes 失败");
+                let _ = MFShutdown();
+                return None;
+            }
+            let attrs = attrs?;
+            let _ = attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1);
 
-            let encoder = libwebp_sys::WebPAnimEncoderNewInternal(
-                width.max(1),
-                height.max(1),
-                &options,
-                // 这个参数要的是 mux 的 ABI 版本，不是 encoder 的（传错会直接返回空）
-                libwebp_sys::WEBP_MUX_ABI_VERSION as i32,
-            );
-            if encoder.is_null() {
-                crate::debug_log("webp: NewInternal 返回空");
+            let wide_path: Vec<u16> = path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let writer: IMFSinkWriter = match MFCreateSinkWriterFromURL(
+                PCWSTR(wide_path.as_ptr()),
+                None,
+                &attrs,
+            ) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    crate::debug_log(&format!("mp4: 建 SinkWriter 失败 {error}"));
+                    let _ = MFShutdown();
+                    return None;
+                }
+            };
+
+            let frame_size = ((width as u64) << 32) | height as u64;
+            let frame_rate = ((fps as u64) << 32) | 1;
+            let par = (1u64 << 32) | 1;
+
+            // 输出：H.264
+            let out_type: IMFMediaType = MFCreateMediaType().ok()?;
+            out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+            out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).ok()?;
+            out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).ok()?;
+            out_type
+                .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+                .ok()?;
+            out_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size).ok()?;
+            out_type.SetUINT64(&MF_MT_FRAME_RATE, frame_rate).ok()?;
+            out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par).ok()?;
+            let _ = out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32);
+
+            let stream = match writer.AddStream(&out_type) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    crate::debug_log(&format!("mp4: AddStream 失败 {error}"));
+                    let _ = MFShutdown();
+                    return None;
+                }
+            };
+
+            // 输入：NV12（编码器最认的格式，省掉一层自动插的转换器）
+            let in_type: IMFMediaType = MFCreateMediaType().ok()?;
+            in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+            in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok()?;
+            in_type
+                .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+                .ok()?;
+            in_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size).ok()?;
+            in_type.SetUINT64(&MF_MT_FRAME_RATE, frame_rate).ok()?;
+            in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par).ok()?;
+            if let Err(error) = writer.SetInputMediaType(stream, &in_type, None) {
+                crate::debug_log(&format!("mp4: SetInputMediaType 失败 {error}"));
+                let _ = MFShutdown();
+                return None;
+            }
+            if let Err(error) = writer.BeginWriting() {
+                crate::debug_log(&format!("mp4: BeginWriting 失败 {error}"));
+                let _ = MFShutdown();
                 return None;
             }
 
-            let mut config: libwebp_sys::WebPConfig = std::mem::zeroed();
-            if libwebp_sys::WebPConfigInitInternal(
-                &mut config,
-                libwebp_sys::WebPPreset::WEBP_PRESET_DEFAULT,
-                quality,
-                libwebp_sys::WEBP_ENCODER_ABI_VERSION as i32,
-            ) == 0
-            {
-                crate::debug_log("webp: ConfigInit 失败");
-                libwebp_sys::WebPAnimEncoderDelete(encoder);
-                return None;
-            }
-            // method 4 对 2MP 区域每帧要上百毫秒，抓帧节奏会被编码拖住（看起来卡）；
-            // method 2 是原来的折中；method 1 更快（1080p 单帧 36ms→25ms）但体积 +10~20%，
-            // 具体用哪个由 pick_method() 按区域大小和用户选的帧率决定
-            config.method = method;
-            config.lossless = 0;
-            config.thread_level = 1;
-            if libwebp_sys::WebPValidateConfig(&config) == 0 {
-                crate::debug_log("webp: 配置校验失败");
-            }
-
+            crate::debug_log(&format!(
+                "mp4: {width}x{height} {fps}fps {:.1}Mbps（quality {quality}）",
+                bitrate as f64 / 1_000_000.0
+            ));
             Some(Self {
-                encoder,
-                config,
-                width: width.max(1),
-                height: height.max(1),
+                writer,
+                stream,
+                width,
+                height,
+                path: path.to_path_buf(),
+                duration: 10_000_000 / fps.max(1) as i64,
+                last_ts: -1,
+                started: false,
             })
         }
     }
 
-    /// 喂一帧（BGRA，行序自顶向下），timestamp 是毫秒
-    fn add(&mut self, bgra: &[u8], timestamp_ms: i32) -> bool {
-        unsafe {
-            let mut picture: libwebp_sys::WebPPicture = std::mem::zeroed();
-            if libwebp_sys::WebPPictureInitInternal(
-                &mut picture,
-                libwebp_sys::WEBP_ENCODER_ABI_VERSION as i32,
-            ) == 0
-            {
-                return false;
-            }
-            picture.use_argb = 1;
-            picture.width = self.width;
-            picture.height = self.height;
-            // 用 BGRX：GDI 抓来的 DIB 里 alpha 字节是 0（GDI 不写 alpha），
-            // 用 ImportBGRA 会把整帧当成全透明导出去 —— 录出来的 webp 一打开啥都没有。
-            // BGRX 的第 4 个字节当填充丢弃，alpha 按不透明处理。
-            if libwebp_sys::WebPPictureImportBGRX(
-                &mut picture,
-                bgra.as_ptr(),
-                self.width * 4,
-            ) == 0
-            {
-                libwebp_sys::WebPPictureFree(&mut picture);
-                return false;
-            }
-            let ok = libwebp_sys::WebPAnimEncoderAdd(
-                self.encoder,
-                &mut picture,
-                timestamp_ms,
-                &self.config,
-            ) != 0;
-            if !ok {
-                let message = libwebp_sys::WebPAnimEncoderGetError(self.encoder);
-                let text = if message.is_null() {
-                    "?".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(message).to_string_lossy().to_string()
-                };
-                crate::debug_log(&format!("webp: Add 失败 ts={timestamp_ms}: {text}"));
-            }
-            libwebp_sys::WebPPictureFree(&mut picture);
-            ok
+    fn write(&mut self, bgra: &[u8], ts_ms: i32) -> bool {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w < 2 || h < 2 || bgra.len() < w * h * 4 {
+            return false;
         }
+        let size = (w * h * 3 / 2) as u32;
+        // 时间戳必须严格递增（同一毫秒抓到两帧时往后挤 1ms，肉眼看不出来）
+        let mut ts = ts_ms as i64 * 10_000;
+        if ts <= self.last_ts {
+            ts = self.last_ts + 10_000;
+        }
+        self.last_ts = ts;
+        unsafe {
+            let Ok(buffer) = MFCreateMemoryBuffer(size) else {
+                return false;
+            };
+            let mut ptr = std::ptr::null_mut();
+            if buffer.Lock(&mut ptr, None, None).is_err() || ptr.is_null() {
+                return false;
+            }
+            let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, size as usize);
+            bgra_to_nv12(bgra, w, h, dst);
+            let _ = buffer.Unlock();
+            if buffer.SetCurrentLength(size).is_err() {
+                return false;
+            }
+            let Ok(sample) = MFCreateSample() else {
+                return false;
+            };
+            if sample.AddBuffer(&buffer).is_err() {
+                return false;
+            }
+            let _ = sample.SetSampleTime(ts);
+            let _ = sample.SetSampleDuration(self.duration);
+            if let Err(error) = self.writer.WriteSample(self.stream, &sample) {
+                crate::debug_log(&format!("mp4: WriteSample 失败 {error}"));
+                return false;
+            }
+        }
+        self.started = true;
+        true
     }
 
-    /// 收尾：拿到完整 WebP 字节
-    fn finish(self) -> Vec<u8> {
+    /// 收尾：Finalize 之后文件才收得住，返回文件大小
+    fn finish(self) -> u64 {
+        let Self {
+            writer,
+            path,
+            started,
+            ..
+        } = self;
         unsafe {
-            let mut data = libwebp_sys::WebPData {
-                bytes: std::ptr::null(),
-                size: 0,
-            };
-            let mut out = Vec::new();
-            if libwebp_sys::WebPAnimEncoderAssemble(self.encoder, &mut data) != 0
-                && !data.bytes.is_null()
-                && data.size > 0
-            {
-                out.extend_from_slice(std::slice::from_raw_parts(data.bytes, data.size));
-            } else {
-                crate::debug_log(&format!(
-                    "webp: Assemble 失败 size={} ptr_null={}",
-                    data.size,
-                    data.bytes.is_null()
-                ));
+            if started {
+                if let Err(error) = writer.Finalize() {
+                    crate::debug_log(&format!("mp4: Finalize 失败 {error}"));
+                }
             }
-            if !data.bytes.is_null() {
-                libwebp_sys::WebPFree(data.bytes as *mut std::ffi::c_void);
+            // 先把接口放掉，再关 MF，文件句柄才真的释放
+            drop(writer);
+            let _ = MFShutdown();
+        }
+        std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+    }
+}
+
+/// BGRA（自顶向下）→ NV12（自下而上，MF 默认的 stride 方向）
+fn bgra_to_nv12(src: &[u8], w: usize, h: usize, dst: &mut [u8]) {
+    // BT.709 有限范围：Y 16..235，UV 16..240
+    let y_size = w * h;
+    for y in 0..h {
+        let src_row = &src[y * w * 4..][..w * 4];
+        let dst_row = &mut dst[(h - 1 - y) * w..][..w];
+        for x in 0..w {
+            let b = src_row[x * 4] as i32;
+            let g = src_row[x * 4 + 1] as i32;
+            let r = src_row[x * 4 + 2] as i32;
+            let luma = (47 * r + 157 * g + 16 * b + 128) >> 8;
+            dst_row[x] = (luma + 16).clamp(0, 255) as u8;
+        }
+    }
+    let uv = &mut dst[y_size..];
+    let uv_row_bytes = w;
+    for y in (0..h).step_by(2) {
+        let row0 = &src[y * w * 4..][..w * 4];
+        let row1 = &src[(y + 1) * w * 4..][..w * 4];
+        let out_row = (h / 2 - 1 - y / 2) * uv_row_bytes;
+        let dst_row = &mut uv[out_row..][..uv_row_bytes];
+        for x in (0..w).step_by(2) {
+            let mut sb = 0;
+            let mut sg = 0;
+            let mut sr = 0;
+            for (row, xx) in [(row0, x), (row0, x + 1), (row1, x), (row1, x + 1)] {
+                sb += row[xx * 4] as i32;
+                sg += row[xx * 4 + 1] as i32;
+                sr += row[xx * 4 + 2] as i32;
             }
-            libwebp_sys::WebPAnimEncoderDelete(self.encoder);
-            out
+            let (r, g, b) = (sr / 4, sg / 4, sb / 4);
+            let u = ((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128;
+            let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+            dst_row[x] = u.clamp(0, 255) as u8;
+            dst_row[x + 1] = v.clamp(0, 255) as u8;
         }
     }
 }
 
+/// 首帧 BGRA → CF_DIB（32 位、行序自下而上）
+fn dib_from_bgra(first: &[u8], width: i32, height: i32) -> Option<(Vec<u8>, usize)> {
+    let w = width.max(1) as usize;
+    let h = height.max(1) as usize;
+    if first.len() < w * h * 4 {
+        return None;
+    }
+    let header = std::mem::size_of::<BITMAPINFOHEADER>();
+    let len = header + w * h * 4;
+    let mut out = vec![0u8; len];
+    unsafe {
+        let info = out.as_mut_ptr() as *mut BITMAPINFOHEADER;
+        (*info).biSize = header as u32;
+        (*info).biWidth = w as i32;
+        (*info).biHeight = h as i32;
+        (*info).biPlanes = 1;
+        (*info).biBitCount = 32;
+        (*info).biCompression = 0; // BI_RGB
+        (*info).biSizeImage = (w * h * 4) as u32;
+    }
+    for row in 0..h {
+        let src = &first[(h - 1 - row) * w * 4..][..w * 4];
+        let dst = header + row * w * 4;
+        out[dst..dst + w * 4].copy_from_slice(src);
+    }
+    Some((out, len))
+}
 
-/// 自测：抓一块屏幕录 N 秒，直接走跟正式录制一样的 WebP 编码路径，把结果写文件。
-/// 用来在不开 UI 的情况下验证「录出来的 webp 是不是有画面、alpha 是不是不透明」：
-///   NST_REC_TEST="x,y,w,h,秒数,out.webp" netspeed.exe
+/// 自测用：把写好的 mp4 解一帧回来（RGB32、行序自下而上），验证文件真有画面
+pub fn probe_first_frame(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
+            return None;
+        }
+        let wide_path: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // 要 RGB32 输出，得先允许 SourceReader 插视频处理器（默认只给 NV12）
+        let mut reader_attrs: Option<IMFAttributes> = None;
+        let mut reader = None;
+        if MFCreateAttributes(&mut reader_attrs, 1).is_ok() {
+            if let Some(attrs) = reader_attrs.as_ref() {
+                let _ = attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1);
+            }
+            reader = MFCreateSourceReaderFromURL(PCWSTR(wide_path.as_ptr()), reader_attrs.as_ref())
+                .ok();
+        }
+        let Some(reader) = reader else {
+            crate::debug_log("probe: 建 SourceReader 失败");
+            let _ = MFShutdown();
+            return None;
+        };
+        let out_type: IMFMediaType = MFCreateMediaType().ok()?;
+        out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+        out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).ok()?;
+        let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        if let Err(error) = reader.SetCurrentMediaType(stream, None, &out_type) {
+            crate::debug_log(&format!("probe: 设 RGB32 输出失败 {error}"));
+            let _ = MFShutdown();
+            return None;
+        }
+        let current = reader.GetCurrentMediaType(stream).ok()?;
+        let size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+        let (w, h) = ((size >> 32) as i32, (size & 0xFFFF_FFFF) as i32);
+
+        let mut sample: Option<IMFSample> = None;
+        let mut flags = 0u32;
+        if let Err(error) = reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))
+        {
+            crate::debug_log(&format!("probe: ReadSample 失败 {error}"));
+            let _ = MFShutdown();
+            return None;
+        }
+        let Some(sample) = sample else {
+            crate::debug_log("probe: ReadSample 没给样本");
+            let _ = MFShutdown();
+            return None;
+        };
+        let buffer = match sample.ConvertToContiguousBuffer() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                crate::debug_log(&format!("probe: 取连续缓冲失败 {error}"));
+                let _ = MFShutdown();
+                return None;
+            }
+        };
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        buffer.Lock(&mut ptr, None, Some(&mut len)).ok()?;
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec();
+        let _ = buffer.Unlock();
+        let _ = MFShutdown();
+        Some((w, h, bytes))
+    }
+}
+
+/// 自测：抓一块屏幕录 N 秒，走跟正式录制一样的 MP4 编码路径，然后解一帧回来验证有画面。
+///   NST_REC_TEST="x,y,w,h,秒数,out.mp4" netspeed.exe
 pub unsafe fn selftest(spec: &str) -> bool {
     let parts: Vec<&str> = spec.split(',').collect();
     if parts.len() != 6 {
@@ -1560,11 +1668,16 @@ pub unsafe fn selftest(spec: &str) -> bool {
     let w: i32 = parts[2].trim().parse().unwrap_or(0);
     let h: i32 = parts[3].trim().parse().unwrap_or(0);
     let seconds: u64 = parts[4].trim().parse().unwrap_or(3);
-    let path = parts[5].trim();
-    if w < 16 || h < 16 || path.is_empty() {
+    let path = std::path::PathBuf::from(parts[5].trim());
+    if w < 16 || h < 16 || path.as_os_str().is_empty() {
         return false;
     }
-    let Some(mut streamer) = WebpStreamer::new(w, h, 65.0, 2) else {
+    // 跟正式录制一样：H.264 要偶数宽高
+    let out_w = (w & !1).max(2);
+    let out_h = (h & !1).max(2);
+
+    let Some(mut writer) = Mp4Writer::new(&path, out_w, out_h, 30, 65) else {
+        crate::debug_log("rec test: 编码器创建失败");
         return false;
     };
     let started = std::time::Instant::now();
@@ -1572,19 +1685,56 @@ pub unsafe fn selftest(spec: &str) -> bool {
     while started.elapsed().as_secs() < seconds {
         if let Some(frame) = crate::shot::capture_rect(x, y, w, h) {
             let ts = started.elapsed().as_millis() as i32;
-            if streamer.add(&frame.pixels, ts) {
+            if writer.write(&frame.pixels, ts) {
                 frames += 1;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let bytes = streamer.finish();
+    let bytes = writer.finish();
     crate::debug_log(&format!(
-        "rec test: {} 帧, {} 字节",
-        frames,
-        bytes.len()
+        "rec test: {frames} 帧, {bytes} 字节 -> {}",
+        path.display()
     ));
-    std::fs::write(path, &bytes).is_ok()
+    if bytes == 0 || frames == 0 {
+        return false;
+    }
+
+    // 解一帧回来，确认不是黑屏、也不是上下颠倒
+    let Some((pw, ph, pixels)) = probe_first_frame(&path) else {
+        crate::debug_log("rec test: 解不出首帧");
+        return false;
+    };
+    let mut sum = 0u64;
+    for pixel in pixels.chunks_exact(4).take((pw * ph) as usize) {
+        sum += (pixel[0] as u64 + pixel[1] as u64 + pixel[2] as u64) / 3;
+    }
+    let count = (pw * ph).max(1) as u64;
+    let mean = sum / count;
+    crate::debug_log(&format!(
+        "rec test: 首帧 {pw}x{ph} 平均亮度 {mean}（0/255 说明全黑或解错了）"
+    ));
+
+    // 顺手把解码出来的首帧存成 PNG：验颜色/上下方向时肉眼一看就知道
+    let png_path = path.with_extension("probe.png");
+    let mut rgba = Vec::with_capacity((pw * ph * 4) as usize);
+    for row in 0..ph {
+        let src_row = ((ph - 1 - row) * pw * 4) as usize; // RGB32 是自下而上的
+        for col in 0..pw {
+            let i = src_row + (col * 4) as usize;
+            if i + 3 < pixels.len() {
+                rgba.push(pixels[i + 2]);
+                rgba.push(pixels[i + 1]);
+                rgba.push(pixels[i]);
+                rgba.push(255);
+            }
+        }
+    }
+    if let Some(image) = image::RgbaImage::from_raw(pw as u32, ph as u32, rgba) {
+        let _ = image.save(&png_path);
+        crate::debug_log(&format!("rec test: 首帧存到 {}", png_path.display()));
+    }
+    mean > 8 && mean < 250
 }
 
 fn finish(border: HWND, button: HWND) {
@@ -1611,16 +1761,16 @@ fn finish(border: HWND, button: HWND) {
 // ---------------------------------------------------------------- 保存
 
 /// 录完弹「另存为」，存完给个结果提示
-pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
+pub unsafe fn save_and_notify(owner: HWND, output: RecOutput) {
     let mut name = vec![0u16; 512];
-    let mut filter: Vec<u16> = "WebP 动图\0*.webp\0所有文件\0*.*\0\0".encode_utf16().collect();
-    let mut title = wide("保存 WebP");
-    let mut ext = wide("webp");
+    let mut filter: Vec<u16> = "MP4 视频\0*.mp4\0所有文件\0*.*\0\0".encode_utf16().collect();
+    let mut title = wide("保存录制");
+    let mut ext = wide("mp4");
 
     let mut local: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
     windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut local);
     let default_name = format!(
-        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}.webp",
+        "Rec_{:04}{:02}{:02}_{:02}{:02}{:02}.mp4",
         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
     );
     let default: Vec<u16> = default_name.encode_utf16().collect();
@@ -1644,16 +1794,16 @@ pub unsafe fn save_and_notify(owner: HWND, bytes: Vec<u8>) {
 
     let length = name.iter().position(|c| *c == 0).unwrap_or(name.len());
     let path = String::from_utf16_lossy(&name[..length]);
-    if std::fs::write(&path, &bytes).is_err() {
+    if std::fs::copy(&output.path, &path).is_err() {
         crate::dialog::info(
             owner,
-            "保存 WebP",
-            "WebP 保存失败：磁盘空间不足、没有写入权限，或路径无效。",
+            "保存录制",
+            "MP4 保存失败：磁盘空间不足、没有写入权限，或路径无效。",
         );
         return;
     }
 
-    let size = bytes.len() as f64 / 1024.0 / 1024.0;
-    let text = format!("已保存（{size:.2} MB）\n{path}");
-    crate::dialog::info(owner, "WebP 已保存", &text);
+    let text = format!("已保存（{:.2} MB）\n{path}", output.size_mb());
+    crate::dialog::info(owner, "MP4 已保存", &text);
 }
+
