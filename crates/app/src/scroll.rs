@@ -45,6 +45,10 @@ const HOTKEY_STOP: i32 = 0x5C01;
 /// 每行抽 16 段算一个灰度签名
 const SIG: usize = 16;
 
+/// 滚动抓帧的节奏上下限：最快 30fps、最慢 8fps（滚得慢的时候没必要空转）
+const MIN_SCROLL_INTERVAL_US: u64 = 33_000;
+const MAX_SCROLL_INTERVAL_US: u64 = 125_000;
+
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
 /// 点的是 ✓（要长图）还是 ×（回原图）
@@ -136,6 +140,21 @@ pub enum Pushed {
     Lost,
 }
 
+/// 一次滚动的统计：出问题时靠这几个数判断是「没抓到」还是「没对上」
+#[derive(Default, Clone, Copy)]
+pub struct StitchStats {
+    /// 抓到的帧数
+    pub frames: u32,
+    /// 接上新内容的帧数
+    pub appended: u32,
+    /// 跟上一帧一样（没滚动）
+    pub unchanged: u32,
+    /// 对不上（滚太快 / 内容变了）
+    pub lost: u32,
+    /// 两帧之间没重叠、直接跳过去的行数（这部分内容确实丢了）
+    pub gap_rows: i64,
+}
+
 pub struct Stitcher {
     width: i32,
     frame_h: i32,
@@ -152,6 +171,8 @@ pub struct Stitcher {
     /// 有了它才知道「这一帧看到的内容有多少是新的」：往下滚越过长图底部才多出新行，
     /// 往上滚越过长图顶部才多出新行；中间那段来回滚都是已经拼过的，不能再接一遍。
     offset: i32,
+    /// 累计统计（收尾时打一条日志）
+    pub stats: StitchStats,
 }
 
 impl Stitcher {
@@ -171,6 +192,7 @@ impl Stitcher {
             last_best: None,
             prev,
             offset: 0,
+            stats: StitchStats::default(),
         }
     }
 
@@ -302,10 +324,13 @@ impl Stitcher {
     }
 
     pub fn push(&mut self, frame: Bitmap) -> Pushed {
+        self.stats.frames += 1;
         if frame.width != self.width {
+            self.stats.lost += 1;
             return Pushed::Lost;
         }
         if frame.height < 24 {
+            self.stats.lost += 1;
             return Pushed::Lost;
         }
         let fresh: Vec<[u8; SIG]> = (0..frame.height).map(|y| row_sig(&frame, y)).collect();
@@ -321,6 +346,7 @@ impl Stitcher {
         // 完全没动：省掉下面那次「去长图里找位置」的开销
         if let Some((0, _)) = shift {
             self.prev = Some(frame);
+            self.stats.unchanged += 1;
             return Pushed::Unchanged;
         }
 
@@ -343,10 +369,16 @@ impl Stitcher {
             (None, None) => {
                 self.last_best = None;
                 self.prev = Some(frame);
+                self.stats.lost += 1;
                 return Pushed::Lost;
             }
         };
         let outcome = self.apply_top(&frame, top);
+        match outcome {
+            Pushed::Appended => self.stats.appended += 1,
+            Pushed::Unchanged => self.stats.unchanged += 1,
+            Pushed::Lost => self.stats.lost += 1,
+        }
         // 这一帧成为新的「上一帧」，下次跟它比（所有权转移，不拷贝）
         let frame_height = frame.height;
         self.prev = Some(frame);
@@ -426,10 +458,9 @@ impl Stitcher {
         }
         // 帧和长图之间有空档：中间那几行一帧都没抓到（滚太快）。记一笔，方便排查漏内容
         if top > self.image.height {
-            crate::debug_log(&format!(
-                "scroll: 漏了 {} 行（两帧之间没重叠，滚太快）",
-                top - self.image.height
-            ));
+            let gap = (top - self.image.height) as i64;
+            self.stats.gap_rows += gap;
+            crate::debug_log(&format!("scroll: 漏了 {gap} 行（两帧之间没重叠，滚太快）"));
         }
         let need = need.min(frame.height);
         self.append_rows_from(frame, frame.height - need)
@@ -593,39 +624,14 @@ unsafe fn refresh_thumb(stitcher: &Stitcher, width: i32) {
     }
 }
 
-/// 抓帧高度：胶囊在里面时只抓到它上沿，那一条留给最后补抓
-unsafe fn capture_height() -> i32 {
-    let (_, _, _, h) = REGION;
-    if INNER.load(Ordering::SeqCst) {
-        (h - CHIP_H - s(10.0)).max(32)
-    } else {
-        h
-    }
-}
-
-/// 连抓几帧并拼接（滚动动画中间那几帧也能用上）
-unsafe fn burst_push(stitcher: &mut Stitcher, frames: usize) -> bool {
-    let (x, y, w, _) = REGION;
-    let cap_h = capture_height();
-    let mut appended = false;
-    for _ in 0..frames {
-        if STOP.load(Ordering::SeqCst) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        if let Some(frame) = capture_rect(x, y, w, cap_h) {
-            if let Pushed::Appended = stitcher.push(frame) {
-                appended = true;
-                APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
-                refresh_thumb(stitcher, THUMB_W);
-                let chip = CHIP.load(Ordering::SeqCst) as HWND;
-                if !chip.is_null() {
-                    InvalidateRect(chip, std::ptr::null(), 0);
-                }
-            }
-        }
-    }
-    appended
+/// 下一拍等多久（微秒）：按实测「抓 + 拼」的开销留 25% 余量，夹在 33~125ms 之间，
+/// 再和当前值做平滑，免得一帧抖动就把节奏带飞。
+fn next_interval_us(current: u64, cost_us: u64) -> u64 {
+    let want = cost_us
+        .saturating_mul(5)
+        .saturating_div(4)
+        .clamp(MIN_SCROLL_INTERVAL_US, MAX_SCROLL_INTERVAL_US);
+    (((current * 3 + want) + 2) / 4).clamp(MIN_SCROLL_INTERVAL_US, MAX_SCROLL_INTERVAL_US)
 }
 
 /// 截图编辑窗点了「滚动截图」之后进来：拿当前这块图 + 屏幕位置开会话
@@ -817,13 +823,50 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
             let mut stitcher = Stitcher::new(seed);
             // 先把首帧画到缩略图里，不然刚开始滚之前右边是个空白框
             refresh_thumb(&stitcher, THUMB_W);
+            // 抓得勤不勤跟着实际开销走：起手按 30fps，跟不上就往下调（最低 8fps），
+            // 快了再慢慢收回来。滚得快的时候多抓几帧，才不会整段漏掉。
+            let started = std::time::Instant::now();
+            let mut interval_us = MIN_SCROLL_INTERVAL_US;
             while !STOP.load(Ordering::SeqCst) {
-                burst_push(&mut stitcher, 3);
+                let tick = std::time::Instant::now();
+                let mut cost_us = 0u64;
+                if let Some(frame) = capture_rect(x, y, w, cap_h) {
+                    let captured = std::time::Instant::now();
+                    let outcome = stitcher.push(frame);
+                    cost_us = captured.duration_since(tick).as_micros() as u64
+                        + captured.elapsed().as_micros() as u64;
+                    if matches!(outcome, Pushed::Appended) {
+                        APPENDED.store(stitcher.height() as usize, Ordering::SeqCst);
+                        refresh_thumb(&stitcher, THUMB_W);
+                        let chip = CHIP.load(Ordering::SeqCst) as HWND;
+                        if !chip.is_null() {
+                            InvalidateRect(chip, std::ptr::null(), 0);
+                        }
+                    }
+                }
                 if stitcher.full() {
                     crate::debug_log("scroll: 到长图上限，收工");
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                interval_us = next_interval_us(interval_us, cost_us);
+                let elapsed = tick.elapsed().as_micros() as u64;
+                if interval_us > elapsed {
+                    std::thread::sleep(std::time::Duration::from_micros(interval_us - elapsed));
+                }
+            }
+            {
+                let stats = stitcher.stats;
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                crate::debug_log(&format!(
+                    "scroll 统计: 抓 {} 帧 / 接 {} / 没动 {} / 对不上 {} / 漏 {} 行，{:.1}s → 抓帧 {:.1}fps",
+                    stats.frames,
+                    stats.appended,
+                    stats.unchanged,
+                    stats.lost,
+                    stats.gap_rows,
+                    secs,
+                    stats.frames as f64 / secs
+                ));
             }
             let confirm = CONFIRM.load(Ordering::SeqCst);
             crate::debug_log(&format!(
@@ -1685,5 +1728,54 @@ mod tests {
                 _ => panic!("step={step} 没接上"),
             }
         }
+    }
+
+    #[test]
+    fn cadence_adapts_to_cost_and_stays_in_range() {
+        // 成本很低：一直贴着 30fps 的上限
+        let mut interval = MIN_SCROLL_INTERVAL_US;
+        for _ in 0..40 {
+            interval = next_interval_us(interval, 500);
+        }
+        assert_eq!(interval, MIN_SCROLL_INTERVAL_US, "便宜的时候不该变慢");
+
+        // 成本极高：退到最慢一档（平滑逼近，不会一步跳到位，也不会更慢）
+        let mut interval = MIN_SCROLL_INTERVAL_US;
+        for _ in 0..60 {
+            interval = next_interval_us(interval, 10_000_000);
+        }
+        assert!(
+            interval >= MAX_SCROLL_INTERVAL_US - 2 && interval <= MAX_SCROLL_INTERVAL_US,
+            "贵的时候该退到 8fps 那一档，实际 {interval}"
+        );
+
+        // 中间档：成本和间隔大致成正比，且不会一下跳到底
+        let slow = next_interval_us(MIN_SCROLL_INTERVAL_US, 60_000);
+        assert!(slow > MIN_SCROLL_INTERVAL_US && slow < MAX_SCROLL_INTERVAL_US);
+        assert_eq!(slow, (MIN_SCROLL_INTERVAL_US * 3 + 75_000) / 4);
+    }
+
+    #[test]
+    fn stats_count_what_happened_to_each_frame() {
+        let width = 400;
+        let window = 600;
+        let doc = text_like(width, 2400, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top * width * 4) as usize;
+            let len = (window * width * 4) as usize;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        assert!(matches!(stitcher.push(crop(300)), Pushed::Appended));
+        assert!(matches!(stitcher.push(crop(600)), Pushed::Appended));
+        assert!(matches!(stitcher.push(crop(600)), Pushed::Unchanged));
+        assert_eq!(stitcher.stats.frames, 3);
+        assert_eq!(stitcher.stats.appended, 2);
+        assert_eq!(stitcher.stats.unchanged, 1);
+        assert_eq!(stitcher.stats.lost, 0);
+        assert_eq!(stitcher.stats.gap_rows, 0);
     }
 }
