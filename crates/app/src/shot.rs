@@ -1362,6 +1362,8 @@ enum Tool {
     None,
     Arrow,
     Rect,
+    /// 正方形画框（拖出来宽高始终一样）
+    Square,
     /// 空心椭圆（微信那排第一个）
     Ellipse,
     Pen,
@@ -1379,6 +1381,11 @@ enum Shape {
         stroke: u8,
     },
     Rect {
+        a: (i32, i32),
+        b: (i32, i32),
+        stroke: u8,
+    },
+    Square {
         a: (i32, i32),
         b: (i32, i32),
         stroke: u8,
@@ -1503,6 +1510,7 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Tool(Tool::None) => "",
         Action::Tool(Tool::Arrow) => "箭头",
         Action::Tool(Tool::Rect) => "矩形",
+        Action::Tool(Tool::Square) => "正方形",
         Action::Tool(Tool::Ellipse) => "椭圆",
         Action::Tool(Tool::Pen) => "画笔",
         Action::Tool(Tool::Text) => "文字",
@@ -1563,6 +1571,17 @@ fn draw_arrow(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
         DeleteObject(brush as *mut _);
         DeleteObject(pen as *mut _);
     }
+}
+
+/// 把拖拽的两个点补成正方形：边长取长边，方向跟着终点走
+fn squared(a: (i32, i32), b: (i32, i32)) -> (i32, i32) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let side = dx.abs().max(dy.abs());
+    (
+        a.0 + if dx < 0 { -side } else { side },
+        a.1 + if dy < 0 { -side } else { side },
+    )
 }
 
 fn draw_rect(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
@@ -1799,6 +1818,7 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::None => "选一个工具再画 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 关闭",
         Tool::Text => "拖出文字位置后直接输入 · Enter 提交 · Esc 取消",
         Tool::Ellipse => "拖出椭圆 · Esc 取消",
+        Tool::Square => "拖出正方形（宽高始终一样）· Esc 取消",
         Tool::Ocr => "拖框选择要识别的区域 · Esc 取消",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
         _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
@@ -1813,6 +1833,9 @@ fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
                 draw_arrow(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
             Shape::Rect { a, b, stroke } => {
+                draw_rect(dc, *a, *b, stroke_width(scale, *stroke), scale)
+            }
+            Shape::Square { a, b, stroke } => {
                 draw_rect(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
             Shape::Ellipse { a, b, stroke } => {
@@ -1962,6 +1985,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         match editor.tool {
             Tool::Arrow => draw_arrow(dc, from, to, width, editor.scale),
             Tool::Rect => draw_rect(dc, from, to, width, editor.scale),
+            Tool::Square => draw_rect(dc, from, squared(from, to), width, editor.scale),
             Tool::Ellipse => draw_ellipse(dc, from, to, width, editor.scale),
             Tool::Mosaic => {
                 // 实时看到打码效果，外面再套一层选框
@@ -2003,16 +2027,17 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     let bar_top = editor.image_top + image_h + s(3.0);
     let bar_bottom = bar_top + bar_h;
-    let item = s(30.0);
-    let gap = s(2.0);
-    let sep_w = s(11.0);
+    let mut item = s(30.0);
+    let mut gap = s(2.0);
+    let mut sep_w = s(11.0);
     let pad = s(6.0);
 
     // bool = 这一格前面要不要画一条分组竖线
     let layout_items: Vec<(Action, bool)> = vec![
+        (Action::Tool(Tool::Rect), false),
+        (Action::Tool(Tool::Square), false),
         (Action::Tool(Tool::Ellipse), false),
         (Action::Tool(Tool::Arrow), false),
-        (Action::Tool(Tool::Rect), false),
         (Action::Tool(Tool::Pen), false),
         (Action::Tool(Tool::Mosaic), false),
         (Action::Tool(Tool::Text), false),
@@ -2029,10 +2054,21 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     ];
 
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
-    let bar_w = layout_items.len() as i32 * item
-        + (layout_items.len() as i32 - 1) * gap
-        + groups * (sep_w + gap)
-        + pad * 2;
+    let measure = |item: i32, gap: i32, sep_w: i32| -> i32 {
+        layout_items.len() as i32 * item
+            + (layout_items.len() as i32 - 1) * gap
+            + groups * (sep_w + gap)
+            + pad * 2
+    };
+    // 窄图（小截图 / 小屏）时整条按比例收窄，别让按钮跑出窗口
+    let avail = (client.right - s(16.0)).max(s(240.0));
+    if measure(item, gap, sep_w) > avail {
+        let factor = avail as f32 / measure(item, gap, sep_w) as f32;
+        item = ((item as f32 * factor) as i32).max(s(22.0));
+        gap = ((gap as f32 * factor) as i32).max(s(1.0));
+        sep_w = ((sep_w as f32 * factor) as i32).max(s(6.0));
+    }
+    let bar_w = measure(item, gap, sep_w);
     let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
 
     // 底栏背板：圆角 + 1px 描边
@@ -2408,8 +2444,8 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
 // 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
 
 const PACK_CELL: u32 = 176;
-/// 16 枚来自设计稿 + 2 枚补画（贴图 / 置顶）
-const PACK_COUNT: usize = 18;
+/// 16 枚来自设计稿 + 贴图/置顶 + 正方形画框
+const PACK_COUNT: usize = 19;
 
 struct IconPack {
     /// 每格 PACK_CELL×PACK_CELL 的灰度蒙版（0=透明，255=实心）
@@ -2471,6 +2507,7 @@ fn load_icon_pack() -> Option<IconPack> {
 fn pack_index(action: Action) -> Option<usize> {
     Some(match action {
         Action::Tool(Tool::Rect) => 0,
+        Action::Tool(Tool::Square) => 18,
         Action::Tool(Tool::Ellipse) => 1,
         Action::Tool(Tool::Arrow) => 3,
         Action::Tool(Tool::Pen) => 4,
@@ -3670,6 +3707,14 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                         editor.shapes.push(Shape::Rect {
                             a: from,
                             b: to,
+                            stroke: editor.stroke,
+                        })
+                    }
+                    Tool::Square if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
+                        let corner = squared(from, to);
+                        editor.shapes.push(Shape::Square {
+                            a: from,
+                            b: corner,
                             stroke: editor.stroke,
                         })
                     }
