@@ -32,7 +32,7 @@ use crate::theme::wide;
 const DT_NOPREFIX: u32 = 0x0800;
 
 const BORDER: i32 = 3;
-const CHIP_W: i32 = 268;
+const CHIP_W: i32 = 300;
 const CHIP_H: i32 = 62;
 const BORDER_CLASS: &str = "NetSpeedTaskbarRs.ScrollBorder";
 const PREVIEW_CLASS: &str = "NetSpeedTaskbarRs.ScrollPreview";
@@ -55,6 +55,10 @@ static CHIP: AtomicIsize = AtomicIsize::new(0);
 static BORDER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 右侧缩略图窗口
 static PREVIEW: AtomicIsize = AtomicIsize::new(0);
+/// 缩略图刷新节流用：上次刷新的时间点（毫秒）与调用次数
+static THUMB_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_THUMB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 /// 缩略图像素（宽, 高, BGRA），由抓帧线程写、预览窗口读
 static THUMB: std::sync::Mutex<Option<(i32, i32, std::sync::Arc<Vec<u8>>)>> =
     std::sync::Mutex::new(None);
@@ -455,6 +459,16 @@ unsafe fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
 
 /// 把当前长图采样成一张小图（最近邻，只要 O(缩略图) 的功夫）
 unsafe fn refresh_thumb(stitcher: &Stitcher, width: i32) {
+    // 节流：最多 8 次/秒。缩略图不用跟抓帧一样勤，也别把 UI 线程刷爆
+    let now = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    if now.saturating_sub(LAST_THUMB_MS.load(Ordering::Relaxed)) < 120 {
+        return;
+    }
+    LAST_THUMB_MS.store(now, Ordering::Relaxed);
+
     let image = stitcher.image();
     if image.width <= 0 || image.height <= 0 {
         return;
@@ -475,6 +489,13 @@ unsafe fn refresh_thumb(stitcher: &Stitcher, width: i32) {
     }
     if let Ok(mut guard) = THUMB.lock() {
         *guard = Some((thumb_w, thumb_h, std::sync::Arc::new(pixels)));
+    }
+    let calls = THUMB_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls <= 5 || calls % 20 == 0 {
+        crate::debug_log(&format!(
+            "scroll: 缩略图 {thumb_w}x{thumb_h}（长图 {}x{}）第 {calls} 次",
+            image.width, image.height
+        ));
     }
     let preview = PREVIEW.load(Ordering::SeqCst) as HWND;
     if !preview.is_null() {
@@ -704,6 +725,8 @@ pub unsafe fn start(panel: HWND, first: Bitmap, rect: (i32, i32, i32, i32)) {
                 copy
             });
             let mut stitcher = Stitcher::new(seed);
+            // 先把首帧画到缩略图里，不然刚开始滚之前右边是个空白框
+            refresh_thumb(&stitcher, THUMB_W);
             while !STOP.load(Ordering::SeqCst) {
                 burst_push(&mut stitcher, 3);
                 if stitcher.full() {
@@ -930,7 +953,7 @@ unsafe fn paint_preview(hwnd: HWND) {
     };
 
     let ui = crate::theme::ui();
-    let brush = CreateSolidBrush(0x0020_2020);
+    let brush = CreateSolidBrush(ui.chip);
     FillRect(dc, &client, brush);
     DeleteObject(brush as *mut _);
 
@@ -1051,7 +1074,7 @@ unsafe fn paint_chip(hwnd: HWND) {
     };
     DrawTextW(
         dc,
-        wide("滚动截图 · 用滚轮往下滚").as_ptr(),
+        wide("用滚轮往下滚").as_ptr(),
         -1,
         &mut title,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
@@ -1064,7 +1087,7 @@ unsafe fn paint_chip(hwnd: HWND) {
         bottom: 58,
     };
     let rows = APPENDED.load(Ordering::SeqCst);
-    let text = format!("已拼接 {rows} px · 滚完点 ✓", rows = rows);
+    let text = format!("已拼接 {rows} px", rows = rows);
     DrawTextW(
         dc,
         wide(&text).as_ptr(),
