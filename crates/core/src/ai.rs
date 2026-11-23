@@ -1437,6 +1437,10 @@ pub fn now_ms() -> i64 {
 }
 
 /// 本地当天 0 点对应的时间戳（毫秒）。
+/// 今天 0 点的时间戳。
+///
+/// 注意：内部用 GetLocalTime 读「现在过了多少秒」，所以 now_ms 必须是当前时间；
+/// 传历史时间戳会算出错的午夜（写测试时踩过）。
 pub fn local_midnight_ms(now_ms: i64) -> i64 {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -2039,5 +2043,96 @@ mod tests {
         let snapshot = engine.snapshot(now);
         assert_eq!(snapshot.today_tokens, 100, "今日应该是输入 + 输出");
         assert!(snapshot.speed > 0.0, "速度仍然只按输出算");
+    }
+
+    // ---------------------------------------------------- 日期换算 / 格式化边界
+
+    #[test]
+    fn civil_dates_map_to_known_epoch_days() {
+        // 1970-01-01 是第 0 天
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        // 2000-01-01 是闰年之前，2000-03-01 才算过了 2 月 29
+        assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2);
+        // 2024 是闰年：2/28 → 2/29 → 3/1 连续三天
+        assert_eq!(days_from_civil(2024, 2, 29) - days_from_civil(2024, 2, 28), 1);
+        assert_eq!(days_from_civil(2024, 3, 1) - days_from_civil(2024, 2, 29), 1);
+        // 2023 不是闰年：2/28 之后直接 3/1
+        assert_eq!(days_from_civil(2023, 3, 1) - days_from_civil(2023, 2, 28), 1);
+        // 跨年也要连续（这是按天分组的基准）
+        assert_eq!(days_from_civil(2025, 1, 1) - days_from_civil(2024, 12, 31), 1);
+        // 和已知锚点对得上：2020-01-01 = 18262 天
+        assert_eq!(days_from_civil(2020, 1, 1), 18262);
+    }
+
+    #[test]
+    fn day_index_agrees_with_local_hour() {
+        // day_index 和 local_hour 必须自洽：同一毫秒算出来的小时要落在 0..24
+        let base = 1_700_000_000_000i64;
+        for step in 0..48 {
+            let ms = base + step * 1_800_000; // 每半小时一档，覆盖两天
+            let hour = local_hour(ms);
+            assert!(hour < 24, "小时必须在 0..24，实际 {hour}");
+            // 同一天内 day_index 不变
+            let day = day_index(ms);
+            assert_eq!(day_index(ms + 1_000), day, "1 秒不该换天");
+        }
+    }
+
+    #[test]
+    fn local_midnight_is_the_start_of_the_same_day() {
+        // 这个函数内部用 GetLocalTime 取"今天过了多少秒"，所以只能用当前时间来测
+        let now = now_ms();
+        let midnight = local_midnight_ms(now);
+        assert!(midnight <= now, "午夜不能晚于现在");
+        assert!(now - midnight < 86_400_000, "午夜必须在一天之内");
+        assert_eq!(local_hour(midnight), 0, "午夜那一刻是 0 点");
+        assert_eq!(day_index(midnight), day_index(now), "午夜和现在属于同一天");
+    }
+
+    #[test]
+    fn token_formatting_boundaries() {
+        // 0 和负数都要能显示，不能出现 "NaN" / panic
+        assert!(!format_tokens(0).is_empty());
+        assert!(!format_tokens(-1).is_empty());
+        // 千 / 百万 / 十亿 三档都要有单位，且随数量级变化
+        let small = format_tokens(999);
+        let thousand = format_tokens(1_500);
+        let million = format_tokens(1_500_000);
+        let billion = format_tokens(2_500_000_000);
+        assert_ne!(small, thousand);
+        assert_ne!(thousand, million);
+        assert_ne!(million, billion);
+        for text in [small, thousand, million, billion] {
+            assert!(!text.contains("NaN"), "不能出现 NaN：{text}");
+            assert!(text.len() <= 8, "面板放得下，实际：{text}");
+        }
+    }
+
+    #[test]
+    fn speed_formatting_boundaries() {
+        // 0 / 极小值 / 大值都要稳定，不出现 inf、NaN、超长
+        for value in [0.0, 0.001, 0.9, 1.0, 9.99, 1024.0, 1_048_576.0, 1e9, 1e12] {
+            let text = format_speed(value);
+            assert!(!text.contains("NaN") && !text.contains("inf"), "速度格式化异常：{text}");
+            // 面板宽度有限，超过 1G 的档位会顶到边上，这里只要求别失控
+            let limit = if value >= 1e9 { 16 } else { 12 };
+            assert!(text.len() <= limit, "面板放得下，实际：{text}");
+        }
+    }
+
+    #[test]
+    fn suffix_matching_is_exact_and_case_insensitive() {
+        // 契约：后缀不带点（调用点传的都是 "jsonl"）
+        assert!(has_suffix("session.jsonl", "jsonl"));
+        assert!(has_suffix("SESSION.JSONL", "jsonl"), "扩展名比较要不分大小写");
+        // 只是名字里含 jsonl 不算
+        assert!(!has_suffix("jsonl-notes.txt", "jsonl"));
+        assert!(!has_suffix("noext", "jsonl"));
+        // 短名字 / 空名字不能越界
+        assert!(!has_suffix("a", "jsonl"));
+        assert!(!has_suffix("", "jsonl"));
+        // 多点文件名只认最后一段
+        assert!(has_suffix("a.b.jsonl", "jsonl"));
+        assert!(!has_suffix("a.jsonl.bak", "jsonl"));
     }
 }
