@@ -1598,12 +1598,17 @@ pub(crate) fn apply_translate_settings(
     key: &str,
     model: &str,
     base: &str,
+    profiles: &[netspeed_core::settings::TranslateProfile],
 ) {
     if let Some(panel) = panel_mut(parent) {
         panel.settings.translate_provider = provider.to_string();
         panel.settings.translate_key = key.to_string();
         panel.settings.translate_model = model.to_string();
         panel.settings.translate_base = base.to_string();
+        // 每家一份：切换服务商时互不覆盖
+        for (slot, profile) in panel.settings.translate_profiles.iter_mut().zip(profiles) {
+            *slot = profile.clone();
+        }
         panel.settings.save();
         crate::shot::set_translate_enabled(panel.settings.translate_enabled);
     }

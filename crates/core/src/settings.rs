@@ -65,8 +65,32 @@ pub struct Settings {
     pub translate_model: String,
     /// Base URL；空 = 用服务商默认值
     pub translate_base: String,
+    /// 三家服务商各自的 Key / 模型 / Base：切换服务商时照着搬，切回来还是上次填的
+    pub translate_profiles: [TranslateProfile; TRANSLATE_PROVIDERS.len()],
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
     extra: BTreeMap<String, String>,
+}
+
+/// 一家服务商的一套翻译配置
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TranslateProfile {
+    pub key: String,
+    pub model: String,
+    pub base: String,
+}
+
+/// 服务商在 ini 里的名字（下标和设置页的三颗按钮一致）
+pub const TRANSLATE_PROVIDERS: [&str; 2] = ["ChatGPT", "DeepSeek"];
+
+impl Settings {
+    /// 服务商名（"chatgpt"/"deepseek"/"opencode" 或显示名）→ 下标
+    pub fn translate_provider_index(name: &str) -> usize {
+        let name = name.trim().to_lowercase();
+        match name.as_str() {
+            "deepseek" => 1,
+            _ => 0,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -103,6 +127,7 @@ impl Default for Settings {
             translate_key: String::new(),
             translate_model: String::new(),
             translate_base: String::new(),
+            translate_profiles: Default::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -190,7 +215,25 @@ impl Settings {
                     }
                 }
                 _ => {
-                    settings.extra.insert(key.to_string(), value.to_string());
+                    // 每家一份：TranslateKey.ChatGPT / TranslateModel.OpenCode ...
+                    let mut stored = false;
+                    if let Some((field, provider)) = key.split_once('.') {
+                        if matches!(field, "TranslateKey" | "TranslateModel" | "TranslateBase") {
+                            let slot = Settings::translate_provider_index(provider);
+                            if slot < TRANSLATE_PROVIDERS.len() {
+                                let profile = &mut settings.translate_profiles[slot];
+                                match field {
+                                    "TranslateKey" => profile.key = value.to_string(),
+                                    "TranslateModel" => profile.model = value.to_string(),
+                                    _ => profile.base = value.to_string(),
+                                }
+                                stored = true;
+                            }
+                        }
+                    }
+                    if !stored {
+                        settings.extra.insert(key.to_string(), value.to_string());
+                    }
                 }
             }
         }
@@ -198,6 +241,31 @@ impl Settings {
         // 老配置没有 TranslateEnabled 这一行：填过 Key 就算「开着」，升级不丢功能
         if !text.contains("TranslateEnabled=") {
             settings.translate_enabled = !settings.translate_key.trim().is_empty();
+        }
+
+        // 老配置只有一份（没有 TranslateKey.xxx）：把它当成当前服务商的那份
+        if settings
+            .translate_profiles
+            .iter()
+            .all(|profile| profile.key.is_empty() && profile.model.is_empty() && profile.base.is_empty())
+        {
+            let index = Settings::translate_provider_index(&settings.translate_provider);
+            settings.translate_profiles[index] = TranslateProfile {
+                key: settings.translate_key.clone(),
+                model: settings.translate_model.clone(),
+                base: settings.translate_base.clone(),
+            };
+        }
+        // 当前服务商那份和扁平字段对齐（扁平字段是「正在用的」，translate.rs 只读它）
+        {
+            let index = Settings::translate_provider_index(&settings.translate_provider);
+            if let Some(profile) = settings.translate_profiles.get(index) {
+                if !profile.key.is_empty() || !profile.model.is_empty() || !profile.base.is_empty() {
+                    settings.translate_key = profile.key.clone();
+                    settings.translate_model = profile.model.clone();
+                    settings.translate_base = profile.base.clone();
+                }
+            }
         }
 
         settings.panel_width = settings.panel_width.clamp(72, 360);
@@ -217,7 +285,18 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        self.save_to(&Self::path());
+        // 落盘之前，把「正在用的这套」同步进对应服务商那一格，
+        // 这样切走再切回来还能拿到上次填的 Key / 模型
+        let mut synced = self.clone();
+        let index = Settings::translate_provider_index(&self.translate_provider);
+        if index < TRANSLATE_PROVIDERS.len() {
+            synced.translate_profiles[index] = TranslateProfile {
+                key: self.translate_key.clone(),
+                model: self.translate_model.clone(),
+                base: self.translate_base.clone(),
+            };
+        }
+        synced.save_to(&Self::path());
     }
 
     /// 写到指定文件（测试用；正常走 save()）
@@ -225,6 +304,7 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
+
 
         let mut out = String::new();
         out.push_str("SettingsVersion=7\n");
@@ -260,6 +340,13 @@ impl Settings {
         out.push_str(&format!("TranslateKey={}\n", self.translate_key));
         out.push_str(&format!("TranslateModel={}\n", self.translate_model));
         out.push_str(&format!("TranslateBase={}\n", self.translate_base));
+        for (index, name) in TRANSLATE_PROVIDERS.iter().enumerate() {
+            if let Some(profile) = self.translate_profiles.get(index) {
+                out.push_str(&format!("TranslateKey.{name}={}\n", profile.key));
+                out.push_str(&format!("TranslateModel.{name}={}\n", profile.model));
+                out.push_str(&format!("TranslateBase.{name}={}\n", profile.base));
+            }
+        }
 
         for (key, value) in &self.extra {
             // 上面这些键已经写过，不再重复

@@ -19,8 +19,6 @@ fn endpoint(settings: &netspeed_core::settings::Settings) -> (String, String) {
     let provider = settings.translate_provider.trim().to_lowercase();
     let (default_base, default_model) = match provider.as_str() {
         "deepseek" => ("https://api.deepseek.com/v1", "deepseek-chat"),
-        // OpenCode Zen：一个 key 走所有模型，chat/completions 兼容；默认用免费那个
-        "opencode" => ("https://opencode.ai/zen/v1", "deepseek-v4-flash-free"),
         _ => ("https://api.openai.com/v1", "gpt-4o-mini"),
     };
     let base = settings.translate_base.trim();
@@ -176,9 +174,9 @@ fn http_request(method: &str, url: &str, headers: &str, body: Option<&[u8]>) -> 
                 .unwrap_or_else(|| text.chars().take(200).collect());
             // OpenCode 的免费模型只在它自己的客户端里生效，走 API 会报 FreeUsageLimitError
             let hint = if detail.contains("Model access is disabled") {
-                "这个模型没开权限：去 OpenCode console 打开模型访问"
+                "这个模型没开权限：去服务商控制台打开模型访问"
             } else if detail.contains("Free usage limit") || detail.contains("FreeUsageLimit") {
-                "免费模型只限 OpenCode 客户端"
+                "免费模型不开放给 API"
             } else {
                 match status {
                     401 => "Key 不对或已失效",
@@ -205,7 +203,6 @@ fn http_request(method: &str, url: &str, headers: &str, body: Option<&[u8]>) -> 
 pub fn default_model(provider: &str) -> &'static str {
     match provider.trim().to_lowercase().as_str() {
         "deepseek" => "deepseek-chat",
-        "opencode" => "deepseek-v4-flash-free",
         _ => "gpt-4o-mini",
     }
 }
@@ -214,7 +211,6 @@ pub fn default_model(provider: &str) -> &'static str {
 pub fn default_base(provider: &str) -> &'static str {
     match provider.trim().to_lowercase().as_str() {
         "deepseek" => "https://api.deepseek.com/v1",
-        "opencode" => "https://opencode.ai/zen/v1",
         _ => "https://api.openai.com/v1",
     }
 }

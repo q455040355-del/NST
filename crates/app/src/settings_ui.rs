@@ -434,6 +434,10 @@ struct State {
     models_busy: bool,
     /// 拉模型失败的原因（显示在模型那一行下面）
     models_error: Option<String>,
+    /// 三家（现在是两家）各自的一套 Key / 模型 / Base，切换服务商时照着搬
+    tr_profiles: [netspeed_core::settings::TranslateProfile; 2],
+    /// 输入框里的选中范围（字符下标，start..end）；None = 没选中
+    tr_sel: Option<(usize, usize)>,
     /// 正在测连接
     test_busy: bool,
     /// 上一次测连接的结果：(成功?, 说明)
@@ -505,8 +509,6 @@ struct Layout {
     tr_reveal: RECT,
     /// 「翻译」小标题右边那颗总开关
     tr_toggle: RECT,
-    /// 服务商第三颗：OpenCode
-    tr_opencode: RECT,
     /// 模型那一格右边的「获取」
     tr_fetch: RECT,
     /// 「测试连接」
@@ -678,17 +680,11 @@ fn layout(state: &State, client: RECT) -> Layout {
         tr_chatgpt: RECT {
             left: right_left,
             top: s(TR_ROW1_TOP, scale),
-            right: right_left + (right - right_left - s(12.0, scale)) / 3,
+            right: right_left + (right - right_left - s(6.0, scale)) / 2,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
         },
         tr_deepseek: RECT {
-            left: right_left + (right - right_left - s(12.0, scale)) / 3 + s(6.0, scale),
-            top: s(TR_ROW1_TOP, scale),
-            right: right_left + (right - right_left - s(12.0, scale)) / 3 * 2 + s(6.0, scale),
-            bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
-        },
-        tr_opencode: RECT {
-            left: right_left + (right - right_left - s(12.0, scale)) / 3 * 2 + s(12.0, scale),
+            left: right_left + (right - right_left - s(6.0, scale)) / 2 + s(6.0, scale),
             top: s(TR_ROW1_TOP, scale),
             right,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
@@ -1749,7 +1745,6 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             for (rect, name, index) in [
                 (l.tr_chatgpt, "ChatGPT", 0usize),
                 (l.tr_deepseek, "DeepSeek", 1usize),
-                (l.tr_opencode, "OpenCode", 2usize),
             ] {
                 let active = state.tr_provider == index;
                 let (fill, ink) = if active {
@@ -1832,6 +1827,24 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                     TrField::Base => p.s(10.0),
                 };
                 let text_left = rect.left + p.s(10.0);
+                // 选中的那段先铺一层淡蓝底
+                if editing {
+                    if let Some((start, end)) = state.tr_sel {
+                        if end > start {
+                            let prefix: String = text.chars().take(start).collect();
+                            let mid: String = text.chars().skip(start).take(end - start).collect();
+                            let x0 = text_left + crate::shot::text_width(p.dc, &prefix, state.fonts.label);
+                            let x1 = x0 + crate::shot::text_width(p.dc, &mid, state.fonts.label);
+                            p.fill(
+                                x0,
+                                rect.top + p.s(4.0),
+                                x1,
+                                rect.bottom - p.s(4.0),
+                                mix_white(c.accent, 0.78),
+                            );
+                        }
+                    }
+                }
                 p.text(
                     &text,
                     state.fonts.label,
@@ -2289,32 +2302,8 @@ unsafe extern "system" fn popup_proc(
             DestroyWindow(hwnd);
             0
         }
-        WM_CHAR => {
-            let state = state_of(hwnd);
-            if state.is_null() {
-                return 0;
-            }
-            let state = &mut *state;
-            if let Some(field) = state.tr_edit {
-                let ch = wparam as u32;
-                if ch >= 0x20 && ch != 0x7F {
-                    if let Some(c) = char::from_u32(ch) {
-                        let buffer = match field {
-                            TrField::Key => &mut state.tr_key,
-                            TrField::Model => &mut state.tr_model,
-                            TrField::Base => &mut state.tr_base,
-                        };
-                        let mut chars: Vec<char> = buffer.chars().collect();
-                        let caret = state.tr_caret.min(chars.len());
-                        chars.insert(caret, c);
-                        *buffer = chars.into_iter().collect();
-                        state.tr_caret = caret + 1;
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                    }
-                }
-            }
-            0
-        }
+        // 下拉窗口不管输入框编辑：它的 USERDATA 是 Popup，按 State 解会读坏内存
+        WM_CHAR => 0,
         WM_KEYDOWN => {
             match wparam as u32 {
                 0x1B => {
@@ -2644,8 +2633,6 @@ pub fn open(parent: HWND, settings: &Settings) {
             translate_enabled: settings.translate_enabled,
             tr_provider: if settings.translate_provider.eq_ignore_ascii_case("deepseek") {
                 1
-            } else if settings.translate_provider.eq_ignore_ascii_case("opencode") {
-                2
             } else {
                 0
             },
@@ -2657,6 +2644,11 @@ pub fn open(parent: HWND, settings: &Settings) {
             models: Vec::new(),
             models_busy: false,
             models_error: None,
+            tr_profiles: [
+                settings.translate_profiles[0].clone(),
+                settings.translate_profiles[1].clone(),
+            ],
+            tr_sel: None,
             test_busy: false,
             test_result: None,
             tr_caret: 0,
@@ -2950,10 +2942,13 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
 /// 下拉选中某一项：鼠标点选和键盘改值共用
 /// 把翻译配置写回设置（点服务商、编辑结束、关窗时调）
 fn commit_translate(state: &State) {
-    let provider = match state.tr_provider {
-        1 => "deepseek",
-        2 => "opencode",
-        _ => "chatgpt",
+    let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" };
+    // 把当前这套写进它自己那格，再整体交出去（切走切回都不丢）
+    let mut profiles = state.tr_profiles.clone();
+    profiles[state.tr_provider.min(1)] = netspeed_core::settings::TranslateProfile {
+        key: state.tr_key.clone(),
+        model: state.tr_model.clone(),
+        base: state.tr_base.clone(),
     };
     crate::apply_translate_settings(
         state.parent,
@@ -2961,6 +2956,7 @@ fn commit_translate(state: &State) {
         &state.tr_key,
         &state.tr_model,
         &state.tr_base,
+        &profiles,
     );
 }
 
@@ -3080,12 +3076,35 @@ fn clipboard_text() -> Option<String> {
     }
 }
 
+/// 把选中的那段删掉（没有选中就什么都不做），返回删完后的光标位置
+fn delete_selection(state: &mut State, field: TrField) -> Option<usize> {
+    let (start, end) = state.tr_sel?;
+    if end <= start {
+        state.tr_sel = None;
+        return None;
+    }
+    let buffer = match field {
+        TrField::Key => &mut state.tr_key,
+        TrField::Model => &mut state.tr_model,
+        TrField::Base => &mut state.tr_base,
+    };
+    let mut chars: Vec<char> = buffer.chars().collect();
+    let start = start.min(chars.len());
+    let end = end.min(chars.len());
+    chars.drain(start..end);
+    *buffer = chars.into_iter().collect();
+    state.tr_caret = start;
+    state.tr_sel = None;
+    Some(start)
+}
+
 /// 把一段文字插到光标的当前位置（换行/制表符会被丢掉，key 里不可能有这些）
 fn insert_at_caret(state: &mut State, field: TrField, text: &str) {
     let clean: String = text
         .chars()
         .filter(|c| *c != '\r' && *c != '\n' && *c != '\t')
         .collect();
+    delete_selection(state, field);
     let buffer = match field {
         TrField::Key => &mut state.tr_key,
         TrField::Model => &mut state.tr_model,
@@ -3111,12 +3130,7 @@ fn start_model_fetch(state: &mut State) {
     state.models_busy = true;
     state.models_error = None;
     let raw = state.hwnd as isize;
-    let provider = match state.tr_provider {
-        1 => "deepseek",
-        2 => "opencode",
-        _ => "chatgpt",
-    }
-    .to_string();
+    let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" }.to_string();
     let base = state.tr_base.clone();
     let key = state.tr_key.clone();
     unsafe {
@@ -3143,12 +3157,7 @@ fn start_connection_test(state: &mut State) {
     state.test_busy = true;
     state.test_result = None;
     let raw = state.hwnd as isize;
-    let provider = match state.tr_provider {
-        1 => "deepseek",
-        2 => "opencode",
-        _ => "chatgpt",
-    }
-    .to_string();
+    let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" }.to_string();
     let base = state.tr_base.clone();
     let key = state.tr_key.clone();
     let model = state.tr_model.clone();
@@ -3566,17 +3575,32 @@ unsafe extern "system" fn dialog_proc(
                     Some(0usize)
                 } else if inside(l.tr_deepseek) {
                     Some(1usize)
-                } else if inside(l.tr_opencode) {
-                    Some(2usize)
                 } else {
                     None
                 };
                 if let Some(provider) = provider {
-                    state.tr_provider = provider;
-                    state.models.clear();
-                    state.models_error = None;
-                    commit_translate(state);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    if provider != state.tr_provider {
+                        // 1) 先把正在填的这套存回原来的服务商
+                        state.tr_profiles[state.tr_provider.min(1)] =
+                            netspeed_core::settings::TranslateProfile {
+                                key: state.tr_key.clone(),
+                                model: state.tr_model.clone(),
+                                base: state.tr_base.clone(),
+                            };
+                        // 2) 换上目标服务商上次填的那套（没有就清空，用官方默认）
+                        state.tr_provider = provider;
+                        let profile = state.tr_profiles[provider.min(1)].clone();
+                        state.tr_key = profile.key;
+                        state.tr_model = profile.model;
+                        state.tr_base = profile.base;
+                        state.tr_edit = None;
+                        state.tr_sel = None;
+                        state.models.clear();
+                        state.models_error = None;
+                        state.test_result = None;
+                        commit_translate(state);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
                     return 0;
                 }
 
@@ -3911,15 +3935,23 @@ unsafe extern "system" fn dialog_proc(
             // 正在编辑翻译输入框：先处理编辑键
             if state.tr_edit.is_some() {
                 let field = state.tr_edit.unwrap();
-                let buffer = match field {
-                    TrField::Key => &mut state.tr_key,
-                    TrField::Model => &mut state.tr_model,
-                    TrField::Base => &mut state.tr_base,
+                // 只读地拿长度和内容，别在整段里长期占着 &mut
+                let snapshot = match field {
+                    TrField::Key => state.tr_key.clone(),
+                    TrField::Model => state.tr_model.clone(),
+                    TrField::Base => state.tr_base.clone(),
                 };
-                let count = buffer.chars().count();
+                let count = snapshot.chars().count();
                 let caret = state.tr_caret.min(count);
                 let ctrl = unsafe { GetKeyState(0x11) } < 0;
                 let shift = unsafe { GetKeyState(0x10) } < 0;
+                // 全选：Ctrl+A（选完直接打字或粘贴就是整格替换）
+                if ctrl && (wparam as u32) == 0x41 {
+                    state.tr_sel = if count > 0 { Some((0, count)) } else { None };
+                    state.tr_caret = count;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
                 // 粘贴：Ctrl+V，或者 Shift+Insert（老的输入习惯也认）
                 if (ctrl && (wparam as u32) == 0x56) || (shift && (wparam as u32) == 0x2D) {
                     if let Some(text) = clipboard_text() {
@@ -3928,9 +3960,16 @@ unsafe extern "system" fn dialog_proc(
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
                 }
-                // 复制：Ctrl+C 把整格内容拷走（Key 打码时也能拷到真值）
+                // 复制：Ctrl+C 优先拷选中的那段，没选中就拷整格（Key 打码时也能拷到真值）
                 if ctrl && (wparam as u32) == 0x43 {
-                    let text = buffer.clone();
+                    let text = match state.tr_sel {
+                        Some((start, end)) if end > start => snapshot
+                            .chars()
+                            .skip(start)
+                            .take(end - start)
+                            .collect::<String>(),
+                        _ => snapshot.clone(),
+                    };
                     if !text.is_empty() {
                         crate::ocr::copy_text(&text);
                     }
@@ -3938,8 +3977,17 @@ unsafe extern "system" fn dialog_proc(
                 }
                 match wparam as u32 {
                     0x08 => {
-                        // 退格
+                        // 退格：有选中就整段删掉，没有才删一个字
+                        if delete_selection(state, field).is_some() {
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
                         if caret > 0 {
+                            let buffer = match field {
+                                TrField::Key => &mut state.tr_key,
+                                TrField::Model => &mut state.tr_model,
+                                TrField::Base => &mut state.tr_base,
+                            };
                             let mut chars: Vec<char> = buffer.chars().collect();
                             chars.remove(caret - 1);
                             *buffer = chars.into_iter().collect();
@@ -3947,19 +3995,41 @@ unsafe extern "system" fn dialog_proc(
                         }
                     }
                     0x2E => {
-                        // Delete
+                        // Delete：同样先处理选中
+                        if delete_selection(state, field).is_some() {
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
                         if caret < count {
+                            let buffer = match field {
+                                TrField::Key => &mut state.tr_key,
+                                TrField::Model => &mut state.tr_model,
+                                TrField::Base => &mut state.tr_base,
+                            };
                             let mut chars: Vec<char> = buffer.chars().collect();
                             chars.remove(caret);
                             *buffer = chars.into_iter().collect();
                         }
                     }
-                    0x25 => state.tr_caret = caret.saturating_sub(1),
-                    0x27 => state.tr_caret = (caret + 1).min(count),
-                    0x24 => state.tr_caret = 0,
-                    0x23 => state.tr_caret = count,
+                    0x25 => {
+                        state.tr_sel = None;
+                        state.tr_caret = caret.saturating_sub(1);
+                    }
+                    0x27 => {
+                        state.tr_sel = None;
+                        state.tr_caret = (caret + 1).min(count);
+                    }
+                    0x24 => {
+                        state.tr_sel = None;
+                        state.tr_caret = 0;
+                    }
+                    0x23 => {
+                        state.tr_sel = None;
+                        state.tr_caret = count;
+                    }
                     0x0D | 0x1B => {
                         // 回车 / Esc：结束编辑并落盘
+                        state.tr_sel = None;
                         commit_translate(state);
                         state.tr_edit = None;
                     }
