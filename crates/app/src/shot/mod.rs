@@ -1374,6 +1374,53 @@ struct Editor {
     back: Option<(HDC, HBITMAP, i32, i32)>,
 }
 
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            base: Bitmap::new(1, 1),
+            screen: (0, 0, 0, 0),
+            base_scale: 1.0,
+            zoom: 1.0,
+            pan: None,
+            shapes: Vec::new(),
+            undone: Vec::new(),
+            next_number: 1,
+            beautify: false,
+            title_h: 0,
+            title_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            bottom_strip: 0,
+            probed: false,
+            bar: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            tool: Tool::None,
+            scale: 1.0,
+            image_left: 0,
+            image_top: 0,
+            drag_from: None,
+            drag_to: None,
+            pen_points: Vec::new(),
+            text: None,
+            stroke: 0,
+            buttons: Vec::new(),
+            pressed: None,
+            hover: None,
+            toast: None,
+            topmost: false,
+            source: None,
+            back: None,
+        }
+    }
+}
+
 const ANNOT: u32 = 0x003A_3AE0; // 0x00BBGGRR，红
 /// 序号的底色（微信那个红）
 const NUMBER_RED: u32 = 0x0040_43E6;
