@@ -59,6 +59,8 @@ const SW_TRANSLATE: usize = 4;
 const SW_AUTOSTART: usize = 5;
 
 static ANIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 上一帧还没被画完（消息队列里只允许排一帧，排多了会几帧挤在一起跳）
+static ANIM_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ANIM_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 面板字号（显示文案, 百分比）
@@ -447,6 +449,8 @@ struct State {
     sw: [f32; 6],
     /// 翻译区块的「展开度」：0 = 收起，1 = 完全展开
     tr_open: f32,
+    /// AI 来源那六格的手风琴展开度
+    ai_open: f32,
     /// 上一帧动效的时间
     anim_at: Option<std::time::Instant>,
     popup: HWND,
@@ -1227,64 +1231,93 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     let sw_h = p.s(22.0);
     switch(left_right - sw_w, mid - sw_h / 2, sw_w, sw_h, state.sw[SW_AI]);
 
-    // 六个来源：排成两列三行（一列六行会顶出窗口）
-    for (index, slot) in l.ai_sources.iter().enumerate() {
-        let rect = *slot;
-        let right = rect.right;
-        let on = state.ai_sources[index];
-        if state.ai_enabled && state.hover == Some(Hit::AiSource(index)) {
-            p.round(
-                rect.left,
-                rect.top + p.s(1.0),
-                right,
-                rect.bottom - p.s(1.0),
-                p.s(7.0),
-                c.chip,
-                c.chip,
-            );
+    // 六个来源：排成两列三行（一列六行会顶出窗口）；
+    // AI 关掉时这一块也要像手风琴一样收起来
+    let ai_shade_open = state.ai_open > 0.01;
+    let mut ai_shade_saved: i32 = 0;
+    if ai_shade_open {
+        let shade_top = p.s(AI_SOURCES_TOP - 4.0);
+        let shade_full = p.s(AI_SOURCE_ROW_H * 3.0 + 8.0);
+        let shade_bottom = shade_top + (shade_full as f32 * state.ai_open).round() as i32;
+        let slide = (((1.0 - state.ai_open) * -8.0) * state.scale).round() as i32;
+        ai_shade_saved = SaveDC(dc);
+        if ai_shade_saved != 0 {
+            IntersectClipRect(dc, 0, shade_top, client.right, shade_bottom);
+            SetViewportOrgEx(dc, 0, -scroll + slide, std::ptr::null_mut());
         }
-        p.text(
-            AI_SOURCE_LABELS[index],
-            state.fonts.value,
-            mix(c.text3, c.text, state.sw[SW_AI]),
-            rect.left + p.s(16.0),
-            rect.top,
-            right - p.s(30.0),
-            rect.bottom,
-            DT_LEFT,
-        );
+        if let Some(aa) = &p.aa {
+            aa.clip_intersect(0, shade_top, client.right, shade_bottom);
+            aa.translate(0, slide);
+        }
+    }
+    if ai_shade_open {
+        for (index, slot) in l.ai_sources.iter().enumerate() {
+            let rect = *slot;
+            let right = rect.right;
+            let on = state.ai_sources[index];
+            if state.ai_enabled && state.hover == Some(Hit::AiSource(index)) {
+                p.round(
+                    rect.left,
+                    rect.top + p.s(1.0),
+                    right,
+                    rect.bottom - p.s(1.0),
+                    p.s(7.0),
+                    c.chip,
+                    c.chip,
+                );
+            }
+            p.text(
+                AI_SOURCE_LABELS[index],
+                state.fonts.value,
+                mix(c.text3, c.text, state.sw[SW_AI]),
+                rect.left + p.s(16.0),
+                rect.top,
+                right - p.s(30.0),
+                rect.bottom,
+                DT_LEFT,
+            );
 
-        let size = p.s(16.0);
-        // 复选框紧跟在文字后面（原来甩在格子最右边，和标签断开了）
-        let text_w = crate::shot::text_width(p.dc, AI_SOURCE_LABELS[index], state.fonts.value);
-        let bx = (rect.left + p.s(16.0) + text_w + p.s(10.0))
-            .min(right - size - p.s(6.0));
-        let by = (rect.top + rect.bottom) / 2 - size / 2;
-        let (fill, border) = if !state.ai_enabled {
-            (c.surface, mix_white(c.border, 0.25))
-        } else if on {
-            (c.accent, c.accent)
-        } else {
-            (c.surface, mix_white(c.border, 0.05))
-        };
-        p.round(bx, by, bx + size, by + size, p.s(4.0), fill, border);
-        if on && state.ai_enabled {
-            p.line(
-                bx + p.s(4.0),
-                by + p.s(8.0),
-                bx + p.s(7.0),
-                by + p.s(11.0),
-                KNOB,
-                p.s(1.6),
-            );
-            p.line(
-                bx + p.s(7.0),
-                by + p.s(11.0),
-                bx + p.s(12.0),
-                by + p.s(5.0),
-                KNOB,
-                p.s(1.6),
-            );
+            let size = p.s(16.0);
+            // 复选框紧跟在文字后面（原来甩在格子最右边，和标签断开了）
+            let text_w = crate::shot::text_width(p.dc, AI_SOURCE_LABELS[index], state.fonts.value);
+            let bx = (rect.left + p.s(16.0) + text_w + p.s(10.0))
+                .min(right - size - p.s(6.0));
+            let by = (rect.top + rect.bottom) / 2 - size / 2;
+            let (fill, border) = if !state.ai_enabled {
+                (c.surface, mix_white(c.border, 0.25))
+            } else if on {
+                (c.accent, c.accent)
+            } else {
+                (c.surface, mix_white(c.border, 0.05))
+            };
+            p.round(bx, by, bx + size, by + size, p.s(4.0), fill, border);
+            if on && state.ai_enabled {
+                p.line(
+                    bx + p.s(4.0),
+                    by + p.s(8.0),
+                    bx + p.s(7.0),
+                    by + p.s(11.0),
+                    KNOB,
+                    p.s(1.6),
+                );
+                p.line(
+                    bx + p.s(7.0),
+                    by + p.s(11.0),
+                    bx + p.s(12.0),
+                    by + p.s(5.0),
+                    KNOB,
+                    p.s(1.6),
+                );
+            }
+        }
+    }
+    if ai_shade_saved != 0 {
+        RestoreDC(dc, ai_shade_saved);
+    }
+    if ai_shade_open {
+        if let Some(aa) = &p.aa {
+            aa.translate(0, -(((1.0 - state.ai_open) * -8.0) * state.scale).round() as i32);
+            aa.clip_rect(0, view_top + scroll, client.right, view_bottom + scroll);
         }
     }
 
@@ -2489,6 +2522,7 @@ pub fn open(parent: HWND, settings: &Settings) {
                 if settings.auto_start { 1.0 } else { 0.0 },
             ],
             tr_open: if settings.translate_enabled { 1.0 } else { 0.0 },
+            ai_open: if settings.ai_enabled { 1.0 } else { 0.0 },
             anim_at: None,
             popup: std::ptr::null_mut(),
             popup_row: 0,
@@ -2865,17 +2899,48 @@ fn start_anim(hwnd: HWND) {
     }
     let raw = hwnd as isize;
     std::thread::spawn(move || {
+        use std::time::{Duration, Instant};
+        let frame = Duration::from_micros(16_000);
+        let mut next = Instant::now();
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            unsafe {
-                if ANIM_ACTIVE.load(Ordering::Relaxed) == false {
+            if !ANIM_ACTIVE.load(Ordering::Relaxed) {
+                break;
+            }
+            // 等上一帧画完再发下一帧：消息队列里永远只排一帧，节奏才是匀的
+            let deadline = Instant::now() + Duration::from_millis(80);
+            while ANIM_PENDING.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            next += frame;
+            let now = Instant::now();
+            if now > next + frame * 3 {
+                // 落后太多就不追了，重新对齐（免得一口气补好几帧）
+                next = now;
+            }
+            // Windows 默认 Sleep 精度是 15.6ms，睡到 16ms 会变成 31ms 一顿一顿的：
+            // 所以大头用 sleep，最后 2ms 自旋，保证真的 60fps
+            loop {
+                let now = Instant::now();
+                if now >= next {
                     break;
                 }
+                let left = next - now;
+                if left > Duration::from_millis(2) {
+                    std::thread::sleep(left - Duration::from_millis(2));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+
+            ANIM_PENDING.store(true, Ordering::Relaxed);
+            unsafe {
                 if PostMessageW(raw as HWND, WM_APP_ANIM, 0, 0) == 0 {
                     break;
                 }
             }
         }
+        ANIM_PENDING.store(false, Ordering::Relaxed);
         ANIM_THREAD.store(false, Ordering::Relaxed);
     });
 }
@@ -2916,6 +2981,13 @@ fn advance_anim(state: &mut State) {
         busy = true;
     } else {
         state.tr_open = goal;
+    }
+    let goal = if state.ai_enabled { 1.0 } else { 0.0 };
+    if (state.ai_open - goal).abs() > 0.004 {
+        state.ai_open += (goal - state.ai_open) * (1.0 - (-dt * 12.0).exp());
+        busy = true;
+    } else {
+        state.ai_open = goal;
     }
 
     ANIM_ACTIVE.store(busy, Ordering::Relaxed);
@@ -3394,6 +3466,7 @@ unsafe extern "system" fn dialog_proc(
             0
         }
         WM_APP_ANIM => {
+            std::sync::atomic::AtomicBool::store(&ANIM_PENDING, false, std::sync::atomic::Ordering::Relaxed);
             let state = state_of(hwnd);
             if !state.is_null() {
                 advance_anim(&mut *state);
