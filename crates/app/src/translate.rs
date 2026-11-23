@@ -175,7 +175,9 @@ fn http_request(method: &str, url: &str, headers: &str, body: Option<&[u8]>) -> 
                 })
                 .unwrap_or_else(|| text.chars().take(200).collect());
             // OpenCode 的免费模型只在它自己的客户端里生效，走 API 会报 FreeUsageLimitError
-            let hint = if detail.contains("Free usage limit") || detail.contains("FreeUsageLimit") {
+            let hint = if detail.contains("Model access is disabled") {
+                "这个模型没开权限：去 OpenCode console 打开模型访问"
+            } else if detail.contains("Free usage limit") || detail.contains("FreeUsageLimit") {
                 "免费模型只限 OpenCode 客户端"
             } else {
                 match status {
@@ -289,6 +291,24 @@ pub fn fetch_models(
         .and_then(|data| data.as_array())
         .ok_or_else(|| "返回里没有模型列表".to_string())?;
 
+    // 免费模型在 OpenCode 里只限它自己的客户端用，走 API 一定 429，列出来只会误导
+    let is_free = |item: &serde_json::Value| -> bool {
+        if let Some(cost) = item.get("cost").and_then(|cost| cost.get("text")) {
+            let price = |key: &str| -> Option<f64> {
+                cost.get(key)
+                    .and_then(|side| side.get("price"))
+                    .and_then(|price| price.as_f64())
+            };
+            if let (Some(input), Some(output)) = (price("input"), price("output")) {
+                return input <= 0.0 && output <= 0.0;
+            }
+        }
+        item.get("id")
+            .and_then(|id| id.as_str())
+            .map(|id| id.ends_with("-free"))
+            .unwrap_or(false)
+    };
+
     let mut models: Vec<(String, String)> = Vec::new();
     for item in list {
         let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
@@ -299,6 +319,27 @@ pub fn fetch_models(
             if !api.eq_ignore_ascii_case("chat-completions") {
                 continue;
             }
+        }
+        if is_free(item) {
+            continue;
+        }
+        // 图片 / 语音 / 向量这些不是聊天模型，选进去只会 500
+        let lowered = id.to_lowercase();
+        if [
+            "image",
+            "embedding",
+            "tts",
+            "whisper",
+            "moderation",
+            "audio",
+            "realtime",
+            "transcribe",
+            "dall-e",
+        ]
+        .iter()
+        .any(|bad| lowered.contains(bad))
+        {
+            continue;
         }
         let name = item
             .get("name")
