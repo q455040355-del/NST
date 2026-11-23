@@ -1126,7 +1126,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             Hit::OcrToggle,
             Hit::OcrHotkey,
             "取字（OCR）",
-            "只管菜单项和直接取字热键；编辑窗里的 OCR 不受影响",
+            "只管菜单项和取字热键",
             state.ocr_enabled,
             state.ocr_hotkey.as_str(),
             state.capture == 2,
