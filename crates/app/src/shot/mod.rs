@@ -467,14 +467,12 @@ fn selection(overlay: &Overlay) -> Option<RECT> {
     let Some(start) = overlay.start else {
         return overlay.hover;
     };
-    let current = overlay.current;
-    let left = start.x.min(current.x).max(0);
-    let top = start.y.min(current.y).max(0);
-    let right = start.x.max(current.x).min(overlay.shot.width);
-    let bottom = start.y.max(current.y).min(overlay.shot.height);
-    if right - left < 2 || bottom - top < 2 {
-        return None;
-    }
+    let [left, top, right, bottom] = selection_rect(
+        (start.x, start.y),
+        (overlay.current.x, overlay.current.y),
+        overlay.shot.width,
+        overlay.shot.height,
+    )?;
     Some(RECT {
         left,
         top,
@@ -595,13 +593,8 @@ unsafe extern "system" fn find_window_under(hwnd: HWND, lparam: LPARAM) -> i32 {
 
 /// 屏幕矩形 → 截图坐标（多屏时截图原点可能不是 0,0）
 fn shot_rect(rect: RECT, origin: (i32, i32), width: i32, height: i32) -> Option<RECT> {
-    let left = (rect.left - origin.0).clamp(0, width);
-    let top = (rect.top - origin.1).clamp(0, height);
-    let right = (rect.right - origin.0).clamp(0, width);
-    let bottom = (rect.bottom - origin.1).clamp(0, height);
-    if right - left < 2 || bottom - top < 2 {
-        return None;
-    }
+    let [left, top, right, bottom] =
+        window_to_shot([rect.left, rect.top, rect.right, rect.bottom], origin, width, height)?;
     Some(RECT {
         left,
         top,

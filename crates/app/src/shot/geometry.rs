@@ -190,6 +190,45 @@ pub(super) const TOOLBAR_ITEMS: &[(Action, bool)] = &[
 
 
 
+
+/// 拖拽出一块选区：任意方向都要归一化成左上/右下，并夹在截图范围内。
+/// 小于 2×2 视为误触（返回 None）。
+pub(super) fn selection_rect(
+    start: (i32, i32),
+    current: (i32, i32),
+    width: i32,
+    height: i32,
+) -> Option<[i32; 4]> {
+    let left = start.0.min(current.0).max(0);
+    let top = start.1.min(current.1).max(0);
+    let right = start.0.max(current.0).min(width);
+    let bottom = start.1.max(current.1).min(height);
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    Some([left, top, right, bottom])
+}
+
+/// 屏幕窗口矩形 → 截图坐标（去掉遮罩原点，再夹进截图范围）。
+pub(super) fn window_to_shot(
+    rect: [i32; 4],
+    origin: (i32, i32),
+    width: i32,
+    height: i32,
+) -> Option<[i32; 4]> {
+    let clamp = |value: i32, high: i32| value.clamp(0, high.max(0));
+    let [left, top, right, bottom] = [
+        clamp(rect[0] - origin.0, width),
+        clamp(rect[1] - origin.1, height),
+        clamp(rect[2] - origin.0, width),
+        clamp(rect[3] - origin.1, height),
+    ];
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    Some([left, top, right, bottom])
+}
+
 /// 客户区坐标 → 图片坐标（夹到图片范围内）。
 ///
 /// 抽出来是因为这里有三个容易错的乘法：缩放的除法、平移偏移的减法、以及
@@ -354,5 +393,53 @@ mod input_tests {
         assert_eq!(zoomed_origin((100, 100), 0, 0, 0.5), (50, 50));
         // 1 倍不动
         assert_eq!(zoomed_origin((80, 60), 30, 20, 1.0), (30, 20));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn selection_normalizes_any_drag_direction() {
+        // 从右下往左上拖，结果要和反方向一样
+        let a = selection_rect((300, 200), (100, 80), 400, 300).unwrap();
+        let b = selection_rect((100, 80), (300, 200), 400, 300).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, [100, 80, 300, 200]);
+    }
+
+    #[test]
+    fn selection_clamps_to_screenshot() {
+        // 拖到截图外面：夹到边界，不能出现负数或越界
+        let r = selection_rect((-50, -30), (9999, 9999), 400, 300).unwrap();
+        assert_eq!(r, [0, 0, 400, 300]);
+    }
+
+    #[test]
+    fn tiny_selection_is_rejected() {
+        // 点一下（没拖动）和 1px 抖动都不算选区
+        assert!(selection_rect((10, 10), (10, 10), 400, 300).is_none());
+        assert!(selection_rect((10, 10), (11, 11), 400, 300).is_none());
+        assert!(selection_rect((10, 10), (12, 12), 400, 300).is_some());
+    }
+
+    #[test]
+    fn window_rect_maps_into_shot_and_clamps() {
+        // 遮罩原点在 (100, 50)：窗口矩形减掉原点就落到截图坐标
+        let r = window_to_shot([130, 70, 330, 270], (100, 50), 400, 300).unwrap();
+        assert_eq!(r, [30, 20, 230, 220]);
+
+        // 窗口比截图大：夹满
+        let r = window_to_shot([0, 0, 9999, 9999], (100, 50), 400, 300).unwrap();
+        assert_eq!(r, [0, 0, 400, 300]);
+    }
+
+    #[test]
+    fn window_rect_outside_shot_is_rejected() {
+        // 整块在截图左边之外 → 没有交集
+        assert!(window_to_shot([-500, 0, -400, 100], (0, 0), 400, 300).is_none());
+        // 只剩 1px 的边 → 也算没有
+        assert!(window_to_shot([-500, 0, 1, 100], (0, 0), 400, 300).is_none());
     }
 }
