@@ -524,6 +524,12 @@ impl Panel {
         self.height = 0;
     }
 
+    /// 系统主题 / 任务栏外观变了：底色缓存作废，下一帧重新采样
+    pub fn forget_background(&mut self) {
+        self.bg_rect = (0, 0, 0, 0);
+        self.bg_at = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    }
+
     fn ensure_buffer(&mut self) {
         let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         unsafe {
@@ -591,10 +597,20 @@ impl Panel {
             GetWindowRect(self.hwnd, &mut frame);
             let key = (frame.left, frame.top, frame.right, frame.bottom);
             let now = std::time::Instant::now();
-            if key != self.bg_rect || now.duration_since(self.bg_at).as_secs() >= 2 {
+            // 任务栏是半透明的：面板旁边那几个像素会随壁纸、悬停高亮、后面的窗口变来变去。
+            // 以前每 2 秒重新采样一次，于是面板颜色会「时不时闪一下」。
+            // 现在只有「面板挪了位置」或「过了很久」才采样，而且颜色差得不多就不认
+            // （主题切换是明暗互换，差值很大，不会被这道门槛挡住）。
+            let moved = key != self.bg_rect;
+            let stale = now.duration_since(self.bg_at).as_secs() >= 30;
+            if moved || stale {
                 let light = taskbar_is_light();
                 let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
-                self.bg_color = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
+                let sampled = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
+                // 没采过样（0）就用这次的；之后差得不够多就不认，避免面板颜色自己抖
+                if self.bg_color == 0 || color_far_enough(sampled, self.bg_color) {
+                    self.bg_color = sampled;
+                }
                 self.bg_rect = key;
                 self.bg_at = now;
             }
@@ -857,7 +873,8 @@ fn sample_taskbar_color(hwnd: HWND) -> Option<u32> {
 
         let y = (rect.top + rect.bottom) / 2;
         let mut samples: Vec<u32> = Vec::new();
-        for dx in [4, 7, 10, 14] {
+        // 离面板远一点再取：贴着边缘取容易采到面板自己的描边/阴影和旁边的悬停高亮
+        for dx in [8, 12, 18, 26, 36, 50, 68] {
             for x in [rect.right + dx, rect.left - dx] {
                 let pixel = GetPixel(screen, x, y);
                 if pixel != u32::MAX && pixel != 0x00FF_FFFF {
@@ -880,6 +897,16 @@ fn sample_taskbar_color(hwnd: HWND) -> Option<u32> {
 
         samples.get(samples.len() / 2).copied()
     }
+}
+
+/// 两个颜色的最大通道差是否超过阈值（小于阈值就当没变，别为了一点点色差重画）
+fn color_far_enough(a: u32, b: u32) -> bool {
+    let channel = |shift: u32| {
+        let av = ((a >> shift) & 0xFF) as i32;
+        let bv = ((b >> shift) & 0xFF) as i32;
+        (av - bv).abs()
+    };
+    channel(0).max(channel(8)).max(channel(16)) > 10
 }
 
 fn blend(a: u32, b: u32, t: f32) -> u32 {

@@ -54,6 +54,9 @@ pub struct Settings {
     pub gif_hotkey: String,
     /// 编辑窗是否置顶（记住上次的选择）
     pub shot_topmost: bool,
+    /// 翻译开关（和 AI 统计一样：关着的时候菜单/工具栏不出现翻译，
+    /// 设置页里的翻译区块也收起来）
+    pub translate_enabled: bool,
     /// 翻译用的服务商：openai / deepseek（两家都是 OpenAI 兼容的 chat/completions）
     pub translate_provider: String,
     /// API Key（只存在本地 ini 里）
@@ -95,6 +98,7 @@ impl Default for Settings {
             gif_seconds: 20,
             gif_hotkey: "Ctrl+Shift+G".to_string(),
             shot_topmost: false,
+            translate_enabled: false,
             translate_provider: "openai".to_string(),
             translate_key: String::new(),
             translate_model: String::new(),
@@ -175,6 +179,7 @@ impl Settings {
                     settings.gif_seconds = normalize_seconds(value.trim().parse().unwrap_or(20))
                 }
                 "ShotTopmost" => settings.shot_topmost = parse_bool(value),
+                "TranslateEnabled" => settings.translate_enabled = parse_bool(value),
                 "TranslateProvider" => settings.translate_provider = value.to_string(),
                 "TranslateKey" => settings.translate_key = value.to_string(),
                 "TranslateModel" => settings.translate_model = value.to_string(),
@@ -188,6 +193,11 @@ impl Settings {
                     settings.extra.insert(key.to_string(), value.to_string());
                 }
             }
+        }
+
+        // 老配置没有 TranslateEnabled 这一行：填过 Key 就算「开着」，升级不丢功能
+        if !text.contains("TranslateEnabled=") {
+            settings.translate_enabled = !settings.translate_key.trim().is_empty();
         }
 
         settings.panel_width = settings.panel_width.clamp(72, 360);
@@ -245,6 +255,7 @@ impl Settings {
         out.push_str(&format!("GifSeconds={}\n", self.gif_seconds));
         out.push_str(&format!("GifHotkey={}\n", self.gif_hotkey));
         out.push_str(&format!("ShotTopmost={}\n", self.shot_topmost));
+        out.push_str(&format!("TranslateEnabled={}\n", self.translate_enabled));
         out.push_str(&format!("TranslateProvider={}\n", self.translate_provider));
         out.push_str(&format!("TranslateKey={}\n", self.translate_key));
         out.push_str(&format!("TranslateModel={}\n", self.translate_model));

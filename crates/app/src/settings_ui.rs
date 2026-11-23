@@ -133,6 +133,8 @@ enum Hit {
     Scrollbar,
     AutoStart,
     Update,
+    /// 「翻译」区块右上角的总开关
+    TrToggle,
 }
 
 struct Fonts {
@@ -396,6 +398,8 @@ struct State {
     shot_hotkey: String,
     ocr_hotkey: String,
     gif_hotkey: String,
+    /// 翻译总开关（和 AI 统计一样：关着的时候整块收起来）
+    translate_enabled: bool,
     /// 翻译：服务商 0 = ChatGPT，1 = DeepSeek
     tr_provider: usize,
     tr_key: String,
@@ -425,6 +429,8 @@ struct State {
     /// 内容区滚动位置（像素，0 = 顶部）
     scroll: i32,
     popup: HWND,
+    /// 弹出的下拉是第几行（0 = 没开）——只高亮那一行，别让四个下拉一起变灰
+    popup_row: usize,
 }
 
 struct Layout {
@@ -458,6 +464,8 @@ struct Layout {
     tr_base: RECT,
     /// API Key 输入框右边的「显示 / 隐藏」热区
     tr_reveal: RECT,
+    /// 「翻译」小标题右边那颗总开关
+    tr_toggle: RECT,
 }
 
 /// 翻译区块里可编辑的输入框
@@ -653,6 +661,13 @@ fn layout(state: &State, client: RECT) -> Layout {
             right,
             s(TR_BOX_H, scale),
         ),
+        // 「翻译」标题右边那颗开关：关掉以后整块像手风琴一样收起来
+        tr_toggle: RECT {
+            left: right - s(34.0, scale),
+            top: s(TR_TITLE_TOP + 1.5, scale),
+            right,
+            bottom: s(TR_TITLE_TOP + 1.5 + 18.0, scale),
+        },
         // API Key 输入框右边的「显示 / 隐藏」
         tr_reveal: RECT {
             left: right - s(48.0, scale),
@@ -971,7 +986,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     }
 
     // 区块标题：小号灰字 + 后面拖一条细线（方向 A 的分组语言）
-    let section = |text: &str, top: i32, left: i32| {
+    let section = |text: &str, top: i32, left: i32, rule_right: i32| {
         let width = crate::shot::text_width(p.dc, text, state.fonts.small);
         p.text(
             text,
@@ -979,7 +994,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             c.text3,
             left,
             top,
-            content_right,
+            rule_right,
             top + p.s(15.0),
             DT_LEFT,
         );
@@ -987,7 +1002,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         p.fill(
             left + width + p.s(10.0),
             y,
-            content_right,
+            rule_right,
             y + 1,
             mix_white(c.border, 0.25),
         );
@@ -1082,7 +1097,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         let rect = *slot;
         let row = index + 1;
         let hovered = state.hover == Some(Hit::Select(row));
-        let open = state.popup != std::ptr::null_mut();
+        let open = state.popup != std::ptr::null_mut() && state.popup_row == row;
         if hovered || open {
             p.round(
                 rect.left - p.s(8.0),
@@ -1114,7 +1129,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     }
 
     // ---------------------------------------------------------------- AI 统计
-    section("AI 统计", p.s(AI_TITLE_TOP), pad + p.s(4.0));
+    section("AI 统计", p.s(AI_TITLE_TOP), pad + p.s(4.0), left_right);
 
     let toggle = l.ai_toggle;
     let mid = (toggle.top + toggle.bottom) / 2;
@@ -1249,7 +1264,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     }
 
     // ---------------------------------------------------------------- 截图 / 取字
-    section("截图与取字", p.s(SHOT_TITLE_TOP), right_left + p.s(4.0));
+    section("截图与取字", p.s(SHOT_TITLE_TOP), right_left + p.s(4.0), content_right);
 
     let shot_rows = [
         (
@@ -1556,7 +1571,75 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
 
     // ---------------------------------------------------------------- 翻译
     {
-        section("翻译", p.s(TR_TITLE_TOP), right_left + p.s(4.0));
+        section(
+            "翻译",
+            p.s(TR_TITLE_TOP),
+            right_left + p.s(4.0),
+            l.tr_toggle.left - p.s(10.0),
+        );
+        // 总开关：关掉的时候下面四条整个收起来（手风琴）
+        let toggle = l.tr_toggle;
+        let toggle_mid = (toggle.top + toggle.bottom) / 2;
+        let sw_h = toggle.bottom - toggle.top;
+        if state.hover == Some(Hit::TrToggle) {
+            p.round(
+                toggle.left - p.s(6.0),
+                toggle.top - p.s(4.0),
+                toggle.right + p.s(6.0),
+                toggle.bottom + p.s(4.0),
+                p.s(7.0),
+                c.chip,
+                c.chip,
+            );
+        }
+        if state.translate_enabled {
+            p.round(
+                toggle.left,
+                toggle.top,
+                toggle.right,
+                toggle.bottom,
+                sw_h,
+                c.accent,
+                c.accent,
+            );
+            p.circle(
+                toggle.right - sw_h / 2,
+                toggle_mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                KNOB,
+            );
+        } else {
+            p.round(
+                toggle.left,
+                toggle.top,
+                toggle.right,
+                toggle.bottom,
+                sw_h,
+                c.chip,
+                mix_white(c.border, 0.05),
+            );
+            p.circle(
+                toggle.left + sw_h / 2,
+                toggle_mid,
+                sw_h / 2 - p.s(3.0),
+                KNOB,
+                mix_white(c.border, 0.05),
+            );
+        }
+        if !state.translate_enabled {
+            // 收起来的提示，别让人以为功能丢了
+            p.text(
+                "翻译关着：勾上右上角的开关就会出现服务商和 Key",
+                state.fonts.small,
+                c.text3,
+                right_left + p.s(4.0),
+                p.s(TR_TITLE_TOP + 22.0),
+                content_right,
+                p.s(TR_TITLE_TOP + 40.0),
+                DT_LEFT,
+            );
+        }
 
         // 表单式（方向 C 的输入框）：标签在控件上方，控件铺满整列；
         // 平时是浅灰填充块，聚焦时反白 + 蓝边 + 一圈很淡的外发光。
@@ -1609,131 +1692,133 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             }
         };
 
-        // 服务商：两个等宽按钮，选中的那颗是实心强调色
-        form_label("服务商", &l.tr_chatgpt);
-        for (rect, name, index) in [
-            (l.tr_chatgpt, "ChatGPT", 0usize),
-            (l.tr_deepseek, "DeepSeek", 1usize),
-        ] {
-            let active = state.tr_provider == index;
-            let (fill, ink) = if active {
-                (c.accent, c.bg)
-            } else {
-                (c.chip, c.text2)
-            };
-            p.round(
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                p.s(8.0),
-                fill,
-                fill,
-            );
-            p.text(
-                name,
-                state.fonts.label,
-                ink,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                DT_CENTER,
-            );
-        }
-
-        // 三个输入框
-        let fields: [(RECT, TrField, &str, &str); 3] = [
-            (l.tr_model, TrField::Model, "模型", "留空用默认"),
-            (l.tr_key, TrField::Key, "API Key", "sk-…"),
-            (l.tr_base, TrField::Base, "Base URL", "留空用官方地址"),
-        ];
-        for (rect, field, title, placeholder) in fields {
-            form_label(title, &rect);
-            let editing = state.tr_edit == Some(field);
-            field_box(rect, editing);
-            let value = match field {
-                TrField::Key => state.tr_key.as_str(),
-                TrField::Model => state.tr_model.as_str(),
-                TrField::Base => state.tr_base.as_str(),
-            };
-            let masked = field == TrField::Key && !value.is_empty() && !editing && !state.tr_show_key;
-            let shown = if masked {
-                // 没在编辑、也没点「显示」时把 Key 打码，肩窥也不怕
-                let tail: String = value
-                    .chars()
-                    .rev()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                format!("••••••{tail}")
-            } else {
-                value.to_string()
-            };
-            let (text, color) = if !shown.is_empty() {
-                (shown, c.text)
-            } else if editing {
-                // 空着又正在编辑：不画占位符，否则光标会压在第一个字上
-                (String::new(), c.text3)
-            } else {
-                (placeholder.to_string(), c.text3)
-            };
-            // API Key 右边要留出「显示 / 隐藏」
-            let suffix_w = if field == TrField::Key {
-                rect.right - l.tr_reveal.left + p.s(4.0)
-            } else {
-                p.s(10.0)
-            };
-            let text_left = rect.left + p.s(10.0);
-            p.text(
-                &text,
-                state.fonts.label,
-                color,
-                text_left,
-                rect.top,
-                rect.right - suffix_w,
-                rect.bottom,
-                DT_LEFT,
-            );
-            if field == TrField::Key {
-                let reveal = l.tr_reveal;
-                p.text(
-                    if state.tr_show_key { "隐藏" } else { "显示" },
-                    state.fonts.small,
-                    c.accent,
-                    reveal.left,
-                    reveal.top,
-                    reveal.right,
-                    reveal.bottom,
-                    DT_RIGHT,
+        if state.translate_enabled {
+            // 服务商：两个等宽按钮，选中的那颗是实心强调色
+            form_label("服务商", &l.tr_chatgpt);
+            for (rect, name, index) in [
+                (l.tr_chatgpt, "ChatGPT", 0usize),
+                (l.tr_deepseek, "DeepSeek", 1usize),
+            ] {
+                let active = state.tr_provider == index;
+                let (fill, ink) = if active {
+                    (c.accent, c.bg)
+                } else {
+                    (c.chip, c.text2)
+                };
+                p.round(
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                    p.s(8.0),
+                    fill,
+                    fill,
                 );
-                // 说明文案：存在本机，不上传
                 p.text(
-                    "存在本机设置文件里，不上传",
-                    state.fonts.small,
-                    c.text3,
-                    rect.left + p.s(2.0),
-                    p.s(TR_HINT_TOP),
-                    content_right,
-                    p.s(TR_HINT_TOP) + p.s(14.0),
-                    DT_LEFT,
+                    name,
+                    state.fonts.label,
+                    ink,
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                    DT_CENTER,
                 );
             }
-            // 光标：按字符宽度粗略定位（等宽字体不需要，这里用平均宽度）
-            if editing {
-                let prefix: String = value.chars().take(state.tr_caret).collect();
-                let caret_x =
-                    text_left + crate::shot::text_width(p.dc, &prefix, state.fonts.label);
-                let caret_w = p.s(2.0).max(1);
-                p.fill(
-                    caret_x,
-                    rect.top + p.s(6.0),
-                    caret_x + caret_w,
-                    rect.bottom - p.s(6.0),
-                    c.accent,
+
+            // 三个输入框
+            let fields: [(RECT, TrField, &str, &str); 3] = [
+                (l.tr_model, TrField::Model, "模型", "留空用默认"),
+                (l.tr_key, TrField::Key, "API Key", "sk-…"),
+                (l.tr_base, TrField::Base, "Base URL", "留空用官方地址"),
+            ];
+            for (rect, field, title, placeholder) in fields {
+                form_label(title, &rect);
+                let editing = state.tr_edit == Some(field);
+                field_box(rect, editing);
+                let value = match field {
+                    TrField::Key => state.tr_key.as_str(),
+                    TrField::Model => state.tr_model.as_str(),
+                    TrField::Base => state.tr_base.as_str(),
+                };
+                let masked = field == TrField::Key && !value.is_empty() && !editing && !state.tr_show_key;
+                let shown = if masked {
+                    // 没在编辑、也没点「显示」时把 Key 打码，肩窥也不怕
+                    let tail: String = value
+                        .chars()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("••••••{tail}")
+                } else {
+                    value.to_string()
+                };
+                let (text, color) = if !shown.is_empty() {
+                    (shown, c.text)
+                } else if editing {
+                    // 空着又正在编辑：不画占位符，否则光标会压在第一个字上
+                    (String::new(), c.text3)
+                } else {
+                    (placeholder.to_string(), c.text3)
+                };
+                // API Key 右边要留出「显示 / 隐藏」
+                let suffix_w = if field == TrField::Key {
+                    rect.right - l.tr_reveal.left + p.s(4.0)
+                } else {
+                    p.s(10.0)
+                };
+                let text_left = rect.left + p.s(10.0);
+                p.text(
+                    &text,
+                    state.fonts.label,
+                    color,
+                    text_left,
+                    rect.top,
+                    rect.right - suffix_w,
+                    rect.bottom,
+                    DT_LEFT,
                 );
+                if field == TrField::Key {
+                    let reveal = l.tr_reveal;
+                    p.text(
+                        if state.tr_show_key { "隐藏" } else { "显示" },
+                        state.fonts.small,
+                        c.accent,
+                        reveal.left,
+                        reveal.top,
+                        reveal.right,
+                        reveal.bottom,
+                        DT_RIGHT,
+                    );
+                    // 说明文案：存在本机，不上传
+                    p.text(
+                        "存在本机设置文件里，不上传",
+                        state.fonts.small,
+                        c.text3,
+                        rect.left + p.s(2.0),
+                        p.s(TR_HINT_TOP),
+                        content_right,
+                        p.s(TR_HINT_TOP) + p.s(14.0),
+                        DT_LEFT,
+                    );
+                }
+                // 光标：按字符宽度粗略定位（等宽字体不需要，这里用平均宽度）
+                if editing {
+                    let prefix: String = value.chars().take(state.tr_caret).collect();
+                    let caret_x =
+                        text_left + crate::shot::text_width(p.dc, &prefix, state.fonts.label);
+                    let caret_w = p.s(2.0).max(1);
+                    p.fill(
+                        caret_x,
+                        rect.top + p.s(6.0),
+                        caret_x + caret_w,
+                        rect.bottom - p.s(6.0),
+                        c.accent,
+                    );
+                }
             }
         }
     }
@@ -2162,6 +2247,7 @@ unsafe extern "system" fn popup_proc(
                     let settings = state_of(parent);
                     if !settings.is_null() {
                         (*settings).popup = std::ptr::null_mut();
+                        (*settings).popup_row = 0;
                         InvalidateRect(parent, std::ptr::null(), 0);
                     }
                 }
@@ -2256,6 +2342,8 @@ unsafe fn open_popup(settings: HWND, row: usize) {
         lpszClassName: class.as_ptr(),
     };
     RegisterClassW(&wc);
+
+    state.popup_row = row;
 
     let popup_state = Box::into_raw(Box::new(Popup {
         parent: settings,
@@ -2403,6 +2491,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             shot_hotkey: settings.shot_hotkey.clone(),
             ocr_hotkey: settings.ocr_hotkey.clone(),
             gif_hotkey: settings.gif_hotkey.clone(),
+            translate_enabled: settings.translate_enabled,
             tr_provider: if settings.translate_provider.eq_ignore_ascii_case("deepseek") {
                 1
             } else {
@@ -2427,6 +2516,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             scroll_drag: false,
             scroll: 0,
             popup: std::ptr::null_mut(),
+            popup_row: 0,
         }));
 
         let hwnd = CreateWindowExW(
@@ -2587,6 +2677,9 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
             return Some(Hit::Select(index + 1));
         }
     }
+    if contains(&l.tr_toggle, point) {
+        return Some(Hit::TrToggle);
+    }
     // 快捷键胶囊比整行矮，得先判
     if contains(&l.shot_hotkey, point) {
         return Some(Hit::ShotHotkey);
@@ -2654,6 +2747,7 @@ fn nav_items(state: &State) -> Vec<Hit> {
     items.push(Hit::GifSeconds);
     items.push(Hit::GifFps);
     items.push(Hit::GifHotkey);
+    items.push(Hit::TrToggle);
     items.push(Hit::AutoStart);
     items.push(Hit::Done);
     items
@@ -2676,6 +2770,7 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
         Hit::GifSeconds => l.gif_seconds,
         Hit::GifFps => l.gif_fps,
         Hit::GifHotkey => l.gif_hotkey,
+        Hit::TrToggle => l.tr_toggle,
         Hit::AutoStart => l.auto_start,
         Hit::Done => l.done,
         _ => return None,
@@ -2779,6 +2874,19 @@ fn toggle_source(state: &mut State, index: usize) {
     }
     state.ai_sources[index] = !state.ai_sources[index];
     crate::apply_ai_sources(state.parent, state.ai_sources);
+}
+
+fn toggle_translate(state: &mut State) {
+    state.translate_enabled = !state.translate_enabled;
+    if !state.translate_enabled {
+        // 收起之前先把正在编辑的那一格收尾
+        if state.tr_edit.is_some() {
+            commit_translate(state);
+            state.tr_edit = None;
+        }
+        state.tr_show_key = false;
+    }
+    crate::apply_translate_enabled(state.parent, state.translate_enabled);
 }
 
 fn toggle_auto_start(state: &mut State) {
@@ -2977,55 +3085,6 @@ unsafe extern "system" fn dialog_proc(
                 return 0;
             }
 
-            // 翻译区块：服务商胶囊 / 输入框
-            {
-                let l = layout(state, client);
-                // 内容区滚过之后，鼠标位置要换算回「未滚动」的坐标
-                let (view_top, view_bottom) = content_viewport(state, client);
-                let inside = |rect: RECT| {
-                    let y = point.y + state.scroll;
-                    point.y >= view_top
-                        && point.y < view_bottom
-                        && point.x >= rect.left
-                        && point.x <= rect.right
-                        && y >= rect.top
-                        && y <= rect.bottom
-                };
-                if inside(l.tr_chatgpt) || inside(l.tr_deepseek) {
-                    state.tr_provider = if inside(l.tr_deepseek) { 1 } else { 0 };
-                    commit_translate(state);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
-                let hit = if inside(l.tr_key) && !inside(l.tr_reveal) {
-                    Some(TrField::Key)
-                } else if inside(l.tr_model) {
-                    Some(TrField::Model)
-                } else if inside(l.tr_base) {
-                    Some(TrField::Base)
-                } else {
-                    None
-                };
-                if let Some(field) = hit {
-                    let value = match field {
-                        TrField::Key => &state.tr_key,
-                        TrField::Model => &state.tr_model,
-                        TrField::Base => &state.tr_base,
-                    };
-                    state.tr_caret = value.chars().count();
-                    state.tr_edit = Some(field);
-                    SetFocus(hwnd);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
-                if state.tr_edit.is_some() {
-                    // 点到别处 = 结束编辑
-                    commit_translate(state);
-                    state.tr_edit = None;
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                }
-            }
-
             if state.scroll_drag {
                 let max = max_scroll(state, client);
                 let bar = scroll_bar(state, client);
@@ -3069,7 +3128,8 @@ unsafe extern "system" fn dialog_proc(
                 let (view_top, view_bottom) = content_viewport(state, client);
                 let y = point.y + state.scroll;
                 let reveal = l.tr_reveal;
-                if point.y >= view_top
+                if state.translate_enabled
+                    && point.y >= view_top
                     && point.y < view_bottom
                     && point.x >= reveal.left
                     && point.x <= reveal.right
@@ -3079,6 +3139,63 @@ unsafe extern "system" fn dialog_proc(
                     state.tr_show_key = !state.tr_show_key;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
+                }
+            }
+
+            // 翻译区块：点一下才生效（鼠标扫过去什么都别做）
+            {
+                let l = layout(state, client);
+                let (view_top, view_bottom) = content_viewport(state, client);
+                let y = point.y + state.scroll;
+                let inside = |rect: RECT| {
+                    point.y >= view_top
+                        && point.y < view_bottom
+                        && point.x >= rect.left
+                        && point.x <= rect.right
+                        && y >= rect.top
+                        && y <= rect.bottom
+                };
+                let provider = if !state.translate_enabled {
+                    None
+                } else if inside(l.tr_chatgpt) {
+                    Some(0usize)
+                } else if inside(l.tr_deepseek) {
+                    Some(1usize)
+                } else {
+                    None
+                };
+                if let Some(provider) = provider {
+                    state.tr_provider = provider;
+                    commit_translate(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                let hit = if state.translate_enabled && inside(l.tr_key) && !inside(l.tr_reveal) {
+                    Some(TrField::Key)
+                } else if state.translate_enabled && inside(l.tr_model) {
+                    Some(TrField::Model)
+                } else if state.translate_enabled && inside(l.tr_base) {
+                    Some(TrField::Base)
+                } else {
+                    None
+                };
+                if let Some(field) = hit {
+                    let value = match field {
+                        TrField::Key => &state.tr_key,
+                        TrField::Model => &state.tr_model,
+                        TrField::Base => &state.tr_base,
+                    };
+                    state.tr_caret = value.chars().count();
+                    state.tr_edit = Some(field);
+                    SetFocus(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if state.tr_edit.is_some() {
+                    // 点到别处 = 结束编辑
+                    commit_translate(state);
+                    state.tr_edit = None;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
             }
 
@@ -3163,6 +3280,10 @@ unsafe extern "system" fn dialog_proc(
                     state.capture = 3;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
+                Some(Hit::TrToggle) => {
+                    toggle_translate(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 Some(Hit::AutoStart) => {
                     toggle_auto_start(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -3231,6 +3352,7 @@ unsafe extern "system" fn dialog_proc(
             choose(state, row, index);
 
             state.popup = std::ptr::null_mut();
+            state.popup_row = 0;
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
             InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -3435,6 +3557,7 @@ unsafe extern "system" fn dialog_proc(
                     Hit::GifQuality => cycle_gif_quality(state),
                     Hit::GifSeconds => cycle_gif_seconds(state),
                     Hit::GifHotkey => state.capture = 3,
+                    Hit::TrToggle => toggle_translate(state),
                     Hit::AutoStart => toggle_auto_start(state),
                     Hit::Done => {
                         DestroyWindow(hwnd);

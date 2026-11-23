@@ -309,7 +309,7 @@ fn main() {
 
         // 全局热键按设置注册（截图 / 取字都有开关，关掉的不占组合键）
         shot::set_ocr_enabled(settings.ocr_enabled);
-        shot::set_translate_enabled(!settings.translate_key.trim().is_empty());
+        shot::set_translate_enabled(settings.translate_enabled);
         register_hotkeys(hwnd);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
@@ -1085,6 +1085,14 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        // 系统主题 / 任务栏外观变了：让它重新采样底色（平时不每 2 秒重采，免得颜色自己抖）
+        WM_SETTINGCHANGE => {
+            if let Some(panel) = panel_mut(hwnd) {
+                panel.forget_background();
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_LBUTTONDOWN => {
             hint::hide();
             // 拖面板挪位置：按下先记起点，移动超过 3px 才算拖动，否则松手还是切视图
@@ -1586,7 +1594,16 @@ pub(crate) fn apply_translate_settings(
         panel.settings.translate_model = model.to_string();
         panel.settings.translate_base = base.to_string();
         panel.settings.save();
-        crate::shot::set_translate_enabled(!key.trim().is_empty());
+        crate::shot::set_translate_enabled(panel.settings.translate_enabled);
+    }
+}
+
+/// 设置窗里拨「启用翻译」：落盘 + 让工具栏的翻译按钮跟着出现/消失
+pub(crate) fn apply_translate_enabled(parent: HWND, enabled: bool) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.translate_enabled = enabled;
+        panel.settings.save();
+        crate::shot::set_translate_enabled(enabled);
     }
 }
 
