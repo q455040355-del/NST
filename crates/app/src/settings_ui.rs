@@ -33,6 +33,8 @@ const POPUP_CLASS: &str = "NetSpeedTaskbarRs.Settings.Popup";
 
 /// 下拉里选完，子窗口用这个消息告诉父窗口
 const WM_APP_PICK: u32 = WM_APP + 0x31;
+/// 动效的一帧（后台线程投递）
+const WM_APP_ANIM: u32 = WM_APP + 0x36;
 
 const DT_NOPREFIX: u32 = 0x0800;
 
@@ -47,6 +49,17 @@ const ID_INTERFACE_LABEL: usize = 2007;
 const ID_REFRESH_LABEL: usize = 2009;
 #[allow(dead_code)]
 const ID_FONT_LABEL: usize = 2011;
+
+/// 动画里的开关顺序：AI 统计 / 截图 / 取字 / 录 MP4 / 翻译 / 开机自启
+const SW_AI: usize = 0;
+const SW_SHOT: usize = 1;
+const SW_OCR: usize = 2;
+const SW_GIF: usize = 3;
+const SW_TRANSLATE: usize = 4;
+const SW_AUTOSTART: usize = 5;
+
+static ANIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ANIM_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 面板字号（显示文案, 百分比）
 const FONT_OPTIONS: [(&str, i32); 4] = [("小", 90), ("标准", 100), ("大", 110), ("特大", 125)];
@@ -428,6 +441,14 @@ struct State {
     scroll_drag: bool,
     /// 内容区滚动位置（像素，0 = 顶部）
     scroll: i32,
+    /// 自己这个窗口（动效线程要往里投消息）
+    hwnd: HWND,
+    /// 开关滑块位置（0 = 关，1 = 开）；按下标是 SW_* 那一套
+    sw: [f32; 6],
+    /// 翻译区块的「展开度」：0 = 收起，1 = 完全展开
+    tr_open: f32,
+    /// 上一帧动效的时间
+    anim_at: Option<std::time::Instant>,
     popup: HWND,
     /// 弹出的下拉是第几行（0 = 没开）——只高亮那一行，别让四个下拉一起变灰
     popup_row: usize,
@@ -985,6 +1006,38 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         );
     }
 
+    // 两个颜色按 t 混合（开关轨道、手风琴淡入淡出都用它）
+    let mix = |a: u32, b: u32, t: f32| -> u32 {
+        let t = t.clamp(0.0, 1.0);
+        let ch = |shift: u32| -> u32 {
+            let av = ((a >> shift) & 0xFF) as f32;
+            let bv = ((b >> shift) & 0xFF) as f32;
+            ((av + (bv - av) * t).round() as u32) & 0xFF
+        };
+        ch(0) | (ch(8) << 8) | (ch(16) << 16)
+    };
+
+    // 开关：轨道颜色和滑块位置都跟着 t（0 = 关，1 = 开）走，动效就是在改 t
+    let switch = |left: i32, top: i32, width: i32, height: i32, t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        let track = mix(c.chip, c.accent, t);
+        p.round(
+            left,
+            top,
+            left + width,
+            top + height,
+            height,
+            track,
+            track,
+        );
+        let pad = p.s(3.0);
+        let radius = (height / 2 - pad).max(p.s(2.0));
+        let cx0 = left + height / 2;
+        let cx1 = left + width - height / 2;
+        let cx = cx0 + ((cx1 - cx0) as f32 * t).round() as i32;
+        p.circle(cx, top + height / 2, radius, KNOB, KNOB);
+    };
+
     // 区块标题：小号灰字 + 后面拖一条细线（方向 A 的分组语言）
     let section = |text: &str, top: i32, left: i32, rule_right: i32| {
         let width = crate::shot::text_width(p.dc, text, state.fonts.small);
@@ -1172,35 +1225,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     // 开关本体
     let sw_w = p.s(40.0);
     let sw_h = p.s(22.0);
-    let sx = left_right - sw_w;
-    let sy = mid - sw_h / 2;
-    if state.ai_enabled {
-        p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
-        p.circle(
-            sx + sw_w - sw_h / 2,
-            mid,
-            sw_h / 2 - p.s(3.0),
-            KNOB,
-            KNOB,
-        );
-    } else {
-        p.round(
-            sx,
-            sy,
-            sx + sw_w,
-            sy + sw_h,
-            sw_h,
-            c.chip,
-            mix_white(c.border, 0.05),
-        );
-        p.circle(
-            sx + sw_h / 2,
-            mid,
-            sw_h / 2 - p.s(3.0),
-            KNOB,
-            mix_white(c.border, 0.05),
-        );
-    }
+    switch(left_right - sw_w, mid - sw_h / 2, sw_w, sw_h, state.sw[SW_AI]);
 
     // 六个来源：排成两列三行（一列六行会顶出窗口）
     for (index, slot) in l.ai_sources.iter().enumerate() {
@@ -1277,6 +1302,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             state.shot_enabled,
             state.shot_hotkey.as_str(),
             state.capture == 1,
+            SW_SHOT,
         ),
         (
             l.ocr_toggle,
@@ -1288,10 +1314,12 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             state.ocr_enabled,
             state.ocr_hotkey.as_str(),
             state.capture == 2,
+            SW_OCR,
         ),
     ];
 
-    for (row, hotkey_rect, toggle_hit, hotkey_hit, title, subtitle, on, value, capturing) in shot_rows
+    for (row, hotkey_rect, toggle_hit, hotkey_hit, title, subtitle, on, value, capturing, sw_index) in
+        shot_rows
     {
         let mid = (row.top + row.bottom) / 2;
         let hovered = state.hover == Some(toggle_hit) || state.hover == Some(hotkey_hit);
@@ -1366,35 +1394,13 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         // 开关本体
         let sw_w = p.s(40.0);
         let sw_h = p.s(22.0);
-        let sx = row.right - sw_w;
-        let sy = mid - sw_h / 2;
-        if on {
-            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
-            p.circle(
-                sx + sw_w - sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                KNOB,
-            );
-        } else {
-            p.round(
-                sx,
-                sy,
-                sx + sw_w,
-                sy + sw_h,
-                sw_h,
-                c.chip,
-                mix_white(c.border, 0.05),
-            );
-            p.circle(
-                sx + sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                mix_white(c.border, 0.05),
-            );
-        }
+        switch(
+            row.right - sw_w,
+            mid - sw_h / 2,
+            sw_w,
+            sw_h,
+            state.sw[sw_index],
+        );
     }
 
     // ---------------------------------------------------------------- 截区域录 GIF
@@ -1484,35 +1490,13 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         // 开关本体
         let sw_w = p.s(40.0);
         let sw_h = p.s(22.0);
-        let sx = row.right - sw_w;
-        let sy = mid - sw_h / 2;
-        if state.gif_enabled {
-            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
-            p.circle(
-                sx + sw_w - sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                KNOB,
-            );
-        } else {
-            p.round(
-                sx,
-                sy,
-                sx + sw_w,
-                sy + sw_h,
-                sw_h,
-                c.chip,
-                mix_white(c.border, 0.05),
-            );
-            p.circle(
-                sx + sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                mix_white(c.border, 0.05),
-            );
-        }
+        switch(
+            row.right - sw_w,
+            mid - sw_h / 2,
+            sw_w,
+            sw_h,
+            state.sw[SW_GIF],
+        );
 
         // 「录制」行：画质 / 时长 / 帧率，三颗胶囊各自循环
         let rec_pills: [(RECT, Hit, String); 3] = [
@@ -1592,42 +1576,15 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                 c.chip,
             );
         }
-        if state.translate_enabled {
-            p.round(
-                toggle.left,
-                toggle.top,
-                toggle.right,
-                toggle.bottom,
-                sw_h,
-                c.accent,
-                c.accent,
-            );
-            p.circle(
-                toggle.right - sw_h / 2,
-                toggle_mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                KNOB,
-            );
-        } else {
-            p.round(
-                toggle.left,
-                toggle.top,
-                toggle.right,
-                toggle.bottom,
-                sw_h,
-                c.chip,
-                mix_white(c.border, 0.05),
-            );
-            p.circle(
-                toggle.left + sw_h / 2,
-                toggle_mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                mix_white(c.border, 0.05),
-            );
-        }
-        if !state.translate_enabled {
+        switch(
+            toggle.left,
+            toggle.top,
+            toggle.right - toggle.left,
+            sw_h,
+            state.sw[SW_TRANSLATE],
+        );
+        let _ = toggle_mid;
+        if state.tr_open < 0.02 {
             // 收起来的提示，别让人以为功能丢了
             p.text(
                 "翻译关着：勾上右上角的开关就会出现服务商和 Key",
@@ -1692,7 +1649,20 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             }
         };
 
-        if state.translate_enabled {
+        // 手风琴：展开度就是一块「百叶窗」，从标签上方一路拉到 Base URL 下面
+        let shade_open = state.tr_open > 0.01;
+        let mut shade_saved: i32 = 0;
+        if shade_open {
+            let shade_top = p.s(TR_ROW1_TOP - 14.0);
+            let shade_full = p.s(TR_ROW4_TOP + TR_BOX_H + 6.0) - shade_top;
+            let shade_bottom = shade_top + (shade_full as f32 * state.tr_open).round() as i32;
+            shade_saved = SaveDC(dc);
+            if shade_saved != 0 {
+                IntersectClipRect(dc, 0, shade_top, client.right, shade_bottom);
+            }
+            if let Some(aa) = &p.aa {
+                aa.clip_intersect(0, shade_top, client.right, shade_bottom);
+            }
             // 服务商：两个等宽按钮，选中的那颗是实心强调色
             form_label("服务商", &l.tr_chatgpt);
             for (rect, name, index) in [
@@ -1819,6 +1789,15 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                         c.accent,
                     );
                 }
+            }
+        }
+        if shade_saved != 0 {
+            RestoreDC(dc, shade_saved);
+        }
+        if shade_open {
+            if let Some(aa) = &p.aa {
+                // 恢复成滚动那一刀（视口范围）
+                aa.clip_rect(0, view_top + scroll, client.right, view_bottom + scroll);
             }
         }
     }
@@ -1964,33 +1943,8 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             DT_LEFT,
         );
 
-        if state.auto_start {
-            p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
-            p.circle(
-                sx + sw_w - sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                KNOB,
-            );
-        } else {
-            p.round(
-                sx,
-                sy,
-                sx + sw_w,
-                sy + sw_h,
-                sw_h,
-                c.chip,
-                mix_white(c.border, 0.05),
-            );
-            p.circle(
-                sx + sw_h / 2,
-                mid,
-                sw_h / 2 - p.s(3.0),
-                KNOB,
-                KNOB,
-            );
-        }
+        switch(sx, sy, sw_w, sw_h, state.sw[SW_AUTOSTART]);
+        let _ = mid;
     }
 
     // 提交（缓冲是常驻的，由 state.back 管，这里不能删）
@@ -2515,6 +2469,17 @@ pub fn open(parent: HWND, settings: &Settings) {
             back_size: (0, 0),
             scroll_drag: false,
             scroll: 0,
+            hwnd: std::ptr::null_mut(),
+            sw: [
+                if settings.ai_enabled { 1.0 } else { 0.0 },
+                if settings.shot_enabled { 1.0 } else { 0.0 },
+                if settings.ocr_enabled { 1.0 } else { 0.0 },
+                if settings.gif_enabled { 1.0 } else { 0.0 },
+                if settings.translate_enabled { 1.0 } else { 0.0 },
+                if settings.auto_start { 1.0 } else { 0.0 },
+            ],
+            tr_open: if settings.translate_enabled { 1.0 } else { 0.0 },
+            anim_at: None,
             popup: std::ptr::null_mut(),
             popup_row: 0,
         }));
@@ -2541,6 +2506,7 @@ pub fn open(parent: HWND, settings: &Settings) {
         }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+        (*state).hwnd = hwnd;
         LAST_HWND.with(|cell| cell.set(hwnd as isize));
         round_corners(hwnd);
         ShowWindow(hwnd, SW_SHOW);
@@ -2853,6 +2819,7 @@ fn toggle_ai(state: &mut State) {
     }
     state.ai_enabled = enabled;
     crate::apply_ai_enabled(state.parent, enabled);
+    start_anim(state.hwnd);
 }
 
 /// 点总开关之后应该变成什么：(新的总开关, 需要一并改动的来源列表)。
@@ -2876,6 +2843,77 @@ fn toggle_source(state: &mut State, index: usize) {
     crate::apply_ai_sources(state.parent, state.ai_sources);
 }
 
+/// 起一轮动效：后台线程按 16ms 往窗口里投 WM_APP_ANIM，直到所有值都到位
+fn start_anim(hwnd: HWND) {
+    use std::sync::atomic::Ordering;
+    if hwnd.is_null() {
+        return;
+    }
+    ANIM_ACTIVE.store(true, Ordering::Relaxed);
+    if ANIM_THREAD.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let raw = hwnd as isize;
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            unsafe {
+                if ANIM_ACTIVE.load(Ordering::Relaxed) == false {
+                    break;
+                }
+                if PostMessageW(raw as HWND, WM_APP_ANIM, 0, 0) == 0 {
+                    break;
+                }
+            }
+        }
+        ANIM_THREAD.store(false, Ordering::Relaxed);
+    });
+}
+
+/// 推一帧动效：所有值都朝目标走，全部到位就停下来
+fn advance_anim(state: &mut State) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::Instant::now();
+    let dt = state
+        .anim_at
+        .map(|last| now.duration_since(last).as_secs_f32())
+        .unwrap_or(0.016)
+        .clamp(0.001, 0.05);
+    state.anim_at = Some(now);
+
+    let targets = [
+        state.ai_enabled,
+        state.shot_enabled,
+        state.ocr_enabled,
+        state.gif_enabled,
+        state.translate_enabled,
+        state.auto_start,
+    ];
+    let mut busy = false;
+    let k = 1.0 - (-dt * 22.0).exp();
+    for (slot, target) in state.sw.iter_mut().zip(targets) {
+        let goal = if target { 1.0 } else { 0.0 };
+        if (*slot - goal).abs() > 0.004 {
+            *slot += (goal - *slot) * k;
+            busy = true;
+        } else {
+            *slot = goal;
+        }
+    }
+    let goal = if state.translate_enabled { 1.0 } else { 0.0 };
+    if (state.tr_open - goal).abs() > 0.004 {
+        state.tr_open += (goal - state.tr_open) * (1.0 - (-dt * 16.0).exp());
+        busy = true;
+    } else {
+        state.tr_open = goal;
+    }
+
+    ANIM_ACTIVE.store(busy, Ordering::Relaxed);
+    unsafe {
+        InvalidateRect(state.hwnd, std::ptr::null(), 0);
+    }
+}
+
 fn toggle_translate(state: &mut State) {
     state.translate_enabled = !state.translate_enabled;
     if !state.translate_enabled {
@@ -2887,26 +2925,31 @@ fn toggle_translate(state: &mut State) {
         state.tr_show_key = false;
     }
     crate::apply_translate_enabled(state.parent, state.translate_enabled);
+    start_anim(state.hwnd);
 }
 
 fn toggle_auto_start(state: &mut State) {
     state.auto_start = !state.auto_start;
     crate::apply_auto_start(state.parent, state.auto_start);
+    start_anim(state.hwnd);
 }
 
 fn toggle_shot(state: &mut State) {
     state.shot_enabled = !state.shot_enabled;
     crate::apply_shot_enabled(state.parent, state.shot_enabled);
+    start_anim(state.hwnd);
 }
 
 fn toggle_ocr(state: &mut State) {
     state.ocr_enabled = !state.ocr_enabled;
     crate::apply_ocr_enabled(state.parent, state.ocr_enabled);
+    start_anim(state.hwnd);
 }
 
 fn toggle_gif(state: &mut State) {
     state.gif_enabled = !state.gif_enabled;
     crate::apply_gif_enabled(state.parent, state.gif_enabled);
+    start_anim(state.hwnd);
 }
 
 /// 帧率胶囊：30 → 60 → 120 → 自动 → 30
@@ -3337,6 +3380,13 @@ unsafe extern "system" fn dialog_proc(
                 state.scroll = next;
                 state.hover = None;
                 InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_APP_ANIM => {
+            let state = state_of(hwnd);
+            if !state.is_null() {
+                advance_anim(&mut *state);
             }
             0
         }

@@ -33,6 +33,8 @@ const UNIT_PIXEL: i32 = 2;
 const MATRIX_ORDER_APPEND: i32 = 1;
 /// `CombineModeReplace`
 const COMBINE_MODE_REPLACE: i32 = 0;
+/// `CombineModeIntersect`
+const COMBINE_MODE_INTERSECT: i32 = 1;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -159,6 +161,18 @@ impl Canvas {
             right - left,
             bottom - top,
             COMBINE_MODE_REPLACE,
+        );
+    }
+
+    /// 在当前裁剪区上再交一刀（手风琴展开时用）
+    pub unsafe fn clip_intersect(&self, left: i32, top: i32, right: i32, bottom: i32) {
+        GdipSetClipRectI(
+            self.graphics,
+            left,
+            top,
+            right - left,
+            bottom - top,
+            COMBINE_MODE_INTERSECT,
         );
     }
 
