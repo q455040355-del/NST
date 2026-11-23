@@ -2351,12 +2351,18 @@ fn shift_choice(state: &mut State, row: usize, delta: i32) {
     let (current, len) = match row {
         1 => (state.font, FONT_OPTIONS.len()),
         2 => (state.gauge, GAUGE_OPTIONS.len()),
+        // 第 0 项是「自动（全部合计）」，所以要多一个
         3 => (state.interface, state.interfaces.len() + 1),
         _ => (state.refresh, REFRESH_OPTIONS.len()),
     };
-    let len = len.max(1) as i32;
-    let next = (current as i32 + delta).rem_euclid(len) as usize;
+    let next = step_choice(current, len, delta);
     choose(state, row, next);
+}
+
+/// 在 [0, len) 里按 delta 走一步，走到头折回去。len 为 0 时返回 0。
+fn step_choice(current: usize, len: usize, delta: i32) -> usize {
+    let len_i = len.max(1) as i32;
+    (current as i32 + delta).rem_euclid(len_i) as usize
 }
 
 fn toggle_ai(state: &mut State) {
@@ -2948,5 +2954,54 @@ unsafe extern "system" fn dialog_proc(
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+
+    #[test]
+    fn step_choice_moves_and_wraps() {
+        // 中间往前走
+        assert_eq!(step_choice(0, 4, 1), 1);
+        // 走到末尾折回开头
+        assert_eq!(step_choice(3, 4, 1), 0);
+        // 从开头往回走折到末尾
+        assert_eq!(step_choice(0, 4, -1), 3);
+        // 大步跨越也能正确取模
+        assert_eq!(step_choice(1, 4, 7), 0);
+        assert_eq!(step_choice(1, 4, -7), 2);
+    }
+
+    #[test]
+    fn step_choice_handles_degenerate_lengths() {
+        // 只有一项时怎么走都还在原地
+        assert_eq!(step_choice(0, 1, 1), 0);
+        assert_eq!(step_choice(0, 1, -5), 0);
+        // len 为 0（比如网卡列表为空时）不能除零 panic
+        assert_eq!(step_choice(0, 0, 1), 0);
+        // 当前值越界（列表变短过）也不会 panic，会被折回范围内
+        assert!(step_choice(9, 4, 0) < 4);
+    }
+
+    #[test]
+    fn options_tables_are_non_empty_and_consistent() {
+        // 下拉框的"标签/值"数量一致，否则 choose() 取到的 value 会对不上
+        assert!(!FONT_OPTIONS.is_empty());
+        assert!(!GAUGE_OPTIONS.is_empty());
+        assert!(!REFRESH_OPTIONS.is_empty());
+        // 刷新间隔必须递增，否则 shift_choice 的"下一档"看起来会乱跳
+        let mut last = 0;
+        for (_, ms) in REFRESH_OPTIONS.iter() {
+            assert!(*ms > last, "刷新档位要递增");
+            last = *ms;
+        }
+        // 字号档位也要递增
+        let mut last = 0;
+        for (_, percent) in FONT_OPTIONS.iter() {
+            assert!(*percent > last, "字号档位要递增");
+            last = *percent;
+        }
     }
 }
