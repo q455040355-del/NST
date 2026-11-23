@@ -2372,24 +2372,23 @@ unsafe fn editor_paint(hwnd: HWND) {
         }
     }
 
-    // 只保留「图片」和「工具栏」两块区域，其余裁掉 —— 于是图片上方那条带子
-    // 既不显示底色、也不吃点击，看起来就是一条浮在桌面上的工具栏。
-    // 先关掉：区域和图片位置一错位，整块编辑区就变成「点不到」，比留白更难受。
+    // 只保留「图片 / 窗口栏 / 工具栏」三块，其余裁掉（透明 + 点击穿透）
     {
-        let image_top = editor.image_top;
-        let image_bottom =
-            image_top + (editor.base.height as f32 * editor.scale).round() as i32;
-        let image_left = editor.image_left;
-        let image_right =
-            image_left + (editor.base.width as f32 * editor.scale).round() as i32;
-        let image = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
-            image_left.max(0),
-            image_top.max(0),
-            image_right.min(client.right),
-            image_bottom.min(client.bottom),
+        let [image_rect, title, _] = window_rects(
+            editor.image_left,
+            editor.image_top,
+            (editor.base.width as f32 * editor.scale).round() as i32,
+            (editor.base.height as f32 * editor.scale).round() as i32,
+            editor.title_rect,
+            editor.bar,
+            client,
         );
-        // 窗口栏 + 工具栏：这两块也要留着
-        let title = editor.title_rect;
+        let image = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
+            image_rect.left,
+            image_rect.top,
+            image_rect.right,
+            image_rect.bottom,
+        );
         let title_rgn = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
             title.left,
             title.top,
@@ -2492,13 +2491,78 @@ pub(crate) unsafe fn editor_zoom(hwnd: HWND, factor: f32, anchor: (i32, i32)) {
 }
 
 /// 工具条自然宽度（按钮不缩，窗口至少要这么宽）
+/// 工具栏内容：唯一事实来源（绘制和宽度计算都读它，别再各自数按钮）
+const TOOLBAR_ITEMS: &[(Action, bool)] = &[
+    (Action::Tool(Tool::Rect), false),
+    (Action::Tool(Tool::Square), false),
+    (Action::Tool(Tool::Ellipse), false),
+    (Action::Tool(Tool::Line), false),
+    (Action::Tool(Tool::Arrow), false),
+    (Action::Tool(Tool::Pen), false),
+    (Action::Tool(Tool::Marker), false),
+    (Action::Tool(Tool::Spotlight), false),
+    (Action::Tool(Tool::Numbered), false),
+    (Action::Tool(Tool::Mosaic), false),
+    (Action::Tool(Tool::Eraser), false),
+    (Action::Tool(Tool::Text), false),
+    (Action::Tool(Tool::Ocr), false),
+    (Action::Tool(Tool::Translate), false),
+    (Action::Scroll, false),
+    (Action::Rotate, false),
+    (Action::Beautify, false),
+    (Action::Stroke, true),
+    (Action::Undo, false),
+    (Action::Redo, false),
+    (Action::Topmost, true),
+    (Action::Copy, false),
+    (Action::Save, false),
+    (Action::Pin, false),
+];
+
+/// 窗口区域的三块矩形（图片 / 窗口栏 / 工具栏），全部夹进客户区。
+/// 抽成纯函数是为了能测：这块一错位，整个编辑区就「点不到」。
+fn window_rects(
+    image_left: i32,
+    image_top: i32,
+    image_w: i32,
+    image_h: i32,
+    title: RECT,
+    bar: RECT,
+    client: RECT,
+) -> [RECT; 3] {
+    let clamp = |value: i32, low: i32, high: i32| -> i32 {
+        // min/max 反过来时也不 panic
+        value.clamp(low.min(high), high.max(low))
+    };
+    let image = RECT {
+        left: clamp(image_left, 0, client.right),
+        top: clamp(image_top, 0, client.bottom),
+        right: clamp(image_left + image_w, 0, client.right),
+        bottom: clamp(image_top + image_h, 0, client.bottom),
+    };
+    let title = RECT {
+        left: clamp(title.left, 0, client.right),
+        top: clamp(title.top, 0, client.bottom),
+        right: clamp(title.right, 0, client.right),
+        bottom: clamp(title.bottom, 0, client.bottom),
+    };
+    let bar = RECT {
+        left: clamp(bar.left, 0, client.right),
+        top: clamp(bar.top, 0, client.bottom),
+        right: clamp(bar.right, 0, client.right),
+        bottom: clamp(bar.bottom, 0, client.bottom),
+    };
+    [image, title, bar]
+}
+
 fn toolbar_width() -> i32 {
-    let items = 26;
+    let count = TOOLBAR_ITEMS.len() as i32;
     let item = s(30.0);
     let gap = s(2.0);
     let sep_w = s(11.0);
     let pad = s(6.0);
-    items * item + (items - 1) * gap + 5 * (sep_w + gap) + pad * 2
+    let groups = TOOLBAR_ITEMS.iter().filter(|(_, sep)| *sep).count() as i32;
+    count * item + (count - 1) * gap + groups * (sep_w + gap) + pad * 2
 }
 
 unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
@@ -2737,33 +2801,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let pad = s(6.0);
 
     // bool = 这一格前面要不要画一条分组竖线
-    let layout_items: Vec<(Action, bool)> = vec![
-        (Action::Tool(Tool::Rect), false),
-        (Action::Tool(Tool::Square), false),
-        (Action::Tool(Tool::Ellipse), false),
-        (Action::Tool(Tool::Line), false),
-        (Action::Tool(Tool::Arrow), false),
-        (Action::Tool(Tool::Pen), false),
-        (Action::Tool(Tool::Marker), false),
-        (Action::Tool(Tool::Spotlight), false),
-        (Action::Tool(Tool::Numbered), false),
-        (Action::Tool(Tool::Mosaic), false),
-        (Action::Tool(Tool::Eraser), false),
-        (Action::Tool(Tool::Text), false),
-        (Action::Tool(Tool::Ocr), false),
-        (Action::Tool(Tool::Translate), false),
-        (Action::Scroll, false),
-        (Action::Rotate, false),
-        (Action::Beautify, false),
-        (Action::Stroke, true),
-        (Action::Undo, false),
-        (Action::Redo, false),
-        (Action::Topmost, true),
-        (Action::Copy, false),
-        (Action::Save, false),
-        (Action::Pin, false),
-    ];
 
+    let layout_items = TOOLBAR_ITEMS;
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
     let measure = |item: i32, gap: i32, sep_w: i32| -> i32 {
         layout_items.len() as i32 * item
@@ -2827,7 +2866,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let icon_top = bar_top + (bar_h - item) / 2;
     let mut x = bar_left + pad;
     let mut hovered: Option<(Action, RECT)> = None;
-    for (action, new_group) in layout_items {
+    for &(action, new_group) in layout_items {
         if new_group {
             let pen = CreatePen(0, 1, ui.border);
             let old = SelectObject(dc, pen as HGDIOBJ);
@@ -3018,14 +3057,14 @@ pub unsafe fn preview_png(path: &str) -> bool {
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
-        title_h: 0,
+        title_h: s(30.0),
         title_rect: RECT {
             left: 0,
             top: 0,
             right: 0,
             bottom: 0,
         },
-        top_margin: 0,
+        top_margin: s(54.0),
         probed: false,
         bar: RECT {
             left: 0,
@@ -3037,7 +3076,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         tool: Tool::Rect,
         scale: preview_zoom,
         image_left: 0,
-        image_top: 0,
+        image_top: s(30.0),
         drag_from: None,
         drag_to: None,
         pen_points: Vec::new(),
@@ -5209,5 +5248,96 @@ mod beautify_tests {
     fn beautify_keeps_alpha_opaque() {
         let out = beautify_bitmap(&solid(64, 64));
         assert!(out.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+}
+
+#[cfg(test)]
+mod editor_geometry_tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn window_rects_clamps_everything_into_client() {
+        let client = rect(0, 0, 300, 200);
+        // 图片比客户区大、还滚到负坐标：三块都要被夹进来，且不能 panic
+        let [image, title, bar] = window_rects(
+            -50,
+            -20,
+            500,
+            400,
+            rect(10, 0, 290, 30),
+            rect(0, 160, 300, 200),
+            client,
+        );
+        for r in [image, title, bar] {
+            assert!(r.left >= 0 && r.top >= 0, "左上不能出界: {:?}", (r.left, r.top));
+            assert!(r.right <= client.right && r.bottom <= client.bottom, "右下不能出界: {:?}", (r.right, r.bottom));
+        }
+    }
+
+    #[test]
+    fn window_rects_keeps_image_when_it_fits() {
+        let client = rect(0, 0, 300, 200);
+        let [image, _, _] = window_rects(
+            20,
+            30,
+            100,
+            80,
+            rect(20, 0, 120, 30),
+            rect(0, 170, 300, 200),
+            client,
+        );
+        assert_eq!((image.left, image.top, image.right, image.bottom), (20, 30, 120, 110));
+    }
+
+    #[test]
+    fn toolbar_width_follows_item_count() {
+        let width = toolbar_width();
+        let expected = TOOLBAR_ITEMS.len() as i32 * s(30.0);
+        assert!(width > expected, "宽度至少要装得下所有按钮");
+        // 分隔线数量变了宽度也要变（防止再出现「写死 26 个」的旧问题）
+        let groups = TOOLBAR_ITEMS.iter().filter(|(_, sep)| *sep).count() as i32;
+        assert!(groups > 0, "工具栏应该至少有一处分组");
+    }
+
+    #[test]
+    fn snap_angle_pulls_nearby_angles_straight() {
+        // 几乎水平 → 吸成水平
+        let to = snap_angle((0, 0), (100, 2));
+        assert_eq!(to.1, 0, "2 度以内应该吸到水平");
+        // 45 度附近 → 吸成真正的 45 度（两个分量相等）
+        let to = snap_angle((0, 0), (100, 97));
+        assert_eq!(to.0, to.1, "45 度吸附后两轴应该一样长");
+        // 明显不是标准角 → 原样返回
+        let to = snap_angle((0, 0), (100, 30));
+        assert_eq!(to, (100, 30));
+    }
+
+    #[test]
+    fn shape_bounds_covers_every_kind() {
+        let cases = [
+            Shape::Arrow { a: (10, 10), b: (20, 5), stroke: 0 },
+            Shape::Rect { a: (30, 40), b: (10, 20), stroke: 0 },
+            Shape::Line { a: (5, 5), b: (50, 60), stroke: 0 },
+            Shape::Spotlight { a: (0, 0), b: (30, 30) },
+            Shape::Mosaic { a: (12, 12), b: (8, 8), stroke: 0 },
+        ];
+        for shape in cases {
+            let (left, top, right, bottom) = shape_bounds(&shape);
+            assert!(left <= right && top <= bottom, "包围盒要正向: {:?}", (left, top, right, bottom));
+        }
+        let pen = Shape::Pen {
+            points: vec![(10, 10), (30, 40), (20, 60)],
+            stroke: 0,
+        };
+        assert_eq!(shape_bounds(&pen), (10, 10, 30, 60));
     }
 }
