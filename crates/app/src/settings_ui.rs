@@ -94,15 +94,13 @@ const SHOT_ROW_H: f32 = 44.0;
 // 翻译区块（截图 / 取字下面）
 const TR_HEAD_TOP: f32 = 790.0; // 分隔线
 const TR_TITLE_TOP: f32 = 796.0; // 「翻译」小标题
-const TR_PROVIDER_TOP: f32 = 818.0; // 服务商
-const TR_KEY_TOP: f32 = 866.0; // API Key
-const TR_MODEL_TOP: f32 = 914.0; // 模型
-const TR_BASE_TOP: f32 = 962.0; // Base URL
+const TR_ROW1_TOP: f32 = 826.0; // 第一行：服务商 | 模型
+const TR_ROW2_TOP: f32 = 878.0; // 第二行：API Key | Base URL
 
 /// 可滚动内容区：分隔线往下到页脚分割线往上
 const CONTENT_TOP: f32 = 65.0;
 /// 内容总高度（最后一行 + 一点留白）；窗口比这个矮就出现滚动
-const CONTENT_BOTTOM: f32 = 1010.0;
+const CONTENT_BOTTOM: f32 = 926.0;
 /// 页脚（分割线 + 完成按钮）高度
 const FOOTER_H: f32 = 64.0;
 
@@ -472,6 +470,8 @@ fn layout(state: &State, client: RECT) -> Layout {
     };
 
     let control_left = s(CONTROL_X, scale);
+    // 右列起点：窗口右半边，减去一点留白
+    let tr_right_left = control_left + ((right - control_left) / 2) + s(6.0, scale);
     let row_center = |index: usize| -> i32 {
         s(ROW_FIRST + ROW_STEP * index as f32, scale) + s(ROW_STEP * 0.5 - 6.0, scale)
     };
@@ -585,21 +585,26 @@ fn layout(state: &State, client: RECT) -> Layout {
             right: (pad + s(4.0, scale) + s(170.0, scale)).min(done.left - s(12.0, scale)),
             bottom: done.bottom,
         },
+        // 两列：左列 x = pad .. mid，右列 x = mid + 间距 .. right
         tr_chatgpt: RECT {
             left: control_left,
-            top: s(TR_PROVIDER_TOP, scale),
-            right: control_left + s(88.0, scale),
-            bottom: s(TR_PROVIDER_TOP, scale) + s(30.0, scale),
+            top: s(TR_ROW1_TOP, scale),
+            right: control_left + s(78.0, scale),
+            bottom: s(TR_ROW1_TOP, scale) + s(28.0, scale),
         },
         tr_deepseek: RECT {
-            left: control_left + s(94.0, scale),
-            top: s(TR_PROVIDER_TOP, scale),
-            right: control_left + s(94.0, scale) + s(96.0, scale),
-            bottom: s(TR_PROVIDER_TOP, scale) + s(30.0, scale),
+            left: control_left + s(84.0, scale),
+            top: s(TR_ROW1_TOP, scale),
+            right: control_left + s(84.0, scale) + s(88.0, scale),
+            bottom: s(TR_ROW1_TOP, scale) + s(28.0, scale),
         },
-        tr_key: input_rect(s(TR_KEY_TOP, scale), control_left, right),
-        tr_model: input_rect(s(TR_MODEL_TOP, scale), control_left, right),
-        tr_base: input_rect(s(TR_BASE_TOP, scale), control_left, right),
+        tr_model: input_rect(
+            s(TR_ROW1_TOP, scale),
+            tr_right_left,
+            right,
+        ),
+        tr_key: input_rect(s(TR_ROW2_TOP, scale), control_left, tr_right_left - s(12.0, scale)),
+        tr_base: input_rect(s(TR_ROW2_TOP, scale), tr_right_left, right),
         // 页脚右侧：检查更新，紧挨着「完成」
         update: RECT {
             left: done.left - s(12.0, scale) - s(104.0, scale),
@@ -1495,22 +1500,22 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             DT_LEFT,
         );
 
-        let label_right = s(CONTROL_X, state.scale) - p.s(12.0);
-        let row_label = |text: &str, top: i32, height: i32| {
+        // 两列布局：标签画在控件**上方**（小号灰字），这样左右两列都不会撞
+        let row_label = |text: &str, left: i32, right: i32, top: i32| {
             p.text(
                 text,
-                state.fonts.label,
-                c.text,
-                pad + p.s(4.0),
-                top,
-                label_right,
-                top + height,
+                state.fonts.small,
+                c.text3,
+                left,
+                top - p.s(17.0),
+                right,
+                top - p.s(3.0),
                 DT_LEFT,
             );
         };
 
         // 服务商：两颗胶囊
-        row_label("服务商", l.tr_chatgpt.top, l.tr_chatgpt.bottom - l.tr_chatgpt.top);
+        row_label("服务商", l.tr_chatgpt.left, l.tr_deepseek.right, l.tr_chatgpt.top);
         for (rect, name, index) in [
             (l.tr_chatgpt, "ChatGPT", 0usize),
             (l.tr_deepseek, "DeepSeek", 1usize),
@@ -1544,7 +1549,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             (l.tr_base, TrField::Base, "Base URL", "留空用官方地址"),
         ];
         for (rect, field, title, placeholder) in fields {
-            row_label(title, rect.top, rect.bottom - rect.top);
+            row_label(title, rect.left, rect.right, rect.top);
             let editing = state.tr_edit == Some(field);
             p.round(
                 rect.left,
