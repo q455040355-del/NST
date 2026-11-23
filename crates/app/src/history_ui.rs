@@ -2606,15 +2606,11 @@ fn weekday_name(weekday: i64) -> &'static str {
 
 /// day 序号 → (年, 月, 日, 星期)
 fn day_to_date(day: i64) -> (i32, u32, u32, i64) {
-    // 1970-01-01 是周四（weekday 4）
-    let days = day;
-    let _weekday = ((days % 7) + 11) % 7; // 3..9 映射到 0..6 太绕，直接算：
-    let weekday = ((days + 3).rem_euclid(7)) + 1; // 1=周一 … 7=周日
-    let _ = weekday;
-
-    let date = civil_from_days(days);
-    let wd = ((days + 3).rem_euclid(7) + 1).rem_euclid(7);
-    (date.0, date.1, date.2, wd + 1)
+    let date = civil_from_days(day);
+    // 1970-01-01（第 0 天）是周四 = 4，所以从 (day + 3) 取模再加 1：1=周一 … 7=周日。
+    // 注意别再加两次 1（这行以前写成了还多套一层 rem_euclid + 1，整整差一天）。
+    let weekday = (day + 3).rem_euclid(7) + 1;
+    (date.0, date.1, date.2, weekday)
 }
 
 /// 天数（1970-01-01 起）转公历。
@@ -2647,4 +2643,95 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 #[allow(dead_code)]
 fn day_from_ms(ms: i64) -> i64 {
     ms.div_euclid(DAY_MS)
+}
+
+#[cfg(test)]
+mod date_and_axis_tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates_convert_back_and_forth() {
+        // 1970-01-01 = 第 0 天
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        // 已知锚点
+        assert_eq!(civil_from_days(18_262), (2020, 1, 1));
+        assert_eq!(days_from_civil(2020, 1, 1), 18_262);
+        // 闰日
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        // 来回转换要自洽（随机一批日子）
+        for day in [0, 1, 365, 10_957, 18_262, 19_782, 20_000, 25_000] {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(days_from_civil(y, m, d), day, "第 {day} 天来回转换不一致");
+        }
+    }
+
+    #[test]
+    fn weekday_matches_known_dates() {
+        // 星期编号：1 = 周一 … 7 = 周日
+        // 1970-01-01 是星期四
+        assert_eq!(day_to_date(0).3, 4, "1970-01-01 应该是周四");
+        // 2024-01-01 是星期一（第 19723 天）
+        assert_eq!(day_to_date(19_723).3, 1, "2024-01-01 应该是周一");
+        // 2020-01-01 是星期三（第 18262 天）
+        assert_eq!(day_to_date(18_262).3, 3, "2020-01-01 应该是周三");
+        // 连续 7 天应该正好绕一圈
+        let start = 19_723;
+        let mut seen: Vec<i64> = (0..7).map(|offset| day_to_date(start + offset).3).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7], "一周七天要各不相同");
+    }
+
+    #[test]
+    fn weekday_name_covers_every_number() {
+        assert_eq!(weekday_name(1), "周一");
+        assert_eq!(weekday_name(7), "周日");
+        for day in 1..=7 {
+            assert!(!weekday_name(day).is_empty());
+        }
+    }
+
+    #[test]
+    fn axis_rounds_up_to_nice_steps() {
+        // 刻度要"好看"：1 / 2 / 2.5 / 5 的整数倍
+        for (max, intervals) in [(100.0f32, 4), (1000.0, 5), (37.0, 4), (1.0, 4), (999_999.0, 6)] {
+            let (top, step) = nice_axis(max, intervals);
+            assert!(step > 0.0, "步长必须为正，实际 {step}");
+            assert!(
+                (top - step * intervals as f64).abs() < 1e-6,
+                "顶端必须等于 步长×刻度数：{top} vs {step}×{intervals}"
+            );
+            assert!(top >= max as f64, "顶端不能比最大值小：{top} < {max}");
+            // 步长的首位数字必须是 1 / 2 / 2.5 / 5
+            let magnitude = 10f64.powf(step.log10().floor());
+            let normalized = (step / magnitude * 10.0).round() / 10.0;
+            assert!(
+                [1.0, 2.0, 2.5, 5.0, 10.0].contains(&normalized),
+                "步长 {step} 的首位是 {normalized}，不是好看的档位"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_handles_degenerate_input() {
+        // 全零 / 负数 / 0 个刻度都不能 panic 或算出 NaN
+        let (top, step) = nice_axis(0.0, 4);
+        assert!(step.is_finite() && step > 0.0);
+        assert!(top.is_finite() && top > 0.0);
+
+        let (top, step) = nice_axis(-5.0, 4);
+        assert!(step.is_finite() && top.is_finite());
+    }
+
+    #[test]
+    fn day_labels_and_full_labels() {
+        let day = 19_723; // 2024-01-01
+        assert_eq!(format_day(day), "2024-01-01");
+        assert_eq!(day_label(day), "01-01");
+        assert_eq!(day_full_label(day), "01/01 (周一)");
+        // 今天 / 昨天用中文
+        let today = history::today(now_ms());
+        assert_eq!(day_full_label(today), "今天");
+        assert_eq!(day_full_label(today - 1), "昨天");
+    }
 }
