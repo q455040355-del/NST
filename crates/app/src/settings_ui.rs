@@ -35,6 +35,8 @@ const POPUP_CLASS: &str = "NetSpeedTaskbarRs.Settings.Popup";
 const WM_APP_PICK: u32 = WM_APP + 0x31;
 /// 动效的一帧（后台线程投递）
 const WM_APP_ANIM: u32 = WM_APP + 0x36;
+/// 模型列表拉回来了（lparam 是 Box<Result<Vec<(id, name)>, String>>）
+const WM_APP_MODELS: u32 = WM_APP + 0x37;
 
 const DT_NOPREFIX: u32 = 0x0800;
 
@@ -424,6 +426,12 @@ struct State {
     tr_edit: Option<TrField>,
     /// API Key 点了「显示」：不打码
     tr_show_key: bool,
+    /// 「获取模型」拉回来的列表：(模型 id, 显示名)
+    models: Vec<(String, String)>,
+    /// 正在拉模型
+    models_busy: bool,
+    /// 拉模型失败的原因（显示在模型那一行下面）
+    models_error: Option<String>,
     /// 光标位置（按 char 计）
     tr_caret: usize,
     /// 正在录制快捷键：0 = 没在录，1 = 截图，2 = 取字，3 = 录 GIF
@@ -491,6 +499,10 @@ struct Layout {
     tr_reveal: RECT,
     /// 「翻译」小标题右边那颗总开关
     tr_toggle: RECT,
+    /// 服务商第三颗：OpenCode
+    tr_opencode: RECT,
+    /// 模型那一格右边的「获取」
+    tr_fetch: RECT,
 }
 
 /// 翻译区块里可编辑的输入框
@@ -658,14 +670,27 @@ fn layout(state: &State, client: RECT) -> Layout {
         tr_chatgpt: RECT {
             left: right_left,
             top: s(TR_ROW1_TOP, scale),
-            right: right_left + (right - right_left - s(6.0, scale)) / 2,
+            right: right_left + (right - right_left - s(12.0, scale)) / 3,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
         },
         tr_deepseek: RECT {
-            left: right_left + (right - right_left - s(6.0, scale)) / 2 + s(6.0, scale),
+            left: right_left + (right - right_left - s(12.0, scale)) / 3 + s(6.0, scale),
+            top: s(TR_ROW1_TOP, scale),
+            right: right_left + (right - right_left - s(12.0, scale)) / 3 * 2 + s(6.0, scale),
+            bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
+        },
+        tr_opencode: RECT {
+            left: right_left + (right - right_left - s(12.0, scale)) / 3 * 2 + s(12.0, scale),
             top: s(TR_ROW1_TOP, scale),
             right,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
+        },
+        // 模型那一格右边的「获取」
+        tr_fetch: RECT {
+            left: right - s(52.0, scale),
+            top: s(TR_ROW2_TOP + 2.0, scale),
+            right: right - s(8.0, scale),
+            bottom: s(TR_ROW2_TOP + TR_BOX_H - 2.0, scale),
         },
         tr_model: input_rect(
             s(TR_ROW2_TOP, scale),
@@ -1704,11 +1729,12 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                 aa.clip_intersect(0, shade_top, client.right, shade_bottom);
                 aa.translate(0, slide);
             }
-            // 服务商：两个等宽按钮，选中的那颗是实心强调色
+            // 服务商：三颗等宽按钮，选中的那颗是实心强调色
             form_label("服务商", &l.tr_chatgpt);
             for (rect, name, index) in [
                 (l.tr_chatgpt, "ChatGPT", 0usize),
                 (l.tr_deepseek, "DeepSeek", 1usize),
+                (l.tr_opencode, "OpenCode", 2usize),
             ] {
                 let active = state.tr_provider == index;
                 let (fill, ink) = if active {
@@ -1775,11 +1801,20 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                 } else {
                     (placeholder.to_string(), c.text3)
                 };
-                // API Key 右边要留出「显示 / 隐藏」
-                let suffix_w = if field == TrField::Key {
-                    rect.right - l.tr_reveal.left + p.s(4.0)
+                // 拉模型失败时，把原因直接写在模型那一格里（不另占一行）
+                let (text, color) = if field == TrField::Model {
+                    match &state.models_error {
+                        Some(error) => (error.clone(), c.accent),
+                        None => (text, color),
+                    }
                 } else {
-                    p.s(10.0)
+                    (text, color)
+                };
+                // API Key 右边留「显示 / 隐藏」，模型那一格留「获取」
+                let suffix_w = match field {
+                    TrField::Key => rect.right - l.tr_reveal.left + p.s(4.0),
+                    TrField::Model => rect.right - l.tr_fetch.left + p.s(4.0),
+                    TrField::Base => p.s(10.0),
                 };
                 let text_left = rect.left + p.s(10.0);
                 p.text(
@@ -1792,6 +1827,19 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
                     rect.bottom,
                     DT_LEFT,
                 );
+                if field == TrField::Model {
+                    let fetch = l.tr_fetch;
+                    p.text(
+                        if state.models_busy { "获取中…" } else { "获取" },
+                        state.fonts.small,
+                        if state.models_busy { c.text3 } else { c.accent },
+                        fetch.left - p.s(4.0),
+                        fetch.top,
+                        fetch.right,
+                        fetch.bottom,
+                        DT_RIGHT,
+                    );
+                }
                 if field == TrField::Key {
                     let reveal = l.tr_reveal;
                     p.text(
@@ -2000,9 +2048,13 @@ const DT_CENTER_ALIGN: u32 = 0x0001;
 struct Popup {
     parent: HWND,
     row: usize,
+    /// true = 模型选择框（选完写进「模型」那一格）
+    models: bool,
     items: Vec<String>,
     selected: usize,
     hover: Option<usize>,
+    /// 顶部第一条的下标（模型列表太长时要能滚）
+    scroll: usize,
     scale: f32,
 }
 
@@ -2012,6 +2064,8 @@ fn popup_state(hwnd: HWND) -> *mut Popup {
 
 const POPUP_PAD: f32 = 6.0;
 const POPUP_ITEM: f32 = 36.0;
+/// 下拉最多显示几条（模型列表可能几十条，多的靠滚轮）
+const POPUP_MAX_ITEMS: usize = 9;
 
 unsafe fn popup_paint(hwnd: HWND) {
     let c = crate::theme::ui();
@@ -2058,8 +2112,11 @@ unsafe fn popup_paint(hwnd: HWND) {
     let f = font(10.5, 400, state.scale);
     let f_selected = font(10.5, 600, state.scale);
 
-    for (index, item) in state.items.iter().enumerate() {
-        let top = pad + item_h * index as i32;
+    let visible = ((client.bottom - pad * 2) / item_h).max(1) as usize;
+    let start = state.scroll.min(state.items.len().saturating_sub(visible));
+    for (slot, (index, item)) in state.items.iter().enumerate().skip(start).take(visible).enumerate() {
+        let _ = slot;
+        let top = pad + item_h * (index - start) as i32;
         let bottom = top + item_h;
         let hovered = state.hover == Some(index);
         let selected = index == state.selected;
@@ -2136,11 +2193,29 @@ unsafe extern "system" fn popup_proc(
             let index = if y < pad {
                 None
             } else {
-                Some(((y - pad) / item_h) as usize)
+                Some(state.scroll + ((y - pad) / item_h) as usize)
             };
             let index = index.filter(|index| *index < state.items.len());
             if state.hover != index {
                 state.hover = index;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let state = popup_state(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            if state.items.len() > POPUP_MAX_ITEMS {
+                let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
+                if delta < 0 {
+                    let max = state.items.len() - POPUP_MAX_ITEMS;
+                    state.scroll = (state.scroll + 1).min(max);
+                } else {
+                    state.scroll = state.scroll.saturating_sub(1);
+                }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             0
@@ -2150,7 +2225,13 @@ unsafe extern "system" fn popup_proc(
             if !state.is_null() {
                 let state = &*state;
                 if let Some(index) = state.hover {
-                    PostMessageW(state.parent, WM_APP_PICK, state.row, index as isize);
+                    let tag = if state.models { 0x100 } else { 0 };
+                    PostMessageW(
+                        state.parent,
+                        WM_APP_PICK,
+                        state.row | tag,
+                        index as isize,
+                    );
                 }
             }
             DestroyWindow(hwnd);
@@ -2254,7 +2335,7 @@ unsafe extern "system" fn popup_proc(
     }
 }
 
-unsafe fn open_popup(settings: HWND, row: usize) {
+unsafe fn open_popup(settings: HWND, row: usize, models_mode: bool) {
     let state = state_of(settings);
     if state.is_null() {
         return;
@@ -2273,12 +2354,19 @@ unsafe fn open_popup(settings: HWND, row: usize) {
     };
     GetClientRect(settings, &mut client);
     let l = layout(state, client);
-    let mut anchor = l.selects[row - 1];
+    let mut anchor = if models_mode {
+        l.tr_model
+    } else {
+        l.selects[row - 1]
+    };
     // 下拉挂在控件下方：控件坐标是「未滚动」的，这里换成窗口坐标
     anchor.top -= state.scroll;
     anchor.bottom -= state.scroll;
 
-    let items: Vec<String> = match row {
+    let items: Vec<String> = if models_mode {
+        state.models.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        match row {
         1 => FONT_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
         2 => GAUGE_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
         3 => {
@@ -2287,17 +2375,29 @@ unsafe fn open_popup(settings: HWND, row: usize) {
             list
         }
         _ => REFRESH_OPTIONS.iter().map(|(label, _)| label.to_string()).collect(),
+        }
     };
-    let selected = match row {
-        1 => state.font,
-        2 => state.gauge,
-        3 => state.interface,
-        _ => state.refresh,
+    let selected = if models_mode {
+        let current = state.tr_model.trim().to_string();
+        state
+            .models
+            .iter()
+            .position(|(id, _)| *id == current)
+            // 还没选过就一个都不打勾（否则会误标第一项）
+            .unwrap_or(usize::MAX)
+    } else {
+        match row {
+            1 => state.font,
+            2 => state.gauge,
+            3 => state.interface,
+            _ => state.refresh,
+        }
     };
 
     let scale = state.scale;
     let width = anchor.right - anchor.left;
-    let height = (s(POPUP_PAD * 2.0, scale) + s(POPUP_ITEM, scale) * items.len() as i32).max(1);
+    let visible = items.len().min(POPUP_MAX_ITEMS);
+    let height = (s(POPUP_PAD * 2.0, scale) + s(POPUP_ITEM, scale) * visible as i32).max(1);
 
     let mut point = POINT {
         x: anchor.left,
@@ -2344,9 +2444,11 @@ unsafe fn open_popup(settings: HWND, row: usize) {
     let popup_state = Box::into_raw(Box::new(Popup {
         parent: settings,
         row,
+        models: models_mode,
         items,
         selected,
         hover: None,
+        scroll: 0,
         scale,
     }));
 
@@ -2490,6 +2592,8 @@ pub fn open(parent: HWND, settings: &Settings) {
             translate_enabled: settings.translate_enabled,
             tr_provider: if settings.translate_provider.eq_ignore_ascii_case("deepseek") {
                 1
+            } else if settings.translate_provider.eq_ignore_ascii_case("opencode") {
+                2
             } else {
                 0
             },
@@ -2498,6 +2602,9 @@ pub fn open(parent: HWND, settings: &Settings) {
             tr_base: settings.translate_base.clone(),
             tr_edit: None,
             tr_show_key: false,
+            models: Vec::new(),
+            models_busy: false,
+            models_error: None,
             tr_caret: 0,
             capture: 0,
             fonts: Fonts::create(scale),
@@ -2789,7 +2896,11 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
 /// 下拉选中某一项：鼠标点选和键盘改值共用
 /// 把翻译配置写回设置（点服务商、编辑结束、关窗时调）
 fn commit_translate(state: &State) {
-    let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" };
+    let provider = match state.tr_provider {
+        1 => "deepseek",
+        2 => "opencode",
+        _ => "chatgpt",
+    };
     crate::apply_translate_settings(
         state.parent,
         provider,
@@ -2884,6 +2995,38 @@ fn toggle_source(state: &mut State, index: usize) {
     }
     state.ai_sources[index] = !state.ai_sources[index];
     crate::apply_ai_sources(state.parent, state.ai_sources);
+}
+
+/// 去服务商拉模型列表（后台线程），回来再弹选择框
+fn start_model_fetch(state: &mut State) {
+    if state.models_busy {
+        return;
+    }
+    state.models_busy = true;
+    state.models_error = None;
+    let raw = state.hwnd as isize;
+    let provider = match state.tr_provider {
+        1 => "deepseek",
+        2 => "opencode",
+        _ => "chatgpt",
+    }
+    .to_string();
+    let base = state.tr_base.clone();
+    let key = state.tr_key.clone();
+    unsafe {
+        InvalidateRect(state.hwnd, std::ptr::null(), 0);
+    }
+    std::thread::spawn(move || {
+        let result = crate::translate::fetch_models(&provider, &base, &key);
+        let boxed = Box::into_raw(Box::new(result));
+        unsafe {
+            // 线程里不能带 HWND（不是 Send），只传地址
+            let hwnd = raw as HWND;
+            if PostMessageW(hwnd, WM_APP_MODELS, 0, boxed as isize) == 0 {
+                drop(Box::from_raw(boxed));
+            }
+        }
+    });
 }
 
 /// 起一轮动效：后台线程按 16ms 往窗口里投 WM_APP_ANIM，直到所有值都到位
@@ -3285,13 +3428,23 @@ unsafe extern "system" fn dialog_proc(
                     Some(0usize)
                 } else if inside(l.tr_deepseek) {
                     Some(1usize)
+                } else if inside(l.tr_opencode) {
+                    Some(2usize)
                 } else {
                     None
                 };
                 if let Some(provider) = provider {
                     state.tr_provider = provider;
+                    state.models.clear();
+                    state.models_error = None;
                     commit_translate(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+
+                // 模型那一格右边的「获取」：去服务商拉模型列表
+                if inside(l.tr_fetch) && !state.models_busy {
+                    start_model_fetch(state);
                     return 0;
                 }
                 let hit = if state.translate_enabled && inside(l.tr_key) && !inside(l.tr_reveal) {
@@ -3358,7 +3511,7 @@ unsafe extern "system" fn dialog_proc(
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::Select(row)) => {
-                    open_popup(hwnd, row);
+                    open_popup(hwnd, row, false);
                 }
                 Some(Hit::AiToggle) => {
                     toggle_ai(state);
@@ -3472,16 +3625,45 @@ unsafe extern "system" fn dialog_proc(
             }
             0
         }
+        WM_APP_MODELS => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let result = Box::from_raw(lparam as *mut Result<Vec<(String, String)>, String>);
+            state.models_busy = false;
+            match *result {
+                Ok(models) => {
+                    state.models = models;
+                    state.models_error = None;
+                    open_popup(hwnd, 0, true);
+                }
+                Err(error) => {
+                    state.models.clear();
+                    state.models_error = Some(error);
+                }
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_APP_PICK => {
             let state = state_of(hwnd);
             if state.is_null() {
                 return 0;
             }
             let state = &mut *state;
-            let row = wparam;
             let index = lparam as usize;
-
-            choose(state, row, index);
+            if wparam & 0x100 != 0 {
+                // 从模型列表里选了一个：写进「模型」并立刻生效
+                if let Some((id, _)) = state.models.get(index).cloned() {
+                    state.tr_model = id;
+                    state.models_error = None;
+                    commit_translate(state);
+                }
+            } else {
+                choose(state, wparam & 0xFF, index);
+            }
 
             state.popup = std::ptr::null_mut();
             state.popup_row = 0;

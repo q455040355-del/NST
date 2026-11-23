@@ -17,10 +17,11 @@ pub struct TranslateOutcome {
 /// 把「服务商 + 模型 + base」统一成实际请求要用的三样东西
 fn endpoint(settings: &netspeed_core::settings::Settings) -> (String, String) {
     let provider = settings.translate_provider.trim().to_lowercase();
-    let (default_base, default_model) = if provider == "deepseek" {
-        ("https://api.deepseek.com/v1", "deepseek-chat")
-    } else {
-        ("https://api.openai.com/v1", "gpt-4o-mini")
+    let (default_base, default_model) = match provider.as_str() {
+        "deepseek" => ("https://api.deepseek.com/v1", "deepseek-chat"),
+        // OpenCode Zen：一个 key 走所有模型，chat/completions 兼容；默认用免费那个
+        "opencode" => ("https://opencode.ai/zen/v1", "deepseek-v4-flash-free"),
+        _ => ("https://api.openai.com/v1", "gpt-4o-mini"),
     };
     let base = settings.translate_base.trim();
     let base = if base.is_empty() { default_base } else { base };
@@ -52,8 +53,8 @@ Only output the translation, no explanations, no quotes.\n\n{}",
     )
 }
 
-/// WinHttp POST（https），返回响应体
-fn http_post(url: &str, headers: &str, body: &[u8]) -> Result<String, String> {
+/// WinHttp 请求（https），返回响应体；body 为 None 就是 GET
+fn http_request(method: &str, url: &str, headers: &str, body: Option<&[u8]>) -> Result<String, String> {
     use windows_sys::Win32::Networking::WinHttp::*;
     use std::ptr::null_mut;
 
@@ -69,7 +70,7 @@ fn http_post(url: &str, headers: &str, body: &[u8]) -> Result<String, String> {
     let agent = wide("NetSpeedTaskbar-Translate");
     let host_w = wide(host);
     let path_w = wide(path);
-    let post = wide("POST");
+    let verb = wide(method);
     let headers_w = wide(headers);
 
     unsafe {
@@ -93,7 +94,7 @@ fn http_post(url: &str, headers: &str, body: &[u8]) -> Result<String, String> {
         }
         let request = WinHttpOpenRequest(
             connect,
-            post.as_ptr(),
+            verb.as_ptr(),
             path_w.as_ptr(),
             null_mut(),
             null_mut(),
@@ -106,13 +107,17 @@ fn http_post(url: &str, headers: &str, body: &[u8]) -> Result<String, String> {
             return Err("创建请求失败".to_string());
         }
 
+        let (body_ptr, body_len) = match body {
+            Some(bytes) => (bytes.as_ptr() as *mut _, bytes.len() as u32),
+            None => (std::ptr::null_mut(), 0),
+        };
         let mut ok = WinHttpSendRequest(
             request,
             headers_w.as_ptr(),
             u32::MAX,
-            body.as_ptr() as *mut _,
-            body.len() as u32,
-            body.len() as u32,
+            body_ptr,
+            body_len,
+            body_len,
             0,
         );
         if ok != 0 {
@@ -175,6 +180,67 @@ fn http_post(url: &str, headers: &str, body: &[u8]) -> Result<String, String> {
     }
 }
 
+/// 服务商的默认 base（设置里没填 Base URL 时用）
+pub fn default_base(provider: &str) -> &'static str {
+    match provider.trim().to_lowercase().as_str() {
+        "deepseek" => "https://api.deepseek.com/v1",
+        "opencode" => "https://opencode.ai/zen/v1",
+        _ => "https://api.openai.com/v1",
+    }
+}
+
+/// 拉服务商的模型列表：GET {base}/models（OpenAI 兼容的 `{"data":[{"id":..}]}`）。
+/// 返回 (模型 id, 显示名)，只留能走 chat/completions 的。
+pub fn fetch_models(
+    provider: &str,
+    base: &str,
+    key: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let base = base.trim();
+    let base = if base.is_empty() {
+        default_base(provider)
+    } else {
+        base
+    };
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let headers = if key.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {}\r\n", key.trim())
+    };
+    let raw = http_request("GET", &url, &headers, None)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| "服务端返回的不是 JSON".to_string())?;
+    let list = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .ok_or_else(|| "返回里没有模型列表".to_string())?;
+
+    let mut models: Vec<(String, String)> = Vec::new();
+    for item in list {
+        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        // OpenCode Zen 会在每个模型上写它推荐的 API：只有 chat-completions 的能直接用
+        if let Some(api) = item.get("recommended_api").and_then(|api| api.as_str()) {
+            if !api.eq_ignore_ascii_case("chat-completions") {
+                continue;
+            }
+        }
+        let name = item
+            .get("name")
+            .and_then(|name| name.as_str())
+            .unwrap_or(id);
+        models.push((id.to_string(), name.to_string()));
+    }
+    models.sort_by(|a, b| a.0.cmp(&b.0));
+    models.dedup_by(|a, b| a.0 == b.0);
+    if models.is_empty() {
+        return Err("这家没返回能用的模型".to_string());
+    }
+    Ok(models)
+}
+
 fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> Result<String, String> {
     if settings.translate_key.trim().is_empty() {
         return Err("还没填 API Key（右键菜单 → 翻译设置…）".to_string());
@@ -198,7 +264,7 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
         settings.translate_key.trim()
     );
 
-    let raw = http_post(&url, &headers, body.as_bytes())?;
+    let raw = http_request("POST", &url, &headers, Some(body.as_bytes()))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| "服务端返回的不是 JSON".to_string())?;
     let translated = value
