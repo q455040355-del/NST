@@ -2014,3 +2014,90 @@ pub unsafe fn save_and_notify(owner: HWND, output: RecOutput) {
     crate::dialog::info(owner, "MP4 已保存", &text);
 }
 
+#[cfg(test)]
+mod rec_pure_tests {
+    use super::*;
+
+    #[test]
+    fn bitrate_stays_inside_the_safe_band() {
+        // 太小 / 太大都夹到上下限，免得码率低到糊或者高到写不动盘
+        assert_eq!(h264_bitrate(1, 1, 0), 600_000, "极小画面也要有下限");
+        let huge = h264_bitrate(3840 * 2160, 120, 100);
+        assert_eq!(huge, 24_000_000, "4K120 也要夹到上限");
+
+        // 中间值要落在区间内
+        let mid = h264_bitrate(1920 * 1080, 30, 65);
+        assert!((600_000..=24_000_000).contains(&mid));
+    }
+
+    #[test]
+    fn bitrate_grows_with_pixels_fps_and_quality() {
+        let base = h264_bitrate(1280 * 720, 30, 50);
+        // 像素翻倍 → 码率变高（未触顶时）
+        assert!(h264_bitrate(2560 * 1440, 30, 50) > base);
+        // 帧率翻倍 → 码率变高
+        assert!(h264_bitrate(1280 * 720, 60, 50) > base);
+        // 质量提高 → 码率变高
+        assert!(h264_bitrate(1280 * 720, 30, 90) > base);
+        // 质量参数越界（>100）按 100 处理，不会失控
+        assert!(h264_bitrate(1280 * 720, 30, 1000) <= 24_000_000);
+        // fps 传 0 当作 1，不能算出 0 码率
+        assert!(h264_bitrate(1280 * 720, 0, 50) >= 600_000);
+    }
+
+    #[test]
+    fn dib_header_is_a_valid_bottom_up_rgb32() {
+        // 2×2 的 BGRA 源：第 0 行红、第 1 行蓝
+        let width = 2;
+        let height = 2;
+        let mut source = Vec::new();
+        for _ in 0..width {
+            source.extend_from_slice(&[0, 0, 255, 255]); // 蓝
+        }
+        for _ in 0..width {
+            source.extend_from_slice(&[0, 0, 255, 255]);
+        }
+
+        let (out, len) = dib_from_bgra(&source, width, height).expect("2x2 应该能转");
+        assert_eq!(len, std::mem::size_of::<BITMAPINFOHEADER>() + 4 * 4);
+        assert_eq!(out.len(), len);
+
+        let info = unsafe { &*(out.as_ptr() as *const BITMAPINFOHEADER) };
+        assert_eq!(info.biSize, std::mem::size_of::<BITMAPINFOHEADER>() as u32);
+        assert_eq!(info.biWidth, width);
+        assert_eq!(info.biHeight, height, "高度为正 = 自下而上");
+        assert_eq!(info.biBitCount, 32);
+        assert_eq!(info.biCompression, 0, "BI_RGB");
+        assert_eq!(info.biSizeImage, (width * height * 4) as u32);
+    }
+
+    #[test]
+    fn dib_rejects_short_buffers_instead_of_reading_past_the_end() {
+        // 源数据不够一帧：返回 None，不能越界读
+        assert!(dib_from_bgra(&[], 2, 2).is_none());
+        assert!(dib_from_bgra(&[0u8; 15], 2, 2).is_none());
+        // 尺寸传 0 也不会 panic（内部按 1 处理）
+        assert!(dib_from_bgra(&[0u8; 4], 0, 0).is_some());
+    }
+
+    #[test]
+    fn mean_luma_matches_the_expected_brightness() {
+        // 全黑 → 0，全白 → 255
+        let black = vec![0u8; 4 * 64 * 8];
+        assert_eq!(mean_luma(&black), 0.0);
+
+        let white = vec![255u8; 4 * 64 * 8];
+        let luma = mean_luma(&white);
+        assert!((luma - 255.0).abs() < 0.01, "全白应该接近 255，实际 {luma}");
+
+        // 中灰
+        let gray = vec![128u8; 4 * 64 * 8];
+        let luma = mean_luma(&gray);
+        assert!((luma - 128.0).abs() < 0.01, "中灰应该接近 128，实际 {luma}");
+
+        // 空数据不能除零
+        assert_eq!(mean_luma(&[]), 0.0);
+        // 不足一个像素的四字节：采样一次，不该 panic
+        assert_eq!(mean_luma(&[1, 2, 3]), 2.0);
+    }
+}
