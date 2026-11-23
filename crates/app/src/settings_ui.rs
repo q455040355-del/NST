@@ -63,16 +63,20 @@ const REFRESH_OPTIONS: [(&str, i32); 3] = [("0.5 秒", 500), ("1 秒", 1000), ("
 const ROW_COUNT: usize = 5;
 const ROW_FIRST: f32 = 84.0;
 const ROW_STEP: f32 = 62.0;
-const CONTROL_X: f32 = 178.0;
 
-// AI 区块（在 5 个基础行下面）
-const AI_HEAD_TOP: f32 = 396.0; // 分隔线
-const AI_TITLE_TOP: f32 = 402.0; // 「AI 统计」小标题
-const AI_TOGGLE_TOP: f32 = 428.0; // 总开关行
-const AI_SOURCES_TOP: f32 = 470.0; // 来源格子起点（两列三行）
+// 两列：左列「显示 + AI 统计」，右列「截图与取字 + 翻译」。
+// 列宽 = (窗口宽 - 左右留白 - 列间距) / 2；标签列固定 100 宽，控件从列左缘 +100 起。
+const COL_GUTTER: f32 = 28.0;
+const COL_LABEL_W: f32 = 100.0;
+
+// 左列：AI 统计（5 个基础行下面）
+const AI_HEAD_TOP: f32 = 404.0; // 分隔线
+const AI_TITLE_TOP: f32 = 410.0; // 「AI 统计」小标题
+const AI_TOGGLE_TOP: f32 = 434.0; // 总开关行
+const AI_SOURCES_TOP: f32 = 482.0; // 来源格子起点（两列三行）
 const AI_ROW_H: f32 = 42.0;
 /// 来源格子的行高（两列三行，比整行矮一点，正好铺满）
-const AI_SOURCE_ROW_H: f32 = 36.0;
+const AI_SOURCE_ROW_H: f32 = 34.0;
 const AI_SOURCE_LABELS: [&str; 6] = [
     "OpenCode",
     "dsh",
@@ -82,25 +86,29 @@ const AI_SOURCE_LABELS: [&str; 6] = [
     "Codex",
 ];
 
-// 截图 / 取字区块（AI 来源下面）
-const SHOT_HEAD_TOP: f32 = 596.0; // 分隔线
-const SHOT_TITLE_TOP: f32 = 602.0; // 「截图与取字」小标题
-const SHOT_FIRST_TOP: f32 = 626.0; // 截图行
-const SHOT_OCR_TOP: f32 = 674.0; // 取字行
-const SHOT_GIF_TOP: f32 = 722.0; // 录 GIF 行
-const SHOT_REC_TOP: f32 = 768.0; // 录制参数行（画质 / 时长 / 帧率）
-const SHOT_ROW_H: f32 = 44.0;
+// 右列：截图 / 取字（右列顶部，上面就是页头，不再画分隔线）
+const SHOT_TITLE_TOP: f32 = 84.0; // 「截图与取字」小标题
+const SHOT_FIRST_TOP: f32 = 106.0; // 截图行
+const SHOT_OCR_TOP: f32 = 152.0; // 取字行
+const SHOT_GIF_TOP: f32 = 198.0; // 录 MP4 行
+const SHOT_REC_TOP: f32 = 244.0; // 录制参数行（画质 / 时长 / 帧率）
+const SHOT_ROW_H: f32 = 46.0;
 
-// 翻译区块（截图 / 取字下面）
-const TR_HEAD_TOP: f32 = 790.0; // 分隔线
-const TR_TITLE_TOP: f32 = 796.0; // 「翻译」小标题
-const TR_ROW1_TOP: f32 = 826.0; // 第一行：服务商 | 模型
-const TR_ROW2_TOP: f32 = 878.0; // 第二行：API Key | Base URL
+// 右列：翻译（截图 / 取字下面）
+const TR_HEAD_TOP: f32 = 306.0; // 分隔线
+const TR_TITLE_TOP: f32 = 312.0; // 「翻译」小标题
+const TR_ROW1_TOP: f32 = 348.0; // 服务商
+const TR_ROW2_TOP: f32 = 402.0; // 模型
+const TR_ROW3_TOP: f32 = 456.0; // API Key
+const TR_ROW4_TOP: f32 = 510.0; // Base URL
 
 /// 可滚动内容区：分隔线往下到页脚分割线往上
 const CONTENT_TOP: f32 = 65.0;
 /// 内容总高度（最后一行 + 一点留白）；窗口比这个矮就出现滚动
-const CONTENT_BOTTOM: f32 = 926.0;
+const CONTENT_BOTTOM: f32 = 600.0;
+/// 窗口尺寸（逻辑像素）：两列铺开，1080p 上不用滚动就能看全
+const WINDOW_W: f32 = 760.0;
+const WINDOW_H: f32 = 676.0;
 /// 页脚（分割线 + 完成按钮）高度
 const FOOTER_H: f32 = 64.0;
 
@@ -469,9 +477,15 @@ fn layout(state: &State, client: RECT) -> Layout {
         bottom: client.bottom - pad,
     };
 
-    let control_left = s(CONTROL_X, scale);
-    // 右列起点：窗口右半边，减去一点留白
-    let tr_right_left = control_left + ((right - control_left) / 2) + s(6.0, scale);
+    // 两列：左列 pad .. left_right，右列 right_left .. right
+    let col_gutter = s(COL_GUTTER, scale);
+    let col_w = ((right - pad - col_gutter) / 2).max(s(200.0, scale));
+    let left_right = pad + col_w;
+    let right_left = left_right + col_gutter;
+    // 标签列固定宽：控件从列左缘往右 100 起，两列的控制区一样宽
+    let control_left = pad + s(COL_LABEL_W, scale);
+    let right_control = right_left + s(COL_LABEL_W, scale);
+
     let row_center = |index: usize| -> i32 {
         s(ROW_FIRST + ROW_STEP * index as f32, scale) + s(ROW_STEP * 0.5 - 6.0, scale)
     };
@@ -480,7 +494,7 @@ fn layout(state: &State, client: RECT) -> Layout {
     let slider = RECT {
         left: control_left,
         top: row_center(1) - s(14.0, scale),
-        right: right - s(96.0, scale),
+        right: left_right - s(88.0, scale),
         bottom: row_center(1) + s(14.0, scale),
     };
 
@@ -498,7 +512,7 @@ fn layout(state: &State, client: RECT) -> Layout {
         *slot = RECT {
             left: control_left,
             top: center - height / 2,
-            right,
+            right: left_right,
             bottom: center + height / 2,
         };
     }
@@ -512,12 +526,12 @@ fn layout(state: &State, client: RECT) -> Layout {
     let hotkey_h = s(26.0, scale);
     let hotkey_right = right - switcher_w - s(10.0, scale);
     let hotkey_left = hotkey_right - hotkey_w;
-    // 「录制」行的三颗胶囊（画质 / 时长 / 帧率），单独占一行
+    // 「录制」行的三颗胶囊（画质 / 时长 / 帧率），单独占一行，右缘和开关那一列对齐
     let rec_top = s(SHOT_REC_TOP, scale);
     let pill_w = s(74.0, scale);
     let pill_gap = s(8.0, scale);
     let pill_h = s(26.0, scale);
-    let pill_x = pad + s(44.0, scale);
+    let pill_x = right - (pill_w * 3 + pill_gap * 2);
     let pill_y = rec_top + (row_h - pill_h) / 2;
     let pill = |index: i32| RECT {
         left: pill_x + index * (pill_w + pill_gap),
@@ -533,20 +547,20 @@ fn layout(state: &State, client: RECT) -> Layout {
         slider,
         selects,
         ai_toggle: RECT {
-            left: s(12.0, scale),
+            left: pad + s(4.0, scale),
             top: s(AI_TOGGLE_TOP, scale),
-            right,
+            right: left_right,
             bottom: s(AI_TOGGLE_TOP + AI_ROW_H, scale),
         },
-        ai_sources: ai_source_rects(scale, right),
+        ai_sources: ai_source_rects(scale, pad + s(4.0, scale), left_right),
         shot_toggle: RECT {
-            left: s(12.0, scale),
+            left: right_left,
             top: shot_top,
             right,
             bottom: shot_top + row_h,
         },
         ocr_toggle: RECT {
-            left: s(12.0, scale),
+            left: right_left,
             top: ocr_top,
             right,
             bottom: ocr_top + row_h,
@@ -564,7 +578,7 @@ fn layout(state: &State, client: RECT) -> Layout {
             bottom: ocr_top + (row_h - hotkey_h) / 2 + hotkey_h,
         },
         gif_toggle: RECT {
-            left: s(12.0, scale),
+            left: right_left,
             top: gif_top,
             right,
             bottom: gif_top + row_h,
@@ -585,26 +599,22 @@ fn layout(state: &State, client: RECT) -> Layout {
             right: (pad + s(4.0, scale) + s(170.0, scale)).min(done.left - s(12.0, scale)),
             bottom: done.bottom,
         },
-        // 两列：左列 x = pad .. mid，右列 x = mid + 间距 .. right
+        // 翻译在右列里竖着排四行：服务商 / 模型 / API Key / Base URL
         tr_chatgpt: RECT {
-            left: control_left,
+            left: right_control,
             top: s(TR_ROW1_TOP, scale),
-            right: control_left + s(78.0, scale),
-            bottom: s(TR_ROW1_TOP, scale) + s(28.0, scale),
+            right: right_control + s(88.0, scale),
+            bottom: s(TR_ROW1_TOP, scale) + s(32.0, scale),
         },
         tr_deepseek: RECT {
-            left: control_left + s(84.0, scale),
+            left: right_control + s(94.0, scale),
             top: s(TR_ROW1_TOP, scale),
-            right: control_left + s(84.0, scale) + s(88.0, scale),
-            bottom: s(TR_ROW1_TOP, scale) + s(28.0, scale),
+            right: right_control + s(94.0, scale) + s(96.0, scale),
+            bottom: s(TR_ROW1_TOP, scale) + s(32.0, scale),
         },
-        tr_model: input_rect(
-            s(TR_ROW1_TOP, scale),
-            tr_right_left,
-            right,
-        ),
-        tr_key: input_rect(s(TR_ROW2_TOP, scale), control_left, tr_right_left - s(12.0, scale)),
-        tr_base: input_rect(s(TR_ROW2_TOP, scale), tr_right_left, right),
+        tr_model: input_rect(s(TR_ROW2_TOP, scale), right_control, right),
+        tr_key: input_rect(s(TR_ROW3_TOP, scale), right_control, right),
+        tr_base: input_rect(s(TR_ROW4_TOP, scale), right_control, right),
         // 页脚右侧：检查更新，紧挨着「完成」
         update: RECT {
             left: done.left - s(12.0, scale) - s(104.0, scale),
@@ -615,11 +625,10 @@ fn layout(state: &State, client: RECT) -> Layout {
     }
 }
 
-fn ai_source_rects(scale: f32, right: i32) -> [RECT; 6] {
-    // 两列三行：一列六行会把窗口顶出滚动条
-    let left = s(12.0, scale);
+fn ai_source_rects(scale: f32, left: i32, right: i32) -> [RECT; 6] {
+    // 两列三行：一列六行会把这一列顶得比左边高
     let gutter = s(12.0, scale);
-    let column = (right - left - gutter) / 2;
+    let column = ((right - left - gutter) / 2).max(s(80.0, scale));
     let top0 = s(AI_SOURCES_TOP, scale);
     let row_h = s(AI_SOURCE_ROW_H, scale);
 
@@ -840,6 +849,13 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
 
     let pad = p.s(20.0);
     let content_right = client.right - pad;
+    // 两列的边界（和 layout() 里的算法必须一致，否则点击和画面会错位）
+    let col_gutter = p.s(COL_GUTTER);
+    let col_w = ((content_right - pad - col_gutter) / 2).max(p.s(200.0));
+    let left_right = pad + col_w;
+    let right_left = left_right + col_gutter;
+    let control_left = pad + p.s(COL_LABEL_W);
+    let right_control = right_left + p.s(COL_LABEL_W);
 
     // 标题
     p.text(
@@ -910,17 +926,17 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             c.text,
             pad + p.s(4.0),
             center - p.s(11.0),
-            s(CONTROL_X, state.scale) - p.s(12.0),
+            control_left - p.s(12.0),
             center + p.s(11.0),
             DT_LEFT,
         );
 
         if row < ROW_COUNT - 1 {
-            // 行间很淡的细线
+            // 行间很淡的细线（只铺左列）
             p.fill(
                 pad + p.s(4.0),
                 bottom,
-                content_right,
+                left_right,
                 bottom + 1,
                 mix_white(c.border, 0.45),
             );
@@ -966,14 +982,14 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         p.circle(knob_x, mid, knob_r, KNOB, mix_white(c.border, 0.1));
         p.circle(knob_x, mid, knob_r - p.s(3.0), KNOB, KNOB);
 
-        // 数值（固定在右侧，不跟着圆钮跑，避免文字框被挤成负数）
+        // 数值（固定在列右侧，不跟着圆钮跑，避免文字框被挤成负数）
         p.text(
             &format!("{} px", state.width),
             state.fonts.value,
             c.text2,
-            content_right - p.s(80.0),
+            left_right - p.s(80.0),
             mid - p.s(10.0),
-            content_right,
+            left_right,
             mid + p.s(10.0),
             DT_RIGHT,
         );
@@ -1021,9 +1037,9 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
 
     // ---------------------------------------------------------------- AI 统计
     p.fill(
-        0,
+        pad,
         p.s(AI_HEAD_TOP),
-        client.right,
+        left_right,
         p.s(AI_HEAD_TOP) + 1,
         c.border,
     );
@@ -1033,7 +1049,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         c.text3,
         pad + p.s(4.0),
         p.s(AI_TITLE_TOP),
-        content_right,
+        left_right,
         p.s(AI_TITLE_TOP + 20.0),
         DT_LEFT,
     );
@@ -1044,7 +1060,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         p.round(
             toggle.left,
             toggle.top + p.s(1.0),
-            content_right,
+            left_right,
             toggle.bottom - p.s(1.0),
             p.s(8.0),
             c.chip,
@@ -1079,7 +1095,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     // 开关本体
     let sw_w = p.s(40.0);
     let sw_h = p.s(22.0);
-    let sx = content_right - sw_w;
+    let sx = left_right - sw_w;
     let sy = mid - sw_h / 2;
     if state.ai_enabled {
         p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
@@ -1168,18 +1184,12 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     }
 
     // ---------------------------------------------------------------- 截图 / 取字
-    p.fill(
-        0,
-        p.s(SHOT_HEAD_TOP),
-        client.right,
-        p.s(SHOT_HEAD_TOP) + 1,
-        c.border,
-    );
+    // 右列的第一块，上面就是页头，所以不画分隔线
     p.text(
         "截图与取字",
         state.fonts.small,
         c.text3,
-        pad + p.s(4.0),
+        right_left + p.s(4.0),
         p.s(SHOT_TITLE_TOP),
         content_right,
         p.s(SHOT_TITLE_TOP + 20.0),
@@ -1219,7 +1229,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             p.round(
                 row.left,
                 row.top + p.s(1.0),
-                content_right,
+                row.right,
                 row.bottom - p.s(1.0),
                 p.s(8.0),
                 c.chip,
@@ -1231,7 +1241,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             title,
             state.fonts.label,
             if on { c.text } else { c.text2 },
-            pad + p.s(4.0),
+            row.left + p.s(4.0),
             row.top + p.s(2.0),
             hotkey_rect.left - p.s(10.0),
             row.top + p.s(24.0),
@@ -1241,7 +1251,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             subtitle,
             state.fonts.small,
             c.text3,
-            pad + p.s(4.0),
+            row.left + p.s(4.0),
             mid,
             hotkey_rect.left - p.s(10.0),
             row.bottom,
@@ -1284,7 +1294,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         // 开关本体
         let sw_w = p.s(40.0);
         let sw_h = p.s(22.0);
-        let sx = content_right - sw_w;
+        let sx = row.right - sw_w;
         let sy = mid - sw_h / 2;
         if on {
             p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
@@ -1327,7 +1337,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             p.round(
                 row.left,
                 row.top + p.s(1.0),
-                content_right,
+                row.right,
                 row.bottom - p.s(1.0),
                 p.s(8.0),
                 c.chip,
@@ -1339,17 +1349,17 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             "截区域录 MP4",
             state.fonts.label,
             if state.gif_enabled { c.text } else { c.text2 },
-            pad + p.s(4.0),
+            row.left + p.s(4.0),
             row.top + p.s(2.0),
             l.gif_hotkey.left - p.s(10.0),
             row.top + p.s(24.0),
             DT_LEFT,
         );
         p.text(
-            "框一块区域录成 MP4 视频",
+            "框一块区域录成视频",
             state.fonts.small,
             c.text3,
-            pad + p.s(4.0),
+            row.left + p.s(4.0),
             mid,
             l.gif_hotkey.left - p.s(10.0),
             row.bottom,
@@ -1400,7 +1410,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         // 开关本体
         let sw_w = p.s(40.0);
         let sw_h = p.s(22.0);
-        let sx = content_right - sw_w;
+        let sx = row.right - sw_w;
         let sy = mid - sw_h / 2;
         if state.gif_enabled {
             p.round(sx, sy, sx + sw_w, sy + sw_h, sw_h, c.accent, c.accent);
@@ -1448,7 +1458,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             "录制",
             state.fonts.small,
             c.text3,
-            pad + p.s(4.0),
+            row.left + p.s(4.0),
             rec_pills[0].0.top,
             rec_pills[0].0.left - p.s(6.0),
             rec_pills[0].0.bottom,
@@ -1488,34 +1498,34 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     // ---------------------------------------------------------------- 翻译
     {
         let head_y = p.s(TR_HEAD_TOP);
-        p.fill(p.s(12.0), head_y, content_right, head_y + 1, c.border);
+        p.fill(right_left, head_y, content_right, head_y + 1, c.border);
         p.text(
             "翻译",
-            state.fonts.title,
-            c.text2,
-            pad + p.s(4.0),
+            state.fonts.small,
+            c.text3,
+            right_left + p.s(4.0),
             p.s(TR_TITLE_TOP),
             content_right,
-            head_y + p.s(24.0),
+            p.s(TR_TITLE_TOP + 20.0),
             DT_LEFT,
         );
 
-        // 两列布局：标签画在控件**上方**（小号灰字），这样左右两列都不会撞
-        let row_label = |text: &str, left: i32, right: i32, top: i32| {
+        // 右列里竖着排，标签在左、控件在右 —— 和左列那五行一个写法
+        let row_label = |text: &str, top: i32, bottom: i32| {
             p.text(
                 text,
-                state.fonts.small,
-                c.text3,
-                left,
-                top - p.s(17.0),
-                right,
-                top - p.s(3.0),
+                state.fonts.label,
+                c.text,
+                right_left + p.s(4.0),
+                top,
+                right_control - p.s(10.0),
+                bottom,
                 DT_LEFT,
             );
         };
 
         // 服务商：两颗胶囊
-        row_label("服务商", l.tr_chatgpt.left, l.tr_deepseek.right, l.tr_chatgpt.top);
+        row_label("服务商", l.tr_chatgpt.top, l.tr_chatgpt.bottom);
         for (rect, name, index) in [
             (l.tr_chatgpt, "ChatGPT", 0usize),
             (l.tr_deepseek, "DeepSeek", 1usize),
@@ -1544,12 +1554,12 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
 
         // 三个输入框
         let fields: [(RECT, TrField, &str, &str); 3] = [
-            (l.tr_key, TrField::Key, "API Key", "sk-…"),
             (l.tr_model, TrField::Model, "模型", "留空用默认"),
+            (l.tr_key, TrField::Key, "API Key", "sk-…"),
             (l.tr_base, TrField::Base, "Base URL", "留空用官方地址"),
         ];
         for (rect, field, title, placeholder) in fields {
-            row_label(title, rect.left, rect.right, rect.top);
+            row_label(title, rect.top, rect.bottom);
             let editing = state.tr_edit == Some(field);
             p.round(
                 rect.left,
@@ -2185,8 +2195,9 @@ pub fn open(parent: HWND, settings: &Settings) {
 
         // 窗口开在鼠标那块屏上：缩放按那块屏算（多屏缩放不同也对）
         let scale = crate::cursor_scale();
-        let width_px = s(440.0, scale);
-        let mut height_px = s(1112.0, scale);
+        // 两列：左列「显示 + AI 统计」，右列「截图与取字 + 翻译」
+        let width_px = s(WINDOW_W, scale);
+        let mut height_px = s(WINDOW_H, scale);
 
         let screen = crate::work_area();
 
@@ -2832,11 +2843,16 @@ unsafe extern "system" fn dialog_proc(
             // 翻译区块：服务商胶囊 / 输入框
             {
                 let l = layout(state, client);
+                // 内容区滚过之后，鼠标位置要换算回「未滚动」的坐标
+                let (view_top, view_bottom) = content_viewport(state, client);
                 let inside = |rect: RECT| {
-                    point.x >= rect.left
+                    let y = point.y + state.scroll;
+                    point.y >= view_top
+                        && point.y < view_bottom
+                        && point.x >= rect.left
                         && point.x <= rect.right
-                        && point.y >= rect.top
-                        && point.y <= rect.bottom
+                        && y >= rect.top
+                        && y <= rect.bottom
                 };
                 if inside(l.tr_chatgpt) || inside(l.tr_deepseek) {
                     state.tr_provider = if inside(l.tr_deepseek) { 1 } else { 0 };
@@ -3074,8 +3090,8 @@ unsafe extern "system" fn dialog_proc(
                 (*state).fonts = Fonts::create(scale);
                 (*state).scroll = 0;
 
-                let width = s(440.0, scale);
-                let mut height = s(884.0, scale);
+                let width = s(WINDOW_W, scale);
+                let mut height = s(WINDOW_H, scale);
                 let suggested = lparam as *const RECT;
                 let (left, top) = if suggested.is_null() {
                     let mut rect = RECT {
