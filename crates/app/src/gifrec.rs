@@ -2010,8 +2010,10 @@ pub unsafe fn save_and_notify(owner: HWND, output: RecOutput) {
         return;
     }
 
-    let text = format!("已保存（{:.2} MB）\n{path}", output.size_mb());
-    crate::dialog::info(owner, "MP4 已保存", &text);
+    let title = format!("MP4 已保存（{:.2} MB）", output.size_mb());
+    if crate::dialog::saved_prompt(owner, &title, &path) {
+        crate::ui::open_path(&path);
+    }
 }
 
 #[cfg(test)]

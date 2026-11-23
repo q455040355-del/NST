@@ -23,7 +23,10 @@ const CLASS: &str = "NetSpeedTaskbarRs.Dialog";
 struct Dialog {
     title: String,
     text: String,
-    confirm: bool,
+    /// 主按钮的字（确定 / 打开）
+    primary: String,
+    /// 副按钮的字（取消 / 关闭）；None = 只有一个按钮
+    secondary: Option<String>,
     /// 点了确定
     accepted: Cell<bool>,
     /// 窗口已关闭
@@ -36,15 +39,27 @@ thread_local! {
 
 /// 只有一个「确定」的提示框
 pub fn info(owner: HWND, title: &str, text: &str) {
-    show(owner, title, text, false);
+    show(owner, title, text, "确定", None);
 }
 
 /// 确定 / 取消，返回是否点了确定
 pub fn confirm(owner: HWND, title: &str, text: &str) -> bool {
-    show(owner, title, text, true)
+    show(owner, title, text, "确定", Some("取消"))
 }
 
-fn show(owner: HWND, title: &str, text: &str, confirm: bool) -> bool {
+/// 存完文件问一句「要不要打开」，返回是否点了「打开」
+pub fn saved_prompt(owner: HWND, title: &str, path: &str) -> bool {
+    let text = format!("已保存到：\n{path}");
+    show(owner, title, &text, "打开", Some("关闭"))
+}
+
+fn show(
+    owner: HWND,
+    title: &str,
+    text: &str,
+    primary: &str,
+    secondary: Option<&str>,
+) -> bool {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class = wide(CLASS);
@@ -136,7 +151,8 @@ fn show(owner: HWND, title: &str, text: &str, confirm: bool) -> bool {
         let state = Box::into_raw(Box::new(Dialog {
             title: title.to_string(),
             text: text.to_string(),
-            confirm,
+            primary: primary.to_string(),
+            secondary: secondary.map(|label| label.to_string()),
             accepted: Cell::new(false),
             closed: Cell::new(false),
         }));
@@ -327,13 +343,13 @@ unsafe fn paint(hwnd: HWND, state: &Dialog) {
     let mut label = ok;
     DrawTextW(
         dc,
-        wide("确定").as_ptr(),
+        wide(&state.primary).as_ptr(),
         -1,
         &mut label,
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
-    if state.confirm {
+    if let Some(secondary) = &state.secondary {
         let cbg = CreateSolidBrush(ui_colors.chip);
         let cpen = CreateSolidBrush(ui_colors.chip);
         let ob = SelectObject(dc, cbg as HGDIOBJ);
@@ -355,7 +371,7 @@ unsafe fn paint(hwnd: HWND, state: &Dialog) {
         let mut cl = cancel;
         DrawTextW(
             dc,
-            wide("取消").as_ptr(),
+            wide(secondary).as_ptr(),
             -1,
             &mut cl,
             DT_CENTER | DT_SINGLELINE | DT_VCENTER,
@@ -390,7 +406,7 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             if contains(&ok, point) {
                 (*state).accepted.set(true);
                 DestroyWindow(hwnd);
-            } else if (*state).confirm && contains(&cancel, point) {
+            } else if (*state).secondary.is_some() && contains(&cancel, point) {
                 DestroyWindow(hwnd);
             }
             0

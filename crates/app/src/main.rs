@@ -235,6 +235,17 @@ fn main() {
             return;
         }
 
+        // 调试用：看一眼「存完文件」的确认框（NST_DIALOG_PREVIEW=C:\\tmp\\x.png）
+        if let Some(path) = std::env::var_os("NST_DIALOG_PREVIEW") {
+            let open = dialog::saved_prompt(
+                std::ptr::null_mut(),
+                "截图已保存",
+                &path.to_string_lossy(),
+            );
+            crate::debug_log(&format!("dialog preview -> open={open}"));
+            return;
+        }
+
         // 通用对话框（另存为）需要 COM 单元，不开的话 GetSaveFileNameW 会直接失败
         windows_sys::Win32::System::Com::CoInitializeEx(
             std::ptr::null(),

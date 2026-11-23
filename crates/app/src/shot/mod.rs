@@ -3249,7 +3249,8 @@ fn clipboard_bitmap(bitmap: &Bitmap) {
 
 /// 保存结果：取消和真失败要区分开 —— 用户点「取消」不该弹权限/磁盘的警告
 enum SaveOutcome {
-    Saved,
+    /// 存成功了：带上路径，确认框里要拿它「打开」
+    Saved(String),
     Cancelled,
     Failed,
 }
@@ -3313,7 +3314,7 @@ fn save_bitmap(bitmap: &Bitmap, owner: HWND) -> SaveOutcome {
         };
 
         if buffer.save(&path).is_ok() {
-            SaveOutcome::Saved
+            SaveOutcome::Saved(path)
         } else {
             SaveOutcome::Failed
         }
@@ -3606,9 +3607,11 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             let editor = &*editor;
             let bitmap = composite(editor);
             match save_bitmap(&bitmap, hwnd) {
-                SaveOutcome::Saved => {
+                SaveOutcome::Saved(path) => {
                     SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
-                    show_toast(hwnd, "已保存");
+                    if crate::dialog::saved_prompt(hwnd, "截图已保存", &path) {
+                        crate::ui::open_path(&path);
+                    }
                 }
                 // 用户自己点了取消，什么都不用说
                 SaveOutcome::Cancelled => {}
@@ -4243,9 +4246,11 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let editor = &*editor_state(hwnd);
                     let bitmap = composite(editor);
                     match save_bitmap(&bitmap, hwnd) {
-                        SaveOutcome::Saved => {
+                        SaveOutcome::Saved(path) => {
                             SetWindowTextW(hwnd, wide("截图编辑 · 已保存").as_ptr());
-                            show_toast(hwnd, "已保存");
+                            if crate::dialog::saved_prompt(hwnd, "截图已保存", &path) {
+                                crate::ui::open_path(&path);
+                            }
                         }
                         SaveOutcome::Cancelled => {}
                         SaveOutcome::Failed => {

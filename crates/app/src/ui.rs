@@ -113,6 +113,22 @@ pub fn set_hand_cursor() {
 
 
 /// 窗口圆角：Win11 交给 DWM；Win10 没有这个特性，就自己把窗口切成圆角区域
+/// 用系统默认程序打开一个文件（存完点「打开」的时候用）。
+/// 返回 false 表示系统没能把它打开（没关联程序、文件被删了之类）。
+pub fn open_path(path: &str) -> bool {
+    unsafe {
+        let result = windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            wide("open").as_ptr(),
+            wide(path).as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+        result as isize > 32
+    }
+}
+
 pub fn round_corners(hwnd: HWND) {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: i32 = 2;
