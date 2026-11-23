@@ -189,6 +189,38 @@ pub(super) const TOOLBAR_ITEMS: &[(Action, bool)] = &[
 ];
 
 
+
+/// 客户区坐标 → 图片坐标（夹到图片范围内）。
+///
+/// 抽出来是因为这里有三个容易错的乘法：缩放的除法、平移偏移的减法、以及
+/// "按在图片外面也要能起笔"的夹取。以前只能靠手拖验证。
+pub(super) fn client_to_image(
+    point: (i32, i32),
+    image_left: i32,
+    image_top: i32,
+    scale: f32,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let scale = if scale.abs() < 1e-4 { 1.0 } else { scale };
+    let x = ((point.0 - image_left) as f32 / scale) as i32;
+    let y = ((point.1 - image_top) as f32 / scale) as i32;
+    (x.clamp(0, width), y.clamp(0, height))
+}
+
+/// 缩放之后，原锚点下的那个像素要仍然停在锚点上。
+pub(super) fn zoomed_origin(
+    anchor: (i32, i32),
+    image_left: i32,
+    image_top: i32,
+    ratio: f32,
+) -> (i32, i32) {
+    (
+        anchor.0 - ((anchor.0 - image_left) as f32 * ratio) as i32,
+        anchor.1 - ((anchor.1 - image_top) as f32 * ratio) as i32,
+    )
+}
+
 /// 拖拽结束该生成什么图形（几何类工具）。None = 太小/这个工具不在这里成形。
 ///
 /// 从 `editor_proc` 的收笔分支里抽出来的，这样"拖多大才成形、正方形怎么定角、
@@ -285,5 +317,42 @@ mod drag_tests {
         for tool in [Tool::Text, Tool::Ocr, Tool::Translate, Tool::Pen, Tool::None] {
             assert!(shape_from_drag(tool, (0, 0), (100, 100), 1).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn client_to_image_is_identity_at_scale_one() {
+        // 图贴着窗口左上角、1 倍缩放：点哪就是哪
+        assert_eq!(client_to_image((10, 20), 0, 0, 1.0, 100, 100), (10, 20));
+    }
+
+    #[test]
+    fn client_to_image_accounts_for_offset_and_zoom() {
+        // 图被拖到 (50, 30)，放大 2 倍：客户区 (150, 130) 对应图内 (50, 50)
+        assert_eq!(client_to_image((150, 130), 50, 30, 2.0, 500, 500), (50, 50));
+    }
+
+    #[test]
+    fn client_to_image_clamps_outside_points() {
+        // 按在图外面（左上 / 右下）都夹到边界，不返回负数也不越界
+        assert_eq!(client_to_image((-90, -90), 0, 0, 1.0, 200, 100), (0, 0));
+        assert_eq!(client_to_image((9999, 9999), 0, 0, 1.0, 200, 100), (200, 100));
+        // 缩放为 0 时不能除出 NaN / infinity
+        let (x, y) = client_to_image((10, 20), 0, 0, 0.0, 100, 100);
+        assert!(x.abs() <= 100 && y.abs() <= 100, "缩放异常也不能炸：{x},{y}");
+    }
+
+    #[test]
+    fn zoomed_origin_keeps_anchor_pixel_in_place() {
+        // 锚点 (100, 100)、图当前在 (0, 0)、放大 2 倍 → 图左上角要挪到 (-100, -100)
+        assert_eq!(zoomed_origin((100, 100), 0, 0, 2.0), (-100, -100));
+        // 缩小一半 → 图左上角挪到 (50, 50)
+        assert_eq!(zoomed_origin((100, 100), 0, 0, 0.5), (50, 50));
+        // 1 倍不动
+        assert_eq!(zoomed_origin((80, 60), 30, 20, 1.0), (30, 20));
     }
 }
