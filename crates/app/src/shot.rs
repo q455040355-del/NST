@@ -2243,10 +2243,29 @@ unsafe fn editor_paint(hwnd: HWND) {
         }
     }
     editor_draw(dc, editor, client);
+    // 工具栏不缩，如果窗口还比它窄（截图很窄 / 缩放比例换算差一点），
+    // 就把窗口撑到刚好装下整条工具条，别让最右边的 ✓ 被切掉
+    {
+        let need = editor.bar.right + s(10.0);
+        if need > client.right {
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut rect);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                rect.left,
+                rect.top,
+                need,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 
     // 只保留「图片」和「工具栏」两块区域，其余裁掉 —— 于是图片上方那条带子
-    // 既不显示底色、也不吃点击，看起来就是一条浮在桌面上的工具栏
-    {
+    // 既不显示底色、也不吃点击，看起来就是一条浮在桌面上的工具栏。
+    // 先关掉：区域和图片位置一错位，整块编辑区就变成「点不到」，比留白更难受。
+    if false {
         let image_top = editor.image_top;
         let image_bottom =
             image_top + (editor.base.height as f32 * editor.scale).round() as i32;
