@@ -1554,7 +1554,7 @@ unsafe fn fit_window_to_image(hwnd: HWND, editor: &mut Editor) {
     let image_w = (editor.base.width as f32 * editor.scale).round() as i32;
     let image_h = (editor.base.height as f32 * editor.scale).round() as i32;
     let margin = editor.top_margin;
-    let mut width = image_w.max(s(240.0)).min(max_w);
+    let mut width = image_w.max(toolbar_width()).max(s(240.0)).min(max_w);
     let mut height = image_h + margin;
     if height > max_h {
         height = max_h;
@@ -2250,10 +2250,13 @@ unsafe fn editor_paint(hwnd: HWND) {
         let image_top = editor.image_top;
         let image_bottom =
             image_top + (editor.base.height as f32 * editor.scale).round() as i32;
+        let image_left = editor.image_left;
+        let image_right =
+            image_left + (editor.base.width as f32 * editor.scale).round() as i32;
         let image = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
-            0,
+            image_left.max(0),
             image_top.max(0),
-            client.right,
+            image_right.min(client.right),
             image_bottom.min(client.bottom),
         );
         let bar = editor.bar;
@@ -2307,12 +2310,14 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
     // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
-    // 带子在底部：图片贴顶，只有比显示区高才允许往上滚
-    let view_h = (view_h - editor.top_margin).max(0);
+    // 带子在顶部：图片的活动范围是 [margin, margin]，比显示区高时才能往上滚
+    let margin = editor.top_margin;
+    let view_h = (view_h - margin).max(0);
     if height >= view_h {
-        editor.image_top = editor.image_top.clamp(view_h - height, 0);
+        let top = (editor.image_top - margin).clamp(view_h - height, 0);
+        editor.image_top = margin + top;
     } else {
-        editor.image_top = 0;
+        editor.image_top = margin;
     }
 }
 
@@ -2341,6 +2346,16 @@ pub(crate) unsafe fn editor_zoom(hwnd: HWND, factor: f32, anchor: (i32, i32)) {
     GetClientRect(hwnd, &mut client);
     clamp_image(editor, client);
     InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
+/// 工具条自然宽度（按钮不缩，窗口至少要这么宽）
+fn toolbar_width() -> i32 {
+    let items = 26;
+    let item = s(30.0);
+    let gap = s(2.0);
+    let sep_w = s(11.0);
+    let pad = s(6.0);
+    items * item + (items - 1) * gap + 5 * (sep_w + gap) + pad * 2
 }
 
 unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
@@ -2494,12 +2509,12 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    // 工具栏放在图片下方那条透明带里，水平居中；不压图
-    let bar_top = view.bottom + (((client.bottom - view.bottom) - bar_h) / 2).max(0);
+    // 工具栏放在图片上方那条透明带里，水平居中；不压图
+    let bar_top = ((editor.top_margin - bar_h) / 2).max(0);
     let bar_bottom = bar_top + bar_h;
-    let mut item = s(30.0);
-    let mut gap = s(2.0);
-    let mut sep_w = s(11.0);
+    let item = s(30.0);
+    let gap = s(2.0);
+    let sep_w = s(11.0);
     let pad = s(6.0);
 
     // bool = 这一格前面要不要画一条分组竖线
@@ -2540,25 +2555,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             + groups * (sep_w + gap)
             + pad * 2
     };
-    // 窄图（小截图 / 小屏）时整条按比例收窄，别让按钮跑出窗口
-    let avail = (client.right - s(16.0)).max(s(240.0));
-    if measure(item, gap, sep_w) > avail {
-        let factor = avail as f32 / measure(item, gap, sep_w) as f32;
-        item = ((item as f32 * factor) as i32).max(s(16.0));
-        gap = ((gap as f32 * factor) as i32).max(s(1.0));
-        sep_w = ((sep_w as f32 * factor) as i32).max(s(4.0));
-    }
-    // 压到最小还是放不下：把间隔和分组线再挤掉一点，保证最右边的 ✓ 不会被切
-    if measure(item, gap, sep_w) > avail {
-        gap = s(1.0);
-        sep_w = s(2.0);
-        item = ((avail
-            - (layout_items.len() as i32 - 1) * gap
-            - groups * (sep_w + gap)
-            - pad * 2)
-            / layout_items.len() as i32)
-            .max(s(14.0));
-    }
     let bar_w = measure(item, gap, sep_w);
     let bar_left = ((client.right - bar_w) / 2).max(s(8.0));
     // 记下底栏的真实范围：命中判定和窗口区域都用它
@@ -2748,7 +2744,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
 /// 调试用：把编辑窗（图片 + 一条底栏）离屏画出来存成 PNG，不弹窗。
 /// 设了 `NST_EDITOR_PREVIEW=<路径>` 就走这里，改工具栏 / 图标时不用真截图就能看效果。
 pub unsafe fn preview_png(path: &str) -> bool {
-    let width = 900;
+    let width = toolbar_width().max(900);
     let height = 560;
 
     // 假的「截图内容」：上面一条深色标题栏，下面浅灰底 + 两个色块，方便看底栏压在哪里
@@ -4771,11 +4767,11 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
 
     // 图片上方留一条带子放工具栏；这条带子会被窗口区域裁掉，看起来是透明的
     let strip = s(54.0);
-    let client_w = image_w.max(s(240.0));
+    let client_w = image_w.max(toolbar_width()).max(s(240.0));
     let client_h = (strip + image_h).max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = 0;
+    let mut image_top = strip;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1;
     if !fits_in_place(scale) {
