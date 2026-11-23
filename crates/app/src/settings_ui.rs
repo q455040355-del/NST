@@ -2366,14 +2366,26 @@ fn step_choice(current: usize, len: usize, delta: i32) -> usize {
 }
 
 fn toggle_ai(state: &mut State) {
-    let enabled = !state.ai_enabled;
-    // 打开总开关时如果来源全关着，默认全开，否则什么也采不到
-    if enabled && !state.ai_sources.iter().any(|flag| *flag) {
-        state.ai_sources = [true; 6];
+    let (enabled, sources) = ai_toggle_plan(state.ai_enabled, state.ai_sources);
+    if let Some(sources) = sources {
+        state.ai_sources = sources;
         crate::apply_ai_sources(state.parent, state.ai_sources);
     }
     state.ai_enabled = enabled;
     crate::apply_ai_enabled(state.parent, enabled);
+}
+
+/// 点总开关之后应该变成什么：(新的总开关, 需要一并改动的来源列表)。
+///
+/// 规则：**打开**总开关时如果来源全关着，就默认全开 —— 否则开关看着是开的、
+/// 实际什么也采不到，这种"静默失效"最难查。
+fn ai_toggle_plan(enabled: bool, sources: [bool; 6]) -> (bool, Option<[bool; 6]>) {
+    let next = !enabled;
+    if next && !sources.iter().any(|flag| *flag) {
+        (next, Some([true; 6]))
+    } else {
+        (next, None)
+    }
 }
 
 fn toggle_source(state: &mut State, index: usize) {
@@ -3002,6 +3014,46 @@ mod choice_tests {
         for (_, percent) in FONT_OPTIONS.iter() {
             assert!(*percent > last, "字号档位要递增");
             last = *percent;
+        }
+    }
+}
+
+#[cfg(test)]
+mod ai_toggle_tests {
+    use super::*;
+
+    #[test]
+    fn turning_on_with_all_sources_off_enables_everything() {
+        let (enabled, sources) = ai_toggle_plan(false, [false; 6]);
+        assert!(enabled, "总开关要打开");
+        assert_eq!(sources, Some([true; 6]), "来源全关时必须一起打开");
+    }
+
+    #[test]
+    fn turning_on_with_some_sources_keeps_them() {
+        let mut sources = [false; 6];
+        sources[2] = true;
+        let (enabled, changed) = ai_toggle_plan(false, sources);
+        assert!(enabled);
+        assert_eq!(changed, None, "已经有来源开着就不要再动用户的勾选");
+    }
+
+    #[test]
+    fn turning_off_never_touches_sources() {
+        for sources in [[true; 6], [false; 6]] {
+            let (enabled, changed) = ai_toggle_plan(true, sources);
+            assert!(!enabled);
+            assert_eq!(changed, None, "关总开关不该改来源");
+        }
+    }
+
+    #[test]
+    fn all_off_detection_covers_every_position() {
+        // 任意一个位置开着都不算"全关"
+        for index in 0..6 {
+            let mut sources = [false; 6];
+            sources[index] = true;
+            assert_eq!(ai_toggle_plan(false, sources).1, None, "第 {index} 项开着就不该覆盖");
         }
     }
 }
