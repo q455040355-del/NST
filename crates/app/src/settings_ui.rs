@@ -538,9 +538,8 @@ fn layout(state: &State, client: RECT) -> Layout {
     let col_w = ((right - pad - col_gutter) / 2).max(s(200.0, scale));
     let left_right = pad + col_w;
     let right_left = left_right + col_gutter;
-    // 标签列固定宽：控件从列左缘往右 100 起，两列的控制区一样宽
+    // 左列还是「标签在左、控件在右」；右列的翻译是表单，控件从列左缘起
     let control_left = pad + s(COL_LABEL_W, scale);
-    let right_control = right_left + s(COL_LABEL_W, scale);
 
     let row_center = |index: usize| -> i32 {
         s(ROW_FIRST + ROW_STEP * index as f32, scale) + s(ROW_STEP * 0.5 - 6.0, scale)
@@ -655,34 +654,34 @@ fn layout(state: &State, client: RECT) -> Layout {
             right: (pad + s(4.0, scale) + s(170.0, scale)).min(done.left - s(12.0, scale)),
             bottom: done.bottom,
         },
-        // 翻译是表单：标签在控件上方，控件铺满整列
+        // 翻译是表单：标签在控件上方，控件铺满整列（从列左缘起，不再空出标签列）
         tr_chatgpt: RECT {
-            left: right_control,
+            left: right_left,
             top: s(TR_ROW1_TOP, scale),
-            right: right_control + (right - right_control - s(6.0, scale)) / 2,
+            right: right_left + (right - right_left - s(6.0, scale)) / 2,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
         },
         tr_deepseek: RECT {
-            left: right_control + (right - right_control - s(6.0, scale)) / 2 + s(6.0, scale),
+            left: right_left + (right - right_left - s(6.0, scale)) / 2 + s(6.0, scale),
             top: s(TR_ROW1_TOP, scale),
             right,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
         },
         tr_model: input_rect(
             s(TR_ROW2_TOP, scale),
-            right_control,
+            right_left,
             right,
             s(TR_BOX_H, scale),
         ),
         tr_key: input_rect(
             s(TR_ROW3_TOP, scale),
-            right_control,
+            right_left,
             right,
             s(TR_BOX_H, scale),
         ),
         tr_base: input_rect(
             s(TR_ROW4_TOP, scale),
-            right_control,
+            right_left,
             right,
             s(TR_BOX_H, scale),
         ),
