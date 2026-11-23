@@ -1492,6 +1492,35 @@ struct Layout {
 }
 
 /// 把轴上限凑成 1/2/2.5/5 × 10ⁿ 的整数刻度，返回 (轴上限, 单格步长)
+/// 柱状图里一根柱子占的位置：槽宽、柱宽、圆角。
+///
+/// 抽出来是为了能测：柱子算窄了会看不清、算宽了会互相压住，
+/// 而这类错误只有"看图表"才能发现，很费眼睛。
+struct BarMetrics {
+    slot: f32,
+    bar_width: f32,
+    radius: i32,
+}
+
+fn bar_metrics(plot_width: i32, count: usize, _plot_left: i32) -> BarMetrics {
+    let slot = plot_width as f32 / count.max(1) as f32;
+    let bar_width = (slot * 0.58).clamp(4.0, 40.0);
+    let radius = (bar_width * 0.28).clamp(2.0, 8.0) as i32;
+    BarMetrics {
+        slot,
+        bar_width,
+        radius,
+    }
+}
+
+/// 第 index 根柱子的左右边界（像素对齐，避免 1px 的边糊掉）
+fn bar_edges(plot_left: i32, index: usize, metrics: &BarMetrics) -> (i32, i32) {
+    let slot_left = plot_left as f32 + metrics.slot * index as f32;
+    let left = (slot_left + (metrics.slot - metrics.bar_width) / 2.0).round() as i32;
+    let right = (slot_left + (metrics.slot + metrics.bar_width) / 2.0).round() as i32;
+    (left, right)
+}
+
 fn nice_axis(max: f32, intervals: i32) -> (f64, f64) {
     let raw = (max / intervals as f32).max(1.0) as f64;
     let magnitude = 10f64.powf(raw.log10().floor());
@@ -2100,9 +2129,10 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     }
 
     let max_output = axis_max as f32;
-    let slot = plot_width as f32 / count as f32;
-    let bar_width = (slot * 0.58).clamp(4.0, 40.0);
-    let radius = (bar_width * 0.28).clamp(2.0, 8.0) as i32;
+    let metrics = bar_metrics(plot_width, count, plot_left);
+    let slot = metrics.slot;
+    let bar_width = metrics.bar_width;
+    let radius = metrics.radius;
 
     for index in 0..state.days.len() {
         let Some(row) = state.now_stack.get(index) else {
@@ -2120,9 +2150,7 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
             .rev()
             .find(|slot| row.get(*slot).copied().unwrap_or(0.0) > 0.0);
         // 像素对齐，1px 的边不会糊
-        let slot_left = plot_left as f32 + slot * index as f32;
-        let left = (slot_left + (slot - bar_width) / 2.0).round() as i32;
-        let right = (slot_left + (slot + bar_width) / 2.0).round() as i32;
+        let (left, right) = bar_edges(plot_left, index, &metrics);
         let mut bottom = plot_bottom as f32;
 
         for (slot_index, source) in sources.iter().enumerate() {
@@ -2733,5 +2761,58 @@ mod date_and_axis_tests {
         let today = history::today(now_ms());
         assert_eq!(day_full_label(today), "今天");
         assert_eq!(day_full_label(today - 1), "昨天");
+    }
+
+    #[test]
+    fn bars_never_overlap_and_never_get_too_narrow() {
+        // 30 天塞进 600px：柱子要有最小宽度，但不能宽到互相压住
+        for (width, count) in [(600, 30), (300, 30), (1200, 7), (400, 90)] {
+            let metrics = bar_metrics(width, count, 0);
+            assert!(
+                metrics.bar_width >= 4.0 - 1e-3,
+                "{count} 根柱子放 {width}px 时太窄：{}",
+                metrics.bar_width
+            );
+            assert!(
+                metrics.bar_width <= metrics.slot + 1e-3,
+                "{count} 根柱子放 {width}px 时会互相压住：柱宽 {} 槽宽 {}",
+                metrics.bar_width,
+                metrics.slot
+            );
+            // 圆角不能超过柱子一半，否则画出来是个药丸
+            assert!(metrics.radius as f32 <= metrics.bar_width / 2.0);
+        }
+    }
+
+    #[test]
+    fn bar_edges_stay_inside_the_slot() {
+        // 每根柱子都要落在自己的槽里，且左右有序
+        let metrics = bar_metrics(600, 30, 0);
+        for index in 0..30 {
+            let (left, right) = bar_edges(100, index, &metrics);
+            assert!(right > left, "第 {index} 根柱子宽度必须为正");
+            let slot_left = 100.0 + metrics.slot * index as f32;
+            let slot_right = slot_left + metrics.slot;
+            assert!(
+                left as f32 >= slot_left - 1.0,
+                "第 {index} 根柱子越到左边去了：{left} < {slot_left}"
+            );
+            assert!(
+                right as f32 <= slot_right + 1.0,
+                "第 {index} 根柱子越到右边去了：{right} > {slot_right}"
+            );
+        }
+    }
+
+    #[test]
+    fn bar_geometry_survives_silly_inputs() {
+        // 0 / 1 根柱子、宽度为 0 都不能 panic 或算出 NaN
+        let metrics = bar_metrics(0, 0, 0);
+        assert!(metrics.slot.is_finite());
+        assert!(metrics.bar_width >= 4.0);
+        let metrics = bar_metrics(10, 1000, 0);
+        assert!(metrics.slot > 0.0 && metrics.bar_width >= 4.0);
+        let (left, right) = bar_edges(0, 0, &metrics);
+        assert!(right >= left);
     }
 }
