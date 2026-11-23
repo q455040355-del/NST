@@ -61,7 +61,7 @@ pub(super) unsafe fn draw_title_bar(dc: HDC, editor: &mut Editor, client: RECT) 
                 right: bx + btn,
                 bottom: (editor.title_h - btn) / 2 + btn,
             };
-            draw_action_icon(dc, action, rect, ui.text2, editor.stroke);
+            draw_action_icon(dc, action, rect, ui.text2, editor.stroke, true);
             editor.buttons.push((rect, action));
             bx += btn + s(4.0);
         }

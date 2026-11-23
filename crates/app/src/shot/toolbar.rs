@@ -147,7 +147,9 @@ pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) ->
         } else {
             ui.text2
         };
-        draw_action_icon(dc, action, rect, color, editor.stroke);
+        // 选中（蓝底反白）和悬停才用单色；平时按设计规范上彩色
+        let colored = !active && !hover;
+        draw_action_icon(dc, action, rect, color, editor.stroke, colored);
         if hover {
             hovered = Some((action, rect));
         }

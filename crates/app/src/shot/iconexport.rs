@@ -114,7 +114,7 @@ pub unsafe fn export(dir: &str) -> bool {
         FillRect(dc, &rect, brush);
         DeleteObject(brush as *mut _);
 
-        draw_action_icon(dc, *action, rect, ink, 1);
+        draw_action_icon(dc, *action, rect, ink, 1, true);
 
         let ok = save_icon(bits, cell, cell, &path);
         if ok {

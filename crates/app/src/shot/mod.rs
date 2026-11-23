@@ -2329,6 +2329,30 @@ unsafe fn icon_polyline(dc: HDC, points: &[POINT], width: i32, color: u32, close
 }
 
 /// 小工具：描一个圆角矩形 / 圆（空心，细线）
+/// 图标内部的浅色填充（规范里的「双色填充体系」）
+unsafe fn icon_fill_round(
+    dc: HDC,
+    radius: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: u32,
+) {
+    let brush = CreateSolidBrush(color);
+    let old_brush = SelectObject(dc, brush as HGDIOBJ);
+    let old_pen = SelectObject(
+        dc,
+        windows_sys::Win32::Graphics::Gdi::GetStockObject(
+            windows_sys::Win32::Graphics::Gdi::NULL_PEN,
+        ) as HGDIOBJ,
+    );
+    windows_sys::Win32::Graphics::Gdi::RoundRect(dc, left, top, right, bottom, radius * 2, radius * 2);
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(brush as *mut _);
+}
+
 unsafe fn icon_outline(
     dc: HDC,
     kind: u8,
@@ -2566,7 +2590,54 @@ unsafe fn draw_pack_icon(dc: HDC, index: usize, rect: RECT, color: u32) {
 }
 
 /// 工具栏按钮的图标：照微信那套画法——**细描边、不填充、该包框的包框**
-fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8) {
+/// 工具栏彩色图标的配色（按《截图与标注工具彩色图标设计规范》）
+///
+/// 六组语义色：基础图形/标注=科技蓝，涂鸦/高亮/聚焦=活力琥珀，
+/// 智能识别/图像效果=灵感紫，历史/图层/操作=青碧，保存/确认=翠绿，关闭/擦除=朱红。
+/// 返回值是 0x00BBGGRR（GDI 的 COLORREF）。
+fn icon_color(action: Action) -> (u32, u32) {
+    const BLUE: u32 = 0x00EB6225; // #2562EB
+    const BLUE_FILL: u32 = 0x00FBD4BF; // 浅蓝
+    const AMBER: u32 = 0x000577D9; // #D97705
+    const AMBER_FILL: u32 = 0x00AAD6FE; // 浅琥珀
+    const PURPLE: u32 = 0x00EC3A7C; // #7C3AEC
+    const PURPLE_FILL: u32 = 0x00FADBEF; // 浅紫
+    const TEAL: u32 = 0x0087940D; // #0D9487
+    const TEAL_FILL: u32 = 0x00E0E6B8; // 浅青
+    const GREEN: u32 = 0x004AA216; // #16A24A
+    const GREEN_FILL: u32 = 0x00C8E9BB; // 浅绿
+    const RED: u32 = 0x00481CE1; // #E11C48
+    const RED_FILL: u32 = 0x00C5D2F8; // 浅朱红
+    const ORANGE: u32 = 0x000C58E9; // #E9580C（画笔）
+
+    match action {
+        Action::Tool(Tool::Rect)
+        | Action::Tool(Tool::Square)
+        | Action::Tool(Tool::Ellipse)
+        | Action::Tool(Tool::Line)
+        | Action::Tool(Tool::Arrow)
+        | Action::Tool(Tool::Numbered)
+        | Action::Tool(Tool::Text)
+        | Action::Stroke => (BLUE, BLUE_FILL),
+        Action::Tool(Tool::Marker)
+        | Action::Tool(Tool::Spotlight)
+        | Action::Pin => (AMBER, AMBER_FILL),
+        Action::Tool(Tool::Pen) => (ORANGE, AMBER_FILL),
+        Action::Tool(Tool::Ocr)
+        | Action::Tool(Tool::Translate)
+        | Action::Tool(Tool::Mosaic)
+        | Action::Scroll
+        | Action::Beautify => (PURPLE, PURPLE_FILL),
+        Action::Rotate | Action::Undo | Action::Redo | Action::Topmost | Action::Copy => {
+            (TEAL, TEAL_FILL)
+        }
+        Action::Save | Action::Done => (GREEN, GREEN_FILL),
+        Action::Tool(Tool::Eraser) | Action::Close | Action::Minimize => (RED, RED_FILL),
+        _ => (BLUE, BLUE_FILL),
+    }
+}
+
+fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8, colored: bool) {
     // 有 icons.png 素材包就贴图（微信原图），没有才走下面的自绘
     if let Some(index) = pack_index(action) {
         if icon_pack().is_some() {
@@ -2582,6 +2653,12 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             return;
         }
     }
+    let (color, fill) = if colored {
+        let (ink, tint) = icon_color(action);
+        (ink, Some(tint))
+    } else {
+        (color, None)
+    };
     unsafe {
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
@@ -2596,7 +2673,12 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
 
         match action {
             // ▢ 圆角矩形
-            Action::Tool(Tool::Rect) => icon_outline(dc, 2, rx, ry, bx, by, pen, color),
+            Action::Tool(Tool::Rect) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
+                icon_outline(dc, 2, rx, ry, bx, by, pen, color)
+            }
             // ◯ 正圆
             Action::Tool(Tool::Ellipse) => icon_outline(dc, 1, rx, ry, bx, by, pen, color),
             // ↗ 斜线 + 开口的 V 形箭头（微信不是实心箭头）
@@ -2627,6 +2709,9 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // ▦ 方框里一个棋盘（微信就是框 + 格子）
             Action::Tool(Tool::Mosaic) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 let inset = s(3.0);
                 let cell = ((r * 2 - inset * 2) as f32 / 3.0).max(2.0);
@@ -2644,12 +2729,18 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // A 加一条下划线（翻译）
             Action::Tool(Tool::Translate) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 draw_glyph_sized(dc, "A", rect, color, 8.0);
                 icon_line(dc, cx - s(6.0), cy + s(7.0), cx + s(6.0), cy + s(7.0), pen, color);
             }
             // T（外面一个方框，和微信一致）
             Action::Tool(Tool::Text) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 let bar = (r as f32 * 0.45) as i32;
                 icon_line(dc, cx - bar, cy - bar, cx + bar, cy - bar, pen, color);
@@ -2657,6 +2748,9 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // Ⓐ 方框里一个 A（取字）
             Action::Tool(Tool::Ocr) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 draw_glyph_sized(dc, "A", rect, color, 8.0);
             }
@@ -2705,6 +2799,9 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // 方框外压暗、中间亮（聚光灯）
             Action::Tool(Tool::Spotlight) => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 let inner = s(5.0);
                 icon_dot(dc, cx - inner, cy - inner, cx + inner, cy + inner, color);
@@ -2712,6 +2809,9 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // ▣ 双层框（美化：图外面再套一层）
             Action::Beautify => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 let inset = s(3.0);
                 icon_outline(dc, 0, rx + inset, ry + inset, bx - inset, by - inset, pen, color);
@@ -2782,6 +2882,9 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8)
             }
             // ⤓ 方框里一个向下的箭头（微信的下载/保存就是这样）
             Action::Save => {
+                if let Some(tint) = fill {
+                    icon_fill_round(dc, 2, rx, ry, bx, by, tint);
+                }
                 icon_outline(dc, 2, rx, ry, bx, by, pen, color);
                 let tip = cy + s(4.0);
                 icon_line(dc, cx, cy - s(5.0), cx, tip, pen, color);
