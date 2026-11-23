@@ -4531,8 +4531,29 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if let Some(((start_x, start_y), (left, top))) = editor.pan {
                 let mut client: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut client);
-                editor.image_left = left + (cursor_point.x - start_x);
-                editor.image_top = top + (cursor_point.y - start_y);
+                let dx = cursor_point.x - start_x;
+                let dy = cursor_point.y - start_y;
+                let image_w = (editor.base.width as f32 * editor.scale) as i32;
+                let image_h = (editor.base.height as f32 * editor.scale) as i32;
+                let fits = image_w <= client.right && image_h <= client.bottom;
+                if fits {
+                    // 图整张都在窗口里：拖动的应该是「窗口」本身（没有标题栏，就靠这个挪）
+                    let mut rect: RECT = std::mem::zeroed();
+                    GetWindowRect(hwnd, &mut rect);
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        rect.left + dx,
+                        rect.top + dy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    editor.pan = Some(((cursor_point.x, cursor_point.y), (left, top)));
+                    return 0;
+                }
+                editor.image_left = left + dx;
+                editor.image_top = top + dy;
                 clamp_image(editor, client);
                 InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
