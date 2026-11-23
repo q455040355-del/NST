@@ -1246,7 +1246,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         p.text(
             AI_SOURCE_LABELS[index],
             state.fonts.value,
-            if state.ai_enabled { c.text } else { c.text3 },
+            mix(c.text3, c.text, state.sw[SW_AI]),
             rect.left + p.s(16.0),
             rect.top,
             right - p.s(30.0),
@@ -1584,18 +1584,22 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             state.sw[SW_TRANSLATE],
         );
         let _ = toggle_mid;
-        if state.tr_open < 0.02 {
-            // 收起来的提示，别让人以为功能丢了
-            p.text(
-                "翻译关着：勾上右上角的开关就会出现服务商和 Key",
-                state.fonts.small,
-                c.text3,
-                right_left + p.s(4.0),
-                p.s(TR_TITLE_TOP + 22.0),
-                content_right,
-                p.s(TR_TITLE_TOP + 40.0),
-                DT_LEFT,
-            );
+        {
+            // 收起来的提示：只在整个收完之后露出来。
+            // 它和「服务商」那一行占的是同一条横带，提前淡入会和正在收的字段叠在一起。
+            let hint = ((0.03 - state.tr_open) / 0.03).clamp(0.0, 1.0);
+            if hint > 0.02 {
+                p.text(
+                    "翻译关着：勾上右上角的开关就会出现服务商和 Key",
+                    state.fonts.small,
+                    mix(c.surface, c.text3, hint),
+                    right_left + p.s(4.0),
+                    p.s(TR_TITLE_TOP + 22.0),
+                    content_right,
+                    p.s(TR_TITLE_TOP + 40.0),
+                    DT_LEFT,
+                );
+            }
         }
 
         // 表单式（方向 C 的输入框）：标签在控件上方，控件铺满整列；
@@ -1649,19 +1653,24 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             }
         };
 
-        // 手风琴：展开度就是一块「百叶窗」，从标签上方一路拉到 Base URL 下面
+        // 手风琴：展开度就是一块「百叶窗」，从标签上方一路拉到 Base URL 下面；
+        // 里面的内容同时从上面滑下来（拉开时往下落 10px，收起时往上抽走），有「抖开」的感觉
         let shade_open = state.tr_open > 0.01;
         let mut shade_saved: i32 = 0;
         if shade_open {
             let shade_top = p.s(TR_ROW1_TOP - 14.0);
             let shade_full = p.s(TR_ROW4_TOP + TR_BOX_H + 6.0) - shade_top;
             let shade_bottom = shade_top + (shade_full as f32 * state.tr_open).round() as i32;
+            let slide = (((1.0 - state.tr_open) * -10.0) * state.scale).round() as i32;
             shade_saved = SaveDC(dc);
             if shade_saved != 0 {
                 IntersectClipRect(dc, 0, shade_top, client.right, shade_bottom);
+                // 裁剪区已经定在设备坐标上，再挪原点只动内容
+                SetViewportOrgEx(dc, 0, -scroll + slide, std::ptr::null_mut());
             }
             if let Some(aa) = &p.aa {
                 aa.clip_intersect(0, shade_top, client.right, shade_bottom);
+                aa.translate(0, slide);
             }
             // 服务商：两个等宽按钮，选中的那颗是实心强调色
             form_label("服务商", &l.tr_chatgpt);
@@ -1796,7 +1805,8 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         }
         if shade_open {
             if let Some(aa) = &p.aa {
-                // 恢复成滚动那一刀（视口范围）
+                // 先把平移还回去，再恢复成滚动那一刀（视口范围）
+                aa.translate(0, -(((1.0 - state.tr_open) * -10.0) * state.scale).round() as i32);
                 aa.clip_rect(0, view_top + scroll, client.right, view_bottom + scroll);
             }
         }
@@ -2902,7 +2912,7 @@ fn advance_anim(state: &mut State) {
     }
     let goal = if state.translate_enabled { 1.0 } else { 0.0 };
     if (state.tr_open - goal).abs() > 0.004 {
-        state.tr_open += (goal - state.tr_open) * (1.0 - (-dt * 16.0).exp());
+        state.tr_open += (goal - state.tr_open) * (1.0 - (-dt * 12.0).exp());
         busy = true;
     } else {
         state.tr_open = goal;
