@@ -522,6 +522,8 @@ fn source_code(source: &str) -> u8 {
         SOURCE_DSH => 1,
         SOURCE_WORKBUDDY => 2,
         SOURCE_WORKBUDDY_AI => 3,
+        SOURCE_CLAUDE => 4,
+        SOURCE_CODEX => 5,
         _ => 0,
     }
 }
@@ -531,6 +533,8 @@ fn source_of_code(code: u8) -> &'static str {
         1 => SOURCE_DSH,
         2 => SOURCE_WORKBUDDY,
         3 => SOURCE_WORKBUDDY_AI,
+        4 => SOURCE_CLAUDE,
+        5 => SOURCE_CODEX,
         _ => SOURCE_OPENCODE,
     }
 }
@@ -1662,5 +1666,91 @@ mod tests {
         assert_eq!(source_name(SOURCE_DSH), "DSH");
         assert_eq!(source_name(SOURCE_WORKBUDDY_AI), "WorkBuddy AI");
         assert_ne!(source_color(SOURCE_DSH), source_color(SOURCE_OPENCODE));
+    }
+
+    // ---------------------------------------------------- 二进制格式 / 编码
+
+    #[test]
+    fn binary_primitives_roundtrip() {
+        // 索引文件是自定义二进制格式：编码端改一位，旧文件就读不出来。
+        // 这里把各类型的边界值都过一遍。
+        let mut buf = Vec::new();
+        put_u8(&mut buf, 0).unwrap();
+        put_u8(&mut buf, 255).unwrap();
+        put_u32(&mut buf, 0).unwrap();
+        put_u32(&mut buf, u32::MAX).unwrap();
+        put_u64(&mut buf, 0).unwrap();
+        put_u64(&mut buf, u64::MAX).unwrap();
+        put_i64(&mut buf, i64::MIN).unwrap();
+        put_i64(&mut buf, -1).unwrap();
+        put_i64(&mut buf, i64::MAX).unwrap();
+        put_str(&mut buf, "").unwrap();
+        put_str(&mut buf, "历史·usage").unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(get_u8(&mut cursor).unwrap(), 0);
+        assert_eq!(get_u8(&mut cursor).unwrap(), 255);
+        assert_eq!(get_u32(&mut cursor).unwrap(), 0);
+        assert_eq!(get_u32(&mut cursor).unwrap(), u32::MAX);
+        assert_eq!(get_u64(&mut cursor).unwrap(), 0);
+        assert_eq!(get_u64(&mut cursor).unwrap(), u64::MAX);
+        assert_eq!(get_i64(&mut cursor).unwrap(), i64::MIN);
+        assert_eq!(get_i64(&mut cursor).unwrap(), -1);
+        assert_eq!(get_i64(&mut cursor).unwrap(), i64::MAX);
+        assert_eq!(get_str(&mut cursor).unwrap(), "");
+        assert_eq!(get_str(&mut cursor).unwrap(), "历史·usage");
+    }
+
+    #[test]
+    fn truncated_index_is_an_error_not_a_panic() {
+        // 文件写到一半（断电 / 磁盘满）：读取要返回 Err，不能 panic
+        let mut buf = Vec::new();
+        put_u32(&mut buf, 4096).unwrap();
+        buf.truncate(2);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(get_u32(&mut cursor).is_err());
+
+        // 声明的字符串长度比实际内容长，同样要报错而不是越界读
+        let mut buf = Vec::new();
+        put_u32(&mut buf, 99).unwrap();
+        buf.extend_from_slice(b"short");
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(get_str(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn source_codes_roundtrip_through_the_binary_format() {
+        // 每个来源都要能被编码成 1 字节再还原；改映射会让旧 shard 读成别的来源
+        for source in all_sources() {
+            assert_eq!(source_of_code(source_code(source)), source);
+        }
+        // 未知编码退回 OpenCode（老文件的 0 就是这个意思）
+        assert_eq!(source_of_code(0), SOURCE_OPENCODE);
+        assert_eq!(source_of_code(200), SOURCE_OPENCODE);
+        // 所有来源的编码必须互不相同，否则会串数据
+        let mut codes: Vec<u8> = all_sources().iter().map(|s| source_code(s)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), all_sources().len(), "编码不能重复");
+    }
+
+    #[test]
+    fn day_index_is_stable_within_a_day_and_moves_between_days() {
+        // 同一天的不同时刻要算作同一天（历史窗口按天分组）
+        let base = 1_700_000_000_000i64;
+        let day = today(base);
+        assert_eq!(today(base + 60_000), day);
+        assert_eq!(today(base + 86_400_000), day + 1);
+        assert!(today(base - 86_400_000) < day);
+    }
+
+    #[test]
+    fn shard_day_is_read_from_the_file_name() {
+        let day = 19_832;
+        let path = std::path::PathBuf::from(format!("usage-{day}.bin"));
+        assert_eq!(shard_day(&path), Some(day));
+        // 不是我们的文件 / 名字不对 → 不认
+        assert_eq!(shard_day(&std::path::PathBuf::from("index.bin")), None);
+        assert_eq!(shard_day(&std::path::PathBuf::from("usage-.bin")), None);
     }
 }
