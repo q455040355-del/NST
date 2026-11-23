@@ -2310,14 +2310,12 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
     // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
-    // 带子在顶部：图片的活动范围是 [margin, margin]，比显示区高时才能往上滚
-    let margin = editor.top_margin;
-    let view_h = (view_h - margin).max(0);
+    // 带子在底部：图片贴顶，只有比显示区高时才允许往上滚
+    let view_h = (view_h - editor.top_margin).max(0);
     if height >= view_h {
-        let top = (editor.image_top - margin).clamp(view_h - height, 0);
-        editor.image_top = margin + top;
+        editor.image_top = editor.image_top.clamp(view_h - height, 0);
     } else {
-        editor.image_top = margin;
+        editor.image_top = 0;
     }
 }
 
@@ -2509,8 +2507,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
     // 底栏放进图片下方那条带子里（view 之外），不再压住图片最后几十像素
-    // 工具栏放在图片上方那条透明带里，水平居中；不压图
-    let bar_top = ((editor.top_margin - bar_h) / 2).max(0);
+    // 工具栏放在图片下方那条透明带里，水平居中；不压图
+    let bar_top = view.bottom + (((client.bottom - view.bottom) - bar_h) / 2).max(0);
     let bar_bottom = bar_top + bar_h;
     let item = s(30.0);
     let gap = s(2.0);
@@ -4287,6 +4285,31 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let brush = CreateSolidBrush(0x00FF_F2_E8);
             brush as LRESULT
         }
+        WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            // 右键 / 中键按住 = 拖动图片（不管当前选的是什么工具）
+            let editor = editor_state(hwnd);
+            if editor.is_null() {
+                return 0;
+            }
+            let editor = &mut *editor;
+            let point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            editor.pan = Some(((point.x, point.y), (editor.image_left, editor.image_top)));
+            SetCapture(hwnd);
+            crate::ui::set_hand_cursor();
+            0
+        }
+        WM_RBUTTONUP | WM_MBUTTONUP => {
+            let editor = editor_state(hwnd);
+            if !editor.is_null() {
+                (*editor).pan = None;
+                ReleaseCapture();
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
             let mut point = POINT {
                 x: (lparam as i32) & 0xFFFF,
@@ -4771,7 +4794,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
     let client_h = (strip + image_h).max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = strip;
+    let mut image_top = 0;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1;
     if !fits_in_place(scale) {
