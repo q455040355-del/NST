@@ -5,7 +5,7 @@
 #
 # 做四件事：
 #   1. 打开设置窗 -> 截图
-#   2. 压到 660x520 -> 应出现滚动条、页脚固定 -> 截图
+#   2. 压矮到 760x347（逻辑像素）-> 应出现滚动条、页脚固定 -> 截图
 #   3. 滚轮 + 拖滚动条 -> 内容应移动 -> 截图
 #   4. 点 AI 总开关 -> ini 的 AiEnabled 应翻转 -> 再点回来复原
 #
@@ -180,15 +180,15 @@ Start-Sleep -Milliseconds 400
 [void](Shot "settings-full" $settings)
 
 # ---------------------------------------------------------------- 压矮 + 滚动
-# 坐标全部按窗口实际尺寸换算：布局是 440 逻辑像素宽，150% 下就是 660。
+# 坐标全部按窗口实际尺寸换算：布局是 760 逻辑像素宽，150% 下就是 1140。
 # 换缩放比例时这里自动跟着变，不用改脚本。
 function Window-Scale([IntPtr]$hwnd) {
     $parts = ([Smoke]::RectOf($hwnd)).Split(' ')
     $width = [int]($parts[1].Split('x')[0])
-    return $width / 440.0
+    return $width / 760.0
 }
 $scale = Window-Scale $settings
-$shortW = [int][math]::Round(440 * $scale)
+$shortW = [int][math]::Round(760 * $scale)
 $shortH = [int][math]::Round(347 * $scale)
 
 [void][Smoke]::Resize($settings, 900, 120, $shortW, $shortH)
@@ -233,9 +233,10 @@ Start-Sleep -Milliseconds 400
 [Smoke]::Wheel($settings, -360)
 Start-Sleep -Milliseconds 350
 
-# AI 总开关中心：x = 右边距 - 39，y = 449 - 3 格滚动
-$aiX = $shortW - [int][math]::Round(39 * $scale)
-$aiY = [int][math]::Round((449 - 198) * $scale)
+# AI 总开关在左列：x = 左列右缘 - 20（开关中心），y = 455 - 3 格滚动
+# 左列右缘 = 20 + (760 - 20*2 - 28) / 2 = 366
+$aiX = [int][math]::Round(346 * $scale)
+$aiY = [int][math]::Round((455 - 198) * $scale)
 [Smoke]::Click($settings, $aiX, $aiY)
 Start-Sleep -Milliseconds 600
 $after = Ini-Ai
@@ -261,27 +262,26 @@ Check "再点一次恢复原值" ($restored -eq $before) $restored
 # ---------------------------------------------------------------- 开机自启
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $runName = "NetSpeedTaskbar"
-$hadRun = $null -ne (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue)
+# 测试前的值可能已经是开的（用户自己开过），这里只断言「点了会翻、再点还原」
+$autoBefore = ([string](Get-Content $ini | Select-String '^AutoStart=').Line) -eq "AutoStart=True"
 
 # 页脚左侧的开关（滚轮不影响页脚位置）：x = 175，y = 底边 - 36
 $autoX = [int][math]::Round(175 * $scale)
 $autoY = $shortH - [int][math]::Round(36 * $scale)
 [Smoke]::Click($settings, $autoX, $autoY)
 Start-Sleep -Milliseconds 600
-$autoIni = [string](Get-Content $ini | Select-String '^AutoStart=').Line
+$autoAfter = ([string](Get-Content $ini | Select-String '^AutoStart=').Line) -eq "AutoStart=True"
 $runValue = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName
-Check "开关写入 AutoStart" ($autoIni -eq "AutoStart=True") $autoIni
-Check "注册表自启项已写入" ($null -ne $runValue) $runValue
+Check "点开关翻转 AutoStart" ($autoAfter -ne $autoBefore) "$autoBefore -> $autoAfter"
+Check "注册表自启项跟着开关" (($null -ne $runValue) -eq $autoAfter) $runValue
 
-# 再点一次关掉（回到测试前的状态）
+# 再点一次回到测试前的状态
 [Smoke]::Click($settings, $autoX, $autoY)
 Start-Sleep -Milliseconds 600
-$autoIni = [string](Get-Content $ini | Select-String '^AutoStart=').Line
+$autoRestored = ([string](Get-Content $ini | Select-String '^AutoStart=').Line) -eq "AutoStart=True"
 $runValue = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName
-Check "再点一次清掉 AutoStart" ($autoIni -eq "AutoStart=False") $autoIni
-if (-not $hadRun) {
-    Check "注册表自启项已删除" ($null -eq $runValue) "$runValue"
-}
+Check "再点一次还原 AutoStart" ($autoRestored -eq $autoBefore) "before=$autoBefore now=$autoRestored"
+Check "注册表自启项跟着还原" (($null -ne $runValue) -eq $autoRestored) $runValue
 
 # ---------------------------------------------------------------- 历史窗口
 # 这一步能抓到「来源变多导致数组越界」这类崩溃：窗口开不出来就是 FAIL
