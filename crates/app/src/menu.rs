@@ -25,6 +25,7 @@ static mut CURRENT: HWND = std::ptr::null_mut();
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
     None,
+    #[allow(dead_code)]
     Check,
     Radio,
 }
@@ -59,6 +60,7 @@ impl Entry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn checked(id: usize, label: &'static str, on: bool) -> Self {
         Self {
             kind: Kind::Item {

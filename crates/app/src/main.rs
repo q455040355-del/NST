@@ -120,6 +120,7 @@ static mut TRAY_ICON: windows_sys::Win32::UI::WindowsAndMessaging::HICON = std::
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.Panel";
 const WINDOW_TITLE: &str = "NetSpeedTaskbar";
 
+const ID_VIEW_CYCLE: usize = 1306;
 const ID_SPEED: usize = 1001;
 const ID_MEMORY: usize = 1002;
 const ID_TEMPERATURE: usize = 1003;
@@ -1378,15 +1379,14 @@ fn show_menu(hwnd: HWND) {
     let gauge = panel.gauge_source().to_string();
     let ai = panel.settings.ai_enabled;
 
-    let mut rows = vec![
-        menu::Entry::header("面板显示"),
-        menu::Entry::checked(ID_SPEED, "网速", view == "speed"),
-        menu::Entry::checked(ID_MEMORY, "内存", view == "memory"),
-        menu::Entry::checked(ID_TEMPERATURE, "温度", view == "temperature"),
-    ];
-    if ai {
-        rows.push(menu::Entry::checked(ID_AI, "AI 速度", view == "ai"));
-    }
+    // 面板显示合并成一行：点一下切到下一个视图（和左键点面板一样）
+    let view_label = match view.as_str() {
+        "speed" => "面板显示：网速",
+        "memory" => "面板显示：内存",
+        "temperature" => "面板显示：温度",
+        _ => "面板显示：AI 速度",
+    };
+    let mut rows = vec![menu::Entry::item(ID_VIEW_CYCLE, view_label)];
     rows.push(menu::Entry::separator());
     rows.push(menu::Entry::header("底部指示条"));
     rows.push(menu::Entry::radio(ID_GAUGE_MEMORY, "内存占用", gauge == "mem"));
@@ -1435,6 +1435,7 @@ fn handle_command(hwnd: HWND, command: usize) {
         };
 
         match command {
+            ID_VIEW_CYCLE => panel.cycle_view(),
             ID_SPEED => panel.set_view("speed"),
             ID_MEMORY => panel.set_view("memory"),
             ID_TEMPERATURE => panel.set_view("temperature"),
