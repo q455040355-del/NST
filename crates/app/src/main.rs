@@ -194,6 +194,17 @@ fn main() {
             return;
         }
 
+        // 调试用：把用量历史窗离屏画成 PNG（改图表布局时做像素比对）
+        if let Some(path) = std::env::var_os("NST_HISTORY_PREVIEW") {
+            let ok = history_ui::preview_png(&path.to_string_lossy());
+            crate::debug_log(&format!(
+                "history preview -> {} ({})",
+                path.to_string_lossy(),
+                if ok { "ok" } else { "failed" }
+            ));
+            return;
+        }
+
         // 调试用：把设置窗离屏画成 PNG（改设置布局时做像素比对）
         if let Some(path) = std::env::var_os("NST_SETTINGS_PREVIEW") {
             let ok = settings_ui::preview_png(&path.to_string_lossy());

@@ -503,6 +503,79 @@ fn start_loading(hwnd: HWND) {
     });
 }
 
+/// 离屏渲染历史窗口到 PNG（NST_HISTORY_PREVIEW，改图表布局时做像素比对）
+pub unsafe fn preview_png(path: &str) -> bool {
+    open(std::ptr::null_mut());
+    // 数据是后台线程算的，等它算完再画（最多等 3 秒）
+    let mut message: MSG = std::mem::zeroed();
+    let mut frame: HWND = std::ptr::null_mut();
+    for _ in 0..60 {
+        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if frame.is_null() {
+            frame = match find_existing() {
+                Some(hwnd) => hwnd,
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // 画布有内容了（窗口已创建）就可以截了
+        if !canvas_of(frame).is_null() {
+            break;
+        }
+    }
+    if frame.is_null() {
+        return false;
+    }
+    // 再让加载动画走几帧，保证数据已经灌进 state
+    for _ in 0..20 {
+        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let canvas = canvas_of(frame);
+    if canvas.is_null() {
+        DestroyWindow(frame);
+        return false;
+    }
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(canvas, &mut client);
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
+
+    let (dc, dib, bits) = crate::ui::make_dib(width, height);
+    if dc.is_null() || bits.is_null() {
+        DestroyWindow(frame);
+        return false;
+    }
+    SendMessageW(canvas, WM_PRINTCLIENT, dc as usize, 0);
+
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for index in 0..(width * height) as usize {
+        let offset = index * 4;
+        rgba.push(*bits.add(offset + 2));
+        rgba.push(*bits.add(offset + 1));
+        rgba.push(*bits.add(offset));
+        rgba.push(255);
+    }
+    let saved = match image::RgbaImage::from_raw(width as u32, height as u32, rgba) {
+        Some(buffer) => buffer.save(path).is_ok(),
+        None => false,
+    };
+    DeleteObject(dib as *mut _);
+    DeleteDC(dc);
+    DestroyWindow(frame);
+    saved
+}
+
 unsafe fn canvas_of(hwnd: HWND) -> HWND {
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
     if state.is_null() {
@@ -1095,6 +1168,17 @@ unsafe extern "system" fn canvas_proc(
             let hdc = BeginPaint(hwnd, &mut ps);
             paint(hwnd, hdc, &ps);
             EndPaint(hwnd, &mut ps);
+            0
+        }
+        // 离屏渲染（NST_HISTORY_PREVIEW）：和真实绘制走同一条路径。
+        // paint() 最后按 ps.rcPaint 做 BitBlt，所以这里必须把脏区设成整个客户区，
+        // 否则离屏那张图是空白的。
+        WM_PRINTCLIENT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            ps.rcPaint = client;
+            paint(hwnd, wparam as HDC, &mut ps);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2131,7 +2215,6 @@ unsafe fn draw_chart(p: &Painter, state: &mut State) {
     let max_output = axis_max as f32;
     let metrics = bar_metrics(plot_width, count, plot_left);
     let slot = metrics.slot;
-    let bar_width = metrics.bar_width;
     let radius = metrics.radius;
 
     for index in 0..state.days.len() {
