@@ -373,6 +373,9 @@ struct State {
     /// 最近一次操作是键盘：只有键盘操作才画焦点框
     keyboard: bool,
     slider_drag: bool,
+    /// 常驻双缓冲：拖动滑杆时每秒要重画几十次，每帧新建 DIB 会明显卡（660×1308 约 3.4 MB）
+    back: Option<(HDC, HBITMAP)>,
+    back_size: (i32, i32),
     /// 正在拖滚动条滑块
     scroll_drag: bool,
     /// 内容区滚动位置（像素，0 = 顶部）
@@ -737,10 +740,24 @@ unsafe fn paint(hwnd: HWND) {
 unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     let c = crate::theme::ui();
 
-    let (dc, dib, _bits) = make_dib(client.right, client.bottom);
-    if dc.is_null() || dib.is_null() {
-        return;
+    // 尺寸没变就复用上一帧的缓冲；变了才重建
+    let size = (client.right, client.bottom);
+    if state.back.is_none() || state.back_size != size {
+        if let Some((old_dc, old_dib)) = state.back.take() {
+            DeleteObject(old_dib as *mut _);
+            DeleteDC(old_dc);
+        }
+        let (dc, dib, _bits) = make_dib(size.0, size.1);
+        if dc.is_null() || dib.is_null() {
+            return;
+        }
+        state.back = Some((dc, dib));
+        state.back_size = size;
     }
+    let (dc, _dib) = match state.back {
+        Some((dc, dib)) => (dc, dib),
+        None => return,
+    };
 
     let p = Painter {
         dc,
@@ -1573,11 +1590,8 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         }
     }
 
-    // 提交
+    // 提交（缓冲是常驻的，由 state.back 管，这里不能删）
     BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
-
-    DeleteObject(dib as *mut _);
-    DeleteDC(dc);
 }
 
 const DT_CENTER_ALIGN: u32 = 0x0001;
@@ -2051,6 +2065,8 @@ pub fn open(parent: HWND, settings: &Settings) {
             focus: Some(Hit::Select(1)),
             keyboard: false,
             slider_drag: false,
+            back: None,
+            back_size: (0, 0),
             scroll_drag: false,
             scroll: 0,
             popup: std::ptr::null_mut(),
