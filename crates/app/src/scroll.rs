@@ -1841,8 +1841,8 @@ mod tests {
         let doc = text_like(width, 2400, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -1869,8 +1869,8 @@ mod tests {
         let doc = text_like(width, 2400, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -1897,8 +1897,8 @@ mod tests {
         let doc = text_like(width, 2400, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -1933,8 +1933,8 @@ mod tests {
         let doc = text_like(width, 2400, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -1980,8 +1980,8 @@ mod tests {
         let doc = text_like(width, 1200, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -2142,8 +2142,8 @@ mod tests {
         let doc = text_like(width, 2400, 0);
         let crop = |top: i32| {
             let mut piece = doc.clone();
-            let start = (top * width * 4) as usize;
-            let len = (window * width * 4) as usize;
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
             piece.pixels = doc.pixels[start..start + len].to_vec();
             piece.height = window;
             piece
@@ -2158,8 +2158,89 @@ mod tests {
         assert_eq!(stitcher.stats.lost, 0);
         assert_eq!(stitcher.stats.gap_rows, 0);
     }
+
+    #[test]
+    fn mixed_scroll_session_matches_the_document() {
+        // 真实使用：往下滚 → 滚过头往回滚 → 再往下滚。
+        // 拼接器要在"上滚插入 / 下滚追加 / 已覆盖不动"之间来回切，最后整幅必须和文档逐字节一致。
+        let width = 400;
+        let doc_height = 1200;
+        let window = 400;
+        let doc = text_like(width, doc_height, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top as usize) * width as usize * 4;
+            let len = (window as usize) * width as usize * 4;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = window;
+            piece
+        };
+        let name = |pushed: &Pushed| match pushed {
+            Pushed::Appended => "接在末尾",
+            Pushed::Unchanged => "没变化",
+            Pushed::Lost => "对不上",
+        };
+
+        // 从中间开始（模拟用户已经滚了一段才按快捷键）
+        let mut stitcher = Stitcher::new(crop(400));
+        assert_eq!(stitcher.height(), window);
+
+        // 往回滚两次：内容要插到前面
+        for (index, top) in [100, 0].iter().enumerate() {
+            match stitcher.push(crop(*top)) {
+                Pushed::Appended => {}
+                other => panic!("第 {index} 次上滚应该插到开头，实际{}", name(&other)),
+            }
+        }
+        assert_eq!(stitcher.height(), window + 400, "上滚补进 400 行");
+        let expect = &doc.pixels[..(stitcher.height() as usize * width as usize * 4)];
+        assert_eq!(stitcher.image().pixels, expect, "上滚之后内容要和文档一致");
+
+        // 滚回已经覆盖的位置：不该重复插
+        assert!(matches!(stitcher.push(crop(200)), Pushed::Unchanged), "已覆盖的区域不该变");
+
+        // 再往下滚：追加
+        for top in [700, 800] {
+            match stitcher.push(crop(top)) {
+                Pushed::Appended => {}
+                other => panic!("下滚到 {top} 应该追加，实际{}", name(&other)),
+            }
+        }
+        assert_eq!(stitcher.height(), doc_height, "最终应该正好拼满整篇");
+        let expect = &doc.pixels[..(stitcher.height() as usize * width as usize * 4)];
+        assert_eq!(stitcher.image().pixels, expect, "混合滚动后内容要和文档一致");
+    }
+
+    #[test]
+    fn burst_of_blank_frames_does_not_shrink_the_canvas() {
+        // 滚动停下来、画面暂时没变化时，程序会抓到重复帧；这些帧不能被当成"没对上"而丢内容
+        let width = 300;
+        let doc = text_like(width, 900, 0);
+        let crop = |top: i32| {
+            let mut piece = doc.clone();
+            let start = (top as usize) * width as usize * 4;
+            let len = 400usize * width as usize * 4;
+            piece.pixels = doc.pixels[start..start + len].to_vec();
+            piece.height = 400;
+            piece
+        };
+        let mut stitcher = Stitcher::new(crop(0));
+        stitcher.push(crop(300));
+        let height_before = stitcher.height();
+
+        // 同一帧连抓 5 次
+        for round in 0..5 {
+            let pushed = stitcher.push(crop(300));
+            assert!(
+                matches!(pushed, Pushed::Unchanged),
+                "第 {round} 次重复帧应该判定为没变化，实际 {}",
+                match pushed {
+                    Pushed::Appended => "追加",
+                    Pushed::Lost => "丢失",
+                    Pushed::Unchanged => "没变化",
+                }
+            );
+            assert_eq!(stitcher.height(), height_before, "重复帧不该改变高度");
+        }
+    }
 }
-
-
-
-
