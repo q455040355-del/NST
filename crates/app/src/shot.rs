@@ -1651,6 +1651,34 @@ unsafe fn rotate_editor(hwnd: HWND, editor: &mut Editor) {
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
+/// 看图片四条边的整体亮度：深色图要白描边，浅色图要浅灰描边
+fn edge_is_dark(bitmap: &Bitmap) -> bool {
+    if bitmap.width < 2 || bitmap.height < 2 {
+        return false;
+    }
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    let mut sample = |x: i32, y: i32| {
+        let offset = ((y as usize * bitmap.width as usize) + x as usize) * 4;
+        if offset + 2 < bitmap.pixels.len() {
+            let pixel = &bitmap.pixels[offset..offset + 3];
+            sum += (pixel[0] as u64 + pixel[1] as u64 + pixel[2] as u64) / 3;
+            count += 1;
+        }
+    };
+    let step = (bitmap.width / 64).max(1);
+    for x in (0..bitmap.width).step_by(step as usize) {
+        sample(x, 0);
+        sample(x, bitmap.height - 1);
+    }
+    let step = (bitmap.height / 64).max(1);
+    for y in (0..bitmap.height).step_by(step as usize) {
+        sample(0, y);
+        sample(bitmap.width - 1, y);
+    }
+    count > 0 && sum / count < 96
+}
+
 /// 图形的包围盒（橡皮命中测试用）
 fn shape_bounds(shape: &Shape) -> (i32, i32, i32, i32) {
     match shape {
@@ -2676,7 +2704,13 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         let bottom = (editor.image_top + (editor.base.height as f32 * editor.scale) as i32)
             .min(view.bottom.saturating_sub(1));
         if right > left && bottom > top {
-            let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00DA_DDE2);
+            // 图边上是深色就画白线，浅色就画浅灰线，保证描边总看得见
+            let border = if edge_is_dark(&editor.base) {
+                0x00FF_FFFF
+            } else {
+                0x00DA_DDE2
+            };
+            let pen = windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, border);
             let old = SelectObject(dc, pen as HGDIOBJ);
             let brush = SelectObject(dc, GetStockObject(5) as HGDIOBJ); // NULL_BRUSH
             // 描边画在图片边界的「内侧」1px：图贴着窗口左边/上边时也能看见
@@ -4515,18 +4549,19 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
 
-            if point.y < (*editor).title_h {
-                // 顶部窗口栏：直接交给系统拖动
-                ReleaseCapture();
-                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
-                return 0;
-            }
+            // 先看是不是点在按钮上（窗口栏右上角那三个），再考虑拖窗口
             if let Some(action) = hit_button(&*editor, point) {
-                // 先记下「按着」，松开鼠标才执行 —— 按下有反馈，滑出去松开就不算点击
+                // 按下有反馈，松开鼠标才执行
                 let editor = &mut *editor;
                 editor.pressed = Some(action);
                 SetCapture(hwnd);
                 InvalidateRect(hwnd, std::ptr::null(), 0);
+                return 0;
+            }
+            if point.y < (*editor).title_h {
+                // 顶部窗口栏空白处：直接交给系统拖动
+                ReleaseCapture();
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
                 return 0;
             }
 
