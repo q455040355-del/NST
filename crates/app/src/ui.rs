@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetCursor};
 
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 
 pub const DT_NOPREFIX: u32 = 0x0800;
 pub const DT_CENTER: u32 = 0x0001;
@@ -93,7 +93,7 @@ pub fn font(points: f32, weight: i32, scale: f32) -> HFONT {
                 CLEARTYPE_QUALITY as u32,
                 0,
                 // 统一用系统自带的中文字体（数字也是它，别一会儿 Consolas 一会儿雅黑）
-                wide("Microsoft YaHei UI").as_ptr(),
+                ui_face().as_ptr(),
             )
         };
         cell.borrow_mut().insert(key, handle);

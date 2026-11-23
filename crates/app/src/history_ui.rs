@@ -24,7 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.History";
 const CANVAS_CLASS: &str = "NetSpeedTaskbarRs.HistoryCanvas";
@@ -1369,6 +1369,8 @@ struct Painter {
     width: i32,
     height: i32,
     scale: f32,
+    /// GDI+ 画布：圆角 / 斜线走它才有抗锯齿（建不出来就退回 GDI 硬边）
+    aa: Option<crate::aa::Canvas>,
 }
 
 impl Painter {
@@ -1398,6 +1400,10 @@ impl Painter {
         fill: u32,
         border: u32,
     ) {
+        if let Some(aa) = &self.aa {
+            aa.round(left, top, right, bottom, radius, fill, border);
+            return;
+        }
         let brush = CreateSolidBrush(fill);
         let pen = CreatePen(0, 1, border);
         let old_brush = SelectObject(self.dc, brush as HGDIOBJ);
@@ -1427,6 +1433,10 @@ impl Painter {
     }
 
     unsafe fn solid_line(&self, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+        if let Some(aa) = &self.aa {
+            aa.line(x1, y1, x2, y2, color, 1);
+            return;
+        }
         let pen = CreatePen(0, 1, color);
         let old = SelectObject(self.dc, pen as HGDIOBJ);
         MoveToEx(self.dc, x1, y1, std::ptr::null_mut());
@@ -1553,7 +1563,7 @@ fn make_font(points: f32, weight: i32) -> HFONT {
             0,
             CLEARTYPE_QUALITY as u32,
             0,
-            wide("Microsoft YaHei UI").as_ptr(),
+            ui_face().as_ptr(),
         )
     }
 }
@@ -2648,6 +2658,7 @@ fn paint(hwnd: HWND, hdc: HDC, ps: &PAINTSTRUCT) {
             width: client.right,
             height: client.bottom,
             scale: ui_scale(),
+            aa: crate::aa::Canvas::new(dc),
         };
 
         let chart = state.chart_rect;

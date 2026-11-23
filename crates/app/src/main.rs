@@ -4,6 +4,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod aa;
 mod dialog;
 mod dxgi;
 mod gifrec;

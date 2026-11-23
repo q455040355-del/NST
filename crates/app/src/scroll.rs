@@ -28,7 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::shot::{capture_rect, s, Bitmap};
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 
 const DT_NOPREFIX: u32 = 0x0800;
 
@@ -1473,7 +1473,7 @@ unsafe fn paint_chip(hwnd: HWND) {
         0,
         CLEARTYPE_QUALITY as u32,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old_font = SelectObject(dc, font as HGDIOBJ);
     SetBkMode(dc, 1);
@@ -1549,7 +1549,7 @@ unsafe fn paint_chip(hwnd: HWND) {
         0,
         CLEARTYPE_QUALITY as u32,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old_cf = SelectObject(dc, check_font as HGDIOBJ);
     SetTextColor(dc, 0x00FF_FFFF);

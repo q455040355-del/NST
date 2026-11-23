@@ -91,9 +91,15 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   托盘、设置窗、历史窗、取字窗共用。悬浮提示随视图更新（文字不变才 `NIM_MODIFY`，避免闪烁）。
   面板被手动隐藏后，**左键单击托盘即可唤回**（不用双击——双击的第一下原来只会弹菜单）。
   Explorer 重启后会重新注册图标（`TaskbarCreated`）。
-- **字体**：全程序统一 `Microsoft YaHei UI`（面板的数字也不再是 Consolas）；字号可选 90/100/110/125%，
+- **字体**：全程序统一一个字体家族（`theme::ui_font_family`）——装了**苹方**就用苹方，
+  没有就用 **Noto Sans SC**（思源黑体，观感最接近苹方），再没有才回微软雅黑 UI；
+  想强制指定就设 `NST_UI_FONT="Microsoft YaHei UI"`。面板的数字也不再是 Consolas；字号可选 90/100/110/125%，
   面板五个字号等比缩放。面板左侧标签列按实际字宽排，`CPU` / `GPU` 不会再被切掉；
   窄面板 + 大字号时会按剩余宽度继续缩字，保证不被 `DrawText` 裁掉。
+- **抗锯齿**：设置 / 历史 / 截图编辑三个窗口的圆角、圆、斜线都走 GDI+ 的
+  `SmoothingModeAntiAlias`（`aa` 模块），圆角和斜线不再是台阶；文字仍然走 GDI 的 ClearType。
+  设置窗滚动时会给 GDI+ 补位移和裁剪（它不认 `SetViewportOrgEx` 和 GDI 裁剪区），
+  否则滚起来会「一半内容动、一半不动」。
 - **温度**：CPU 走 WMI `Win32_PerfFormattedData_Counters_ThermalZoneInformation`（0.1K → °C，取最高热区），
   GPU 走常驻 `nvidia-smi --loop=1`；后台线程分别 2s / 1s 刷新，15 秒没更新显示 `--`，首次进温度视图才启动。
 - **AI 采集（六源，需手动开启）**：设置里「AI 统计」总开关，默认**关**——关着时不建采集线程、

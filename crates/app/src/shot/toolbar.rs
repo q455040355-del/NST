@@ -6,6 +6,27 @@ use super::*;
 
 /// 画底部工具栏（26 个按钮 + 分组线 + hover 标签），返回它的矩形给窗口区域用
 pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) -> RECT {
+    // 这一趟绘制共用一块 GDI+ 画布：底栏、图标、标签都是抗锯齿的
+    let _aa = crate::aa::begin(dc);
+
+    // 圆角矩形：优先抗锯齿，GDI+ 不可用时退回 GDI
+    let round = |left: i32, top: i32, right: i32, bottom: i32, radius: i32, fill: u32, border: u32| {
+        if crate::aa::round(dc, left, top, right, bottom, radius, fill, border) {
+            return;
+        }
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(0, 1, border);
+        let old_brush = SelectObject(dc, brush as HGDIOBJ);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        windows_sys::Win32::Graphics::Gdi::RoundRect(
+            dc, left, top, right, bottom, radius, radius,
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen as *mut _);
+        DeleteObject(brush as *mut _);
+    };
+
     // 工具栏：微信那种一条圆角底栏，纯图标（文字靠 hover 小标签提示）
     let ui = crate::theme::ui();
     let bar_h = s(38.0);
@@ -45,47 +66,26 @@ pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) ->
     };
 
     // 底栏投影：比背板大一圈的浅灰圆角，制造「浮起来」的感觉
-    {
-        let shadow = CreateSolidBrush(0x00EE_F1F4);
-        let old_brush = SelectObject(dc, shadow as HGDIOBJ);
-        let old_pen = SelectObject(
-            dc,
-            windows_sys::Win32::Graphics::Gdi::CreatePen(0, 1, 0x00EE_F1F4) as HGDIOBJ,
-        );
-        windows_sys::Win32::Graphics::Gdi::RoundRect(
-            dc,
-            bar_left - s(2.0),
-            bar_top - s(1.0),
-            bar_left + bar_w + s(2.0),
-            bar_bottom + s(3.0),
-            s(15.0),
-            s(15.0),
-        );
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        DeleteObject(shadow as *mut _);
-    }
+    round(
+        bar_left - s(2.0),
+        bar_top - s(1.0),
+        bar_left + bar_w + s(2.0),
+        bar_bottom + s(3.0),
+        s(15.0),
+        0x00EE_F1F4,
+        0x00EE_F1F4,
+    );
 
     // 底栏背板：圆角 + 1px 描边
-    {
-        let brush = CreateSolidBrush(ui.surface);
-        let pen = CreatePen(0, 1, ui.border);
-        let old_brush = SelectObject(dc, brush as HGDIOBJ);
-        let old_pen = SelectObject(dc, pen as HGDIOBJ);
-        windows_sys::Win32::Graphics::Gdi::RoundRect(
-            dc,
-            bar_left,
-            bar_top,
-            bar_left + bar_w,
-            bar_bottom,
-            s(13.0),
-            s(13.0),
-        );
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        DeleteObject(pen as *mut _);
-        DeleteObject(brush as *mut _);
-    }
+    round(
+        bar_left,
+        bar_top,
+        bar_left + bar_w,
+        bar_bottom,
+        s(13.0),
+        ui.surface,
+        ui.border,
+    );
 
     let icon_top = bar_top + (bar_h - item) / 2;
     let mut x = bar_left + pad;
@@ -124,23 +124,15 @@ pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) ->
             } else {
                 ui.chip
             };
-            let brush = CreateSolidBrush(fill);
-            let pen = CreatePen(0, 1, fill);
-            let old_brush = SelectObject(dc, brush as HGDIOBJ);
-            let old_pen = SelectObject(dc, pen as HGDIOBJ);
-            windows_sys::Win32::Graphics::Gdi::RoundRect(
-                dc,
+            round(
                 rect.left,
                 rect.top,
                 rect.right,
                 rect.bottom,
                 s(8.0),
-                s(8.0),
+                fill,
+                fill,
             );
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-            DeleteObject(pen as *mut _);
-            DeleteObject(brush as *mut _);
         }
 
         let color = if active {

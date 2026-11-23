@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 
 const BORDER_CLASS: &str = "NetSpeedTaskbarRs.GifBorder";
 const STOP_CLASS: &str = "NetSpeedTaskbarRs.GifStop";
@@ -112,7 +112,7 @@ unsafe extern "system" fn hud_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
             SetBkMode(dc, TRANSPARENT as i32);
             SetTextColor(dc, 0x00FF_FFFF);
-            let font = CreateFontW(-13, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, wide("Microsoft YaHei UI").as_ptr());
+            let font = CreateFontW(-13, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, ui_face().as_ptr());
             let old = SelectObject(dc, font as HGDIOBJ);
             let seconds = HUD_SECONDS.load(Ordering::Relaxed);
             let text = format!("● {}s", seconds.max(0));
@@ -454,7 +454,7 @@ unsafe fn paint_bar(hwnd: HWND, dc: HDC, hover: i32) {
         0,
         5,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old_font = SelectObject(dc, font as HGDIOBJ);
     SetBkMode(dc, TRANSPARENT as i32);
@@ -639,7 +639,7 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 0,
                 5,
                 0,
-                wide("Microsoft YaHei UI").as_ptr(),
+                ui_face().as_ptr(),
             );
             let old_font = SelectObject(dc, font as HGDIOBJ);
             let mut rect = client;

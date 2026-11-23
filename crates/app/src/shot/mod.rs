@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 
 mod annotations;
 mod iconexport;
@@ -367,7 +367,7 @@ fn make_font(points: f32, weight: i32) -> HFONT {
             0,
             CLEARTYPE_QUALITY as u32,
             0,
-            wide("Microsoft YaHei UI").as_ptr(),
+            ui_face().as_ptr(),
         )
     }
 }
@@ -720,23 +720,7 @@ unsafe fn overlay_paint(hwnd: HWND) {
 
         // 深色胶囊打底：白字直接画在花花绿绿的壁纸/窗口上会发虚，也容易糊成一片
         let fill = 0x0018_1818;
-        let brush = CreateSolidBrush(fill);
-        let pen = CreatePen(0, 1, fill);
-        let old_brush = SelectObject(dc, brush as HGDIOBJ);
-        let old_pen = SelectObject(dc, pen as HGDIOBJ);
-        windows_sys::Win32::Graphics::Gdi::RoundRect(
-            dc,
-            pill.left,
-            pill.top,
-            pill.right,
-            pill.bottom,
-            s(5.0),
-            s(5.0),
-        );
-        SelectObject(dc, old_brush);
-        SelectObject(dc, old_pen);
-        DeleteObject(brush as *mut _);
-        DeleteObject(pen as *mut _);
+        round_rect_aa(dc, &pill, s(5.0), fill, fill);
 
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, 0x00FF_FFFF);
@@ -798,23 +782,18 @@ unsafe fn draw_loupe(dc: HDC, state: &Overlay) {
     // 面板：浅色圆角底 + 细边框
     let panel = 0x00F7_F8FA;
     let border = 0x00D8_DCE0;
-    let brush = CreateSolidBrush(panel);
-    let pen = CreatePen(0, 1, border);
-    let old_brush = SelectObject(dc, brush as HGDIOBJ);
-    let old_pen = SelectObject(dc, pen as HGDIOBJ);
-    windows_sys::Win32::Graphics::Gdi::RoundRect(
+    round_rect_aa(
         dc,
-        left,
-        top,
-        left + width,
-        top + height,
+        &RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        },
         s(8.0),
-        s(8.0),
+        panel,
+        border,
     );
-    SelectObject(dc, old_brush);
-    SelectObject(dc, old_pen);
-    DeleteObject(brush as *mut _);
-    DeleteObject(pen as *mut _);
 
     let half = cells / 2;
     let mut sample = vec![0u8; (cells * cells * 4) as usize];
@@ -1678,23 +1657,7 @@ fn draw_angle_hint(dc: HDC, from: (i32, i32), to: (i32, i32), scale: f32) {
             right: x + s(12.0) + width,
             bottom: y + s(10.0) + height,
         };
-        let brush = CreateSolidBrush(0x00F2_3A3A);
-        let pen = CreatePen(0, 1, 0x00F2_3A3A);
-        let old_brush = SelectObject(dc, brush as HGDIOBJ);
-        let old_pen = SelectObject(dc, pen as HGDIOBJ);
-        windows_sys::Win32::Graphics::Gdi::RoundRect(
-            dc,
-            pill.left,
-            pill.top,
-            pill.right,
-            pill.bottom,
-            height,
-            height,
-        );
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        DeleteObject(pen as *mut _);
-        DeleteObject(brush as *mut _);
+        round_rect_aa(dc, &pill, height, 0x00F2_3A3A, 0x00F2_3A3A);
         SetTextColor(dc, 0x00FF_FFFF);
         let mut text_rect = pill;
         DrawTextW(
@@ -2131,23 +2094,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
                 right: left + text_w,
                 bottom: top + height_px,
             };
-            let brush = CreateSolidBrush(ui.text);
-            let pen = CreatePen(0, 1, ui.text);
-            let old_brush = SelectObject(dc, brush as HGDIOBJ);
-            let old_toast_pen = SelectObject(dc, pen as HGDIOBJ);
-            windows_sys::Win32::Graphics::Gdi::RoundRect(
-                dc,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                height_px,
-                height_px,
-            );
-            SelectObject(dc, old_toast_pen);
-            SelectObject(dc, old_brush);
-            DeleteObject(pen as *mut _);
-            DeleteObject(brush as *mut _);
+            round_rect_aa(dc, &rect, height_px, ui.text, ui.text);
 
             SetTextColor(dc, ui.bg);
             let mut text_rect = rect;
@@ -2322,7 +2269,43 @@ fn wide_width(dc: HDC, text: &str) -> i32 {
 const DT_CALCRECT: u32 = 0x0400;
 
 /// 小工具：画一条线
+/// 圆角矩形：优先走 GDI+ 抗锯齿（圆角不再有台阶），GDI+ 不可用时退回 GDI
+unsafe fn round_rect_aa(dc: HDC, rect: &RECT, radius: i32, fill: u32, border: u32) {
+    if crate::aa::round(
+        dc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        fill,
+        border,
+    ) {
+        return;
+    }
+    let brush = CreateSolidBrush(fill);
+    let pen = CreatePen(0, 1, border);
+    let old_brush = SelectObject(dc, brush as HGDIOBJ);
+    let old_pen = SelectObject(dc, pen as HGDIOBJ);
+    windows_sys::Win32::Graphics::Gdi::RoundRect(
+        dc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(pen as *mut _);
+    DeleteObject(brush as *mut _);
+}
+
 unsafe fn icon_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, width: i32, color: u32) {
+    if crate::aa::line(dc, x1, y1, x2, y2, color, width) {
+        return;
+    }
     let pen = CreatePen(0, width.max(1), color);
     let old = SelectObject(dc, pen as HGDIOBJ);
     MoveToEx(dc, x1, y1, std::ptr::null_mut());
@@ -2333,6 +2316,20 @@ unsafe fn icon_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, width: i32, col
 
 /// 小工具：画一串折线（不闭合）
 unsafe fn icon_polyline(dc: HDC, points: &[POINT], width: i32, color: u32, close: bool) {
+    if points.len() >= 2 {
+        let mut ok = true;
+        for pair in points.windows(2) {
+            ok &= crate::aa::line(dc, pair[0].x, pair[0].y, pair[1].x, pair[1].y, color, width);
+        }
+        if close {
+            let first = points[0];
+            let last = points[points.len() - 1];
+            ok &= crate::aa::line(dc, last.x, last.y, first.x, first.y, color, width);
+        }
+        if ok {
+            return;
+        }
+    }
     let pen = CreatePen(0, width.max(1), color);
     let old = SelectObject(dc, pen as HGDIOBJ);
     Polyline(dc, points.as_ptr(), points.len() as i32);
@@ -2358,6 +2355,9 @@ unsafe fn icon_fill_round(
     bottom: i32,
     color: u32,
 ) {
+    if crate::aa::round(dc, left, top, right, bottom, radius * 2, color, color) {
+        return;
+    }
     let brush = CreateSolidBrush(color);
     let old_brush = SelectObject(dc, brush as HGDIOBJ);
     let old_pen = SelectObject(
@@ -2382,6 +2382,10 @@ unsafe fn icon_outline(
     width: i32,
     color: u32,
 ) {
+    // 圆角框直接走抗锯齿；要在选画笔之前决定，否则会漏掉 SelectObject 的还原
+    if kind >= 2 && crate::aa::ring(dc, left, top, right, bottom, s(4.0), color, width) {
+        return;
+    }
     let pen = CreatePen(0, width.max(1), color);
     let old_pen = SelectObject(dc, pen as HGDIOBJ);
     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -3040,23 +3044,7 @@ fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke:
         // 弹在图片上方（图片大多偏亮）也看得清
         let ui = crate::theme::ui();
         let (fill, ink) = (ui.surface, ui.text);
-        let brush = CreateSolidBrush(fill);
-        let pen = CreatePen(0, 1, ui.border);
-        let old_brush = SelectObject(dc, brush as HGDIOBJ);
-        let old_pen = SelectObject(dc, pen as HGDIOBJ);
-        windows_sys::Win32::Graphics::Gdi::RoundRect(
-            dc,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            s(8.0),
-            s(8.0),
-        );
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        DeleteObject(pen as *mut _);
-        DeleteObject(brush as *mut _);
+        round_rect_aa(dc, &rect, s(8.0), fill, ui.border);
 
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, ink);
@@ -3606,12 +3594,12 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
         Action::Copy => {
+            // ⧉ 复制：复制完直接收工，不用再点一次 ×
             commit_text(hwnd);
             let editor = &*editor;
             let bitmap = composite(editor);
             clipboard_bitmap(&bitmap);
-            SetWindowTextW(hwnd, wide("截图编辑 · 已复制到剪贴板").as_ptr());
-            show_toast(hwnd, "已复制到剪贴板");
+            DestroyWindow(hwnd);
         }
         Action::Save => {
             commit_text(hwnd);

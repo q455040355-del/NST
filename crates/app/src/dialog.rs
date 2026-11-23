@@ -15,7 +15,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::theme::{ui, wide};
+use crate::theme::{ui, ui_face, wide};
 use crate::ui::s;
 
 const CLASS: &str = "NetSpeedTaskbarRs.Dialog";
@@ -80,7 +80,7 @@ fn show(owner: HWND, title: &str, text: &str, confirm: bool) -> bool {
             0,
             5,
             0,
-            wide("Microsoft YaHei UI").as_ptr(),
+            ui_face().as_ptr(),
         );
         let old = SelectObject(screen, font_body as HGDIOBJ);
         let mut measure = RECT {
@@ -238,7 +238,7 @@ unsafe fn paint(hwnd: HWND, state: &Dialog) {
         0,
         5,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old = SelectObject(dc, title_font as HGDIOBJ);
     SetTextColor(dc, ui_colors.text);
@@ -274,7 +274,7 @@ unsafe fn paint(hwnd: HWND, state: &Dialog) {
         0,
         5,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old = SelectObject(dc, body_font as HGDIOBJ);
     SetTextColor(dc, ui_colors.text2);
@@ -320,7 +320,7 @@ unsafe fn paint(hwnd: HWND, state: &Dialog) {
         0,
         5,
         0,
-        wide("Microsoft YaHei UI").as_ptr(),
+        ui_face().as_ptr(),
     );
     let old = SelectObject(dc, button_font as HGDIOBJ);
     SetTextColor(dc, 0x00FF_FFFF);

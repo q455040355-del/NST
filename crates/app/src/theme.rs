@@ -100,14 +100,95 @@ impl Fonts {
     /// `percent`：字号百分比（90 / 100 / 110 / 125），五个字号等比缩放
     pub fn create(dpi: u32, percent: i32) -> Self {
         let k = percent.clamp(50, 200) as f32 / 100.0;
+        let face = ui_font_family();
         Self {
-            label: create_font(dpi, 9.5 * k, FW_BOLD, "Microsoft YaHei UI"),
-            label_small: create_font(dpi, 8.5 * k, FW_BOLD, "Microsoft YaHei UI"),
+            label: create_font(dpi, 9.5 * k, FW_BOLD, face),
+            label_small: create_font(dpi, 8.5 * k, FW_BOLD, face),
             // 数字也走同一个字体（以前是 Consolas，和中文混排时字重/基线对不上）
-            value: create_font(dpi, 11.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
-            value_mid: create_font(dpi, 10.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
-            value_small: create_font(dpi, 9.0 * k, FW_NORMAL, "Microsoft YaHei UI"),
+            value: create_font(dpi, 11.0 * k, FW_NORMAL, face),
+            value_mid: create_font(dpi, 10.0 * k, FW_NORMAL, face),
+            value_small: create_font(dpi, 9.0 * k, FW_NORMAL, face),
         }
+    }
+}
+
+/// 整个程序用的字体家族。
+///
+/// 顺序：苹方（装了就用，Mac 的字体，Windows 默认没有）→ Noto Sans SC（思源黑体，
+/// 观感最接近苹方）→ 微软雅黑 UI。都没有就还是雅黑。
+/// 想对比效果可以设环境变量 `NST_UI_FONT=Noto Sans SC` 之类，强制指定一个。
+pub fn ui_font_family() -> &'static str {
+    static FAMILY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FAMILY
+        .get_or_init(|| {
+            let mut wanted: Vec<String> = Vec::new();
+            if let Ok(forced) = std::env::var("NST_UI_FONT") {
+                wanted.push(forced.trim().to_string());
+            }
+            for name in [
+                "PingFang SC",
+                "PingFang",
+                "Noto Sans SC",
+                "Microsoft YaHei UI",
+                "Microsoft YaHei",
+            ] {
+                wanted.push(name.to_string());
+            }
+            wanted
+                .into_iter()
+                .find(|name| !name.is_empty() && font_installed(name))
+                .unwrap_or_else(|| "Microsoft YaHei UI".to_string())
+        })
+        .as_str()
+}
+
+/// 界面字体的宽字符版本（直接喂 `CreateFontW`）
+pub fn ui_face() -> Vec<u16> {
+    wide(ui_font_family())
+}
+
+/// 这个字体家族装没装：建一个字体，再问 GDI 实际选中了哪个家族。
+/// 系统上找不到时 GDI 会静默换成别的字体，所以「要求的名字 == 实际名字」才算装了。
+fn font_installed(name: &str) -> bool {
+    unsafe {
+        let dc = windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut());
+        if dc.is_null() {
+            return false;
+        }
+        let face = wide(name);
+        let font = windows_sys::Win32::Graphics::Gdi::CreateFontW(
+            -12,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            windows_sys::Win32::Graphics::Gdi::DEFAULT_CHARSET as u32,
+            0,
+            0,
+            0,
+            0,
+            face.as_ptr(),
+        );
+        let old = windows_sys::Win32::Graphics::Gdi::SelectObject(dc, font as _);
+        let mut actual = [0u16; 64];
+        let len = windows_sys::Win32::Graphics::Gdi::GetTextFaceW(
+            dc,
+            actual.len() as i32,
+            actual.as_mut_ptr(),
+        );
+        windows_sys::Win32::Graphics::Gdi::SelectObject(dc, old);
+        windows_sys::Win32::Graphics::Gdi::DeleteObject(font as _);
+        windows_sys::Win32::Graphics::Gdi::ReleaseDC(std::ptr::null_mut(), dc);
+
+        if len <= 1 {
+            return false;
+        }
+        let got = String::from_utf16_lossy(&actual[..(len as usize - 1)]);
+        got.eq_ignore_ascii_case(name)
+            || got.to_lowercase().contains(&name.to_lowercase())
     }
 }
 

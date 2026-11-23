@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::theme::wide;
+use crate::theme::{ui_face, wide};
 use netspeed_core::settings::{
     format_hotkey, parse_hotkey, Settings, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT,
     HOTKEY_MOD_WIN,
@@ -179,7 +179,7 @@ fn font(points: f32, weight: i32, scale: f32) -> HFONT {
             0,
             CLEARTYPE_QUALITY as u32,
             0,
-            wide("Microsoft YaHei UI").as_ptr(),
+            ui_face().as_ptr(),
         )
     }
 }
@@ -229,6 +229,8 @@ fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
 struct Painter {
     dc: HDC,
     scale: f32,
+    /// GDI+ 画布：圆角 / 圆 / 斜线走它才有抗锯齿（建不出来就退回 GDI 硬边）
+    aa: Option<crate::aa::Canvas>,
 }
 
 impl Painter {
@@ -258,6 +260,10 @@ impl Painter {
         fill: u32,
         border: u32,
     ) {
+        if let Some(aa) = &self.aa {
+            aa.round(left, top, right, bottom, radius, fill, border);
+            return;
+        }
         let brush = CreateSolidBrush(fill);
         let pen = CreatePen(0, 1, border);
         let old_brush = SelectObject(self.dc, brush as HGDIOBJ);
@@ -280,6 +286,10 @@ impl Painter {
         color: u32,
         width: i32,
     ) {
+        if let Some(aa) = &self.aa {
+            aa.ring(left, top, right, bottom, radius, color, width);
+            return;
+        }
         let pen = CreatePen(0, width.max(1), color);
         let old_pen = SelectObject(self.dc, pen as HGDIOBJ);
         let old_brush = SelectObject(
@@ -295,6 +305,10 @@ impl Painter {
     }
 
     unsafe fn line(&self, x1: i32, y1: i32, x2: i32, y2: i32, color: u32, width: i32) {
+        if let Some(aa) = &self.aa {
+            aa.line(x1, y1, x2, y2, color, width);
+            return;
+        }
         let pen = CreatePen(0, width.max(1), color);
         let old = SelectObject(self.dc, pen as HGDIOBJ);
         MoveToEx(self.dc, x1, y1, std::ptr::null_mut());
@@ -304,6 +318,10 @@ impl Painter {
     }
 
     unsafe fn circle(&self, cx: i32, cy: i32, radius: i32, fill: u32, border: u32) {
+        if let Some(aa) = &self.aa {
+            aa.circle(cx, cy, radius, fill, border);
+            return;
+        }
         let brush = CreateSolidBrush(fill);
         let pen = CreatePen(0, 1, border);
         let old_brush = SelectObject(self.dc, brush as HGDIOBJ);
@@ -832,6 +850,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     let p = Painter {
         dc,
         scale: state.scale,
+        aa: crate::aa::Canvas::new(dc),
     };
     let l = layout(state, client);
 
@@ -911,6 +930,18 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     if saved != 0 {
         IntersectClipRect(dc, 0, view_top, client.right, view_bottom);
         SetViewportOrgEx(dc, 0, -scroll, std::ptr::null_mut());
+    }
+    // GDI+ 不认视口原点和 GDI 裁剪区，滚动那点位移和裁剪区得自己补上，
+    // 否则滚起来以后「抗锯齿的那一半」会原地不动 / 画到页头上去
+    if let Some(aa) = &p.aa {
+        aa.translate(0, -scroll);
+        // 可见带是窗口的 view_top..view_bottom，换算回「没滚动」的内容坐标
+        aa.clip_rect(
+            0,
+            view_top + scroll,
+            client.right,
+            view_bottom + scroll,
+        );
     }
 
     // 行
@@ -1582,10 +1613,13 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             } else {
                 value.to_string()
             };
-            let (text, color) = if shown.is_empty() {
-                (placeholder.to_string(), c.text3)
-            } else {
+            let (text, color) = if !shown.is_empty() {
                 (shown, c.text)
+            } else if editing {
+                // 空着又正在编辑：不画占位符，否则光标会压在第一个字上
+                (String::new(), c.text3)
+            } else {
+                (placeholder.to_string(), c.text3)
             };
             let text_left = rect.left + p.s(10.0);
             p.text(
@@ -1602,7 +1636,15 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             if editing {
                 let prefix: String = value.chars().take(state.tr_caret).collect();
                 let caret_x = text_left + crate::shot::text_width(p.dc, &prefix, state.fonts.label);
-                p.fill(caret_x, rect.top + p.s(8.0), caret_x + p.s(1.5), rect.bottom - p.s(8.0), c.accent);
+                // 高度跟着字行走：上下各留 6px，别画成一小截
+                let caret_w = p.s(2.0).max(1);
+                p.fill(
+                    caret_x,
+                    rect.top + p.s(6.0),
+                    caret_x + caret_w,
+                    rect.bottom - p.s(6.0),
+                    c.accent,
+                );
             }
         }
     }
@@ -1610,6 +1652,10 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
     // 内容区结束：恢复裁剪和原点，页脚固定在底部
     if saved != 0 {
         RestoreDC(dc, saved);
+    }
+    // 页脚画在正常坐标系里，GDI+ 的位移和裁剪要一起复位
+    if let Some(aa) = &p.aa {
+        aa.reset();
     }
 
     // 页脚控件的焦点框画在正常坐标系里
@@ -1823,6 +1869,7 @@ unsafe fn popup_paint(hwnd: HWND) {
     let p = Painter {
         dc,
         scale: state.scale,
+        aa: crate::aa::Canvas::new(dc),
     };
 
     p.fill(0, 0, client.right, client.bottom, c.surface);
