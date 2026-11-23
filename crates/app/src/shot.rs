@@ -1334,7 +1334,7 @@ struct Editor {
     /// 顶部窗口栏的实际矩形（宽度跟图片一致）
     title_rect: RECT,
     /// 图片下方的带子高度（工具栏浮在这条带子里）
-    top_margin: i32,
+    bottom_strip: i32,
     /// 诊断用：只探测一次窗口顶部压着什么
     probed: bool,
     /// 底栏的矩形（客户区坐标）：按钮命中判定只在这块里做，
@@ -1557,7 +1557,7 @@ unsafe fn fit_window_to_image(hwnd: HWND, editor: &mut Editor) {
 
     let image_w = (editor.base.width as f32 * editor.scale).round() as i32;
     let image_h = (editor.base.height as f32 * editor.scale).round() as i32;
-    let margin = editor.top_margin;
+    let margin = editor.bottom_strip;
     let mut width = image_w.max(toolbar_width()).max(s(240.0)).min(max_w);
     let mut height = image_h + margin;
     if height > max_h {
@@ -1758,6 +1758,18 @@ fn snap_angle(from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
         from.0 + (length * radians.cos()).round() as i32,
         from.1 + (length * radians.sin()).round() as i32,
     )
+}
+
+/// 窗口栏标题：没选工具是「截图」，选了就带上当前提示
+fn title_text(tool: Tool) -> String {
+    if matches!(tool, Tool::None) {
+        "截图".to_string()
+    } else {
+        // 窗口栏放不下长句子，只取提示的前半句
+        let hint = hint_for(tool);
+        let short = hint.split('·').next().unwrap_or(hint).trim();
+        format!("截图 · {short}")
+    }
 }
 
 /// 拖直线/箭头时在终点旁边显示角度（0~180 度，水平是 0）
@@ -2208,7 +2220,6 @@ fn draw_drag_frame(dc: HDC, a: (i32, i32), b: (i32, i32), scale: f32) {
     }
 }
 
-#[allow(dead_code)]
 fn hint_for(tool: Tool) -> &'static str {
     match tool {
         Tool::None => "选一个工具再画 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 关闭",
@@ -2223,7 +2234,7 @@ fn hint_for(tool: Tool) -> &'static str {
         Tool::Eraser => "点一下删掉那条标注",
         Tool::Translate => "拖出要翻译的区域 · 只把文字发给 API",
         Tool::Mosaic => "拖出要打码的区域 · Esc 取消",
-        _ => "拖动工具绘制 · Enter/Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消",
+        _ => "拖动绘制 · Enter 复制 · Esc 取消",
     }
 }
 
@@ -2323,7 +2334,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     };
     let _ = dib;
 
-    if !editor.probed {
+    if !editor.probed && editor_debug() {
         editor.probed = true;
         unsafe {
             let mut rect: RECT = std::mem::zeroed();
@@ -2455,7 +2466,7 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
     // 上面是窗口栏、下面是工具栏带子，图片在中间这段里活动
     let title = editor.title_h;
-    let view_h = (view_h - editor.top_margin).max(0);
+    let view_h = (view_h - editor.bottom_strip).max(0);
     if height >= view_h - title {
         editor.image_top = editor.image_top.clamp(view_h - height, title);
     } else {
@@ -2565,6 +2576,11 @@ fn toolbar_width() -> i32 {
     count * item + (count - 1) * gap + groups * (sep_w + gap) + pad * 2
 }
 
+/// 编辑器诊断开关：只有设了 NST_EDITOR_DEBUG 才写日志/做探测
+fn editor_debug() -> bool {
+    std::env::var_os("NST_EDITOR_DEBUG").is_some()
+}
+
 unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     // 每帧重排按钮表（窗口栏那三个 + 工具栏那一排都在这里登记）
     editor.buttons.clear();
@@ -2585,7 +2601,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         left: 0,
         top: 0,
         right: client.right,
-        bottom: (client.bottom - editor.top_margin).max(0),
+        bottom: (client.bottom - editor.bottom_strip).max(0),
     };
     if std::env::var_os("NST_EDITOR_DEBUG").is_some() {
         crate::debug_log(&format!(
@@ -2734,9 +2750,10 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             right: strip_rect.right - s(84.0),
             bottom: editor.title_h,
         };
+        let title = title_text(editor.tool);
         DrawTextW(
             dc,
-            wide("截图").as_ptr(),
+            wide(&title).as_ptr(),
             -1,
             &mut text_rect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
@@ -3064,7 +3081,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
             right: 0,
             bottom: 0,
         },
-        top_margin: s(54.0),
+        bottom_strip: s(54.0),
         probed: false,
         bar: RECT {
             left: 0,
@@ -3882,7 +3899,7 @@ impl Editor {
             beautify: self.beautify,
             title_h: self.title_h,
             title_rect: self.title_rect,
-            top_margin: self.top_margin,
+            bottom_strip: self.bottom_strip,
             probed: true,
             bar: self.bar,
             screen: self.screen,
@@ -4614,7 +4631,8 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let iy = (((point.y - editor.image_top) as f32 / editor.scale) as i32)
                 .clamp(0, editor.base.height);
 
-            crate::debug_log(&format!(
+            if editor_debug() {
+                crate::debug_log(&format!(
                 "editor 点击: point=({}, {}) 图位置=({}, {}) scale={:.3} -> 图坐标=({}, {}) 画布={}x{}",
                 point.x,
                 point.y,
@@ -4626,6 +4644,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 editor.base.width,
                 editor.base.height,
             ));
+            }
             let _ = &mut point;
             match editor.tool {
                 Tool::None => {
@@ -5114,7 +5133,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
             right: 0,
             bottom: 0,
         },
-        top_margin: strip,
+        bottom_strip: strip,
         probed: false,
         bar: RECT {
             left: 0,
