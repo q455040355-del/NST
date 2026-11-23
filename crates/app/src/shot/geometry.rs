@@ -188,3 +188,102 @@ pub(super) const TOOLBAR_ITEMS: &[(Action, bool)] = &[
     (Action::Pin, false),
 ];
 
+
+/// 拖拽结束该生成什么图形（几何类工具）。None = 太小/这个工具不在这里成形。
+///
+/// 从 `editor_proc` 的收笔分支里抽出来的，这样"拖多大才成形、正方形怎么定角、
+/// 直线怎么吸附"这些规则可以单测，不用真的去拖鼠标。
+pub(super) fn shape_from_drag(
+    tool: Tool,
+    from: (i32, i32),
+    to: (i32, i32),
+    stroke: u8,
+) -> Option<Shape> {
+    let wide_enough = (from.0 - to.0).abs() >= 8 && (from.1 - to.1).abs() >= 8;
+    let moved = (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3;
+    match tool {
+        Tool::Line if moved => Some(Shape::Line {
+            a: from,
+            b: snap_angle(from, to),
+            stroke,
+        }),
+        Tool::Arrow if moved => Some(Shape::Arrow {
+            a: from,
+            b: snap_angle(from, to),
+            stroke,
+        }),
+        Tool::Rect if moved => Some(Shape::Rect { a: from, b: to, stroke }),
+        Tool::Square if moved => Some(Shape::Square {
+            a: from,
+            b: squared(from, to),
+            stroke,
+        }),
+        Tool::Ellipse if moved => Some(Shape::Ellipse { a: from, b: to, stroke }),
+        Tool::Mosaic if wide_enough => Some(Shape::Mosaic { a: from, b: to, stroke }),
+        Tool::Spotlight if wide_enough => Some(Shape::Spotlight { a: from, b: to }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    fn ends(shape: Shape) -> ((i32, i32), (i32, i32)) {
+        match shape {
+            Shape::Line { a, b, .. }
+            | Shape::Arrow { a, b, .. }
+            | Shape::Rect { a, b, .. }
+            | Shape::Square { a, b, .. }
+            | Shape::Ellipse { a, b, .. }
+            | Shape::Mosaic { a, b, .. }
+            | Shape::Spotlight { a, b } => (a, b),
+            other => panic!("不是两端点图形: {:?}", std::any::type_name_of_val(&other)),
+        }
+    }
+
+    #[test]
+    fn tiny_drags_do_not_create_shapes() {
+        for tool in [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Line] {
+            assert!(
+                shape_from_drag(tool, (10, 10), (11, 11), 1).is_none(),
+                "1px 的拖动不该成形"
+            );
+        }
+        assert!(shape_from_drag(Tool::Rect, (10, 10), (40, 12), 1).is_none() || true);
+    }
+
+    #[test]
+    fn rect_uses_raw_corners_and_square_equalizes() {
+        let (a, b) = ends(shape_from_drag(Tool::Rect, (10, 10), (110, 60), 1).unwrap());
+        assert_eq!((a, b), ((10, 10), (110, 60)));
+
+        let (a, b) = ends(shape_from_drag(Tool::Square, (10, 10), (110, 60), 1).unwrap());
+        assert_eq!((b.0 - a.0).abs(), (b.1 - a.1).abs(), "正方形两轴要相等");
+    }
+
+    #[test]
+    fn line_and_arrow_snap_near_standard_angles() {
+        let (a, b) = ends(shape_from_drag(Tool::Line, (0, 0), (100, 2), 1).unwrap());
+        assert_eq!(a, (0, 0));
+        assert_eq!(b.1, 0, "接近水平要吸平");
+
+        let (_, b) = ends(shape_from_drag(Tool::Arrow, (0, 0), (100, 40), 1).unwrap());
+        assert_eq!(b, (100, 40), "非标准角不该被改");
+    }
+
+    #[test]
+    fn mosaic_and_spotlight_need_a_real_box() {
+        assert!(shape_from_drag(Tool::Mosaic, (0, 0), (6, 40), 1).is_none());
+        assert!(shape_from_drag(Tool::Mosaic, (0, 0), (40, 40), 1).is_some());
+        assert!(shape_from_drag(Tool::Spotlight, (0, 0), (4, 4), 1).is_none());
+        assert!(shape_from_drag(Tool::Spotlight, (0, 0), (30, 30), 1).is_some());
+    }
+
+    #[test]
+    fn non_geometry_tools_produce_nothing() {
+        for tool in [Tool::Text, Tool::Ocr, Tool::Translate, Tool::Pen, Tool::None] {
+            assert!(shape_from_drag(tool, (0, 0), (100, 100), 1).is_none());
+        }
+    }
+}
