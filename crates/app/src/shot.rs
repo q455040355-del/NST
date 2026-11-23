@@ -1708,6 +1708,84 @@ fn shape_at(editor: &Editor, at: (i32, i32)) -> Option<usize> {
     None
 }
 
+/// 直线/箭头：离 0/45/90/135 度不到 2 度就吸过去
+fn snap_angle(from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
+    let dx = (to.0 - from.0) as f32;
+    let dy = (to.1 - from.1) as f32;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 6.0 {
+        return to;
+    }
+    let angle = dy.atan2(dx).to_degrees();
+    let nearest = (angle / 45.0).round() * 45.0;
+    if (angle - nearest).abs() > 2.0 {
+        return to;
+    }
+    let radians = nearest.to_radians();
+    (
+        from.0 + (length * radians.cos()).round() as i32,
+        from.1 + (length * radians.sin()).round() as i32,
+    )
+}
+
+/// 拖直线/箭头时在终点旁边显示角度（0~180 度，水平是 0）
+fn draw_angle_hint(dc: HDC, from: (i32, i32), to: (i32, i32), scale: f32) {
+    let dx = (to.0 - from.0) as f32;
+    let dy = (to.1 - from.1) as f32;
+    if (dx * dx + dy * dy).sqrt() < 12.0 {
+        return;
+    }
+    let mut angle = dy.atan2(dx).to_degrees();
+    if angle < 0.0 {
+        angle += 180.0;
+    }
+    if angle >= 180.0 {
+        angle -= 180.0;
+    }
+    let text = format!("{:.0}°", angle);
+    let (x, y) = scaled(to, scale);
+    unsafe {
+        let font = cached_font(9.0, 600);
+        let old_font = SelectObject(dc, font as HGDIOBJ);
+        SetBkMode(dc, TRANSPARENT as i32);
+        let width = wide_width(dc, &text) + s(14.0);
+        let height = s(20.0);
+        let pill = RECT {
+            left: x + s(12.0),
+            top: y + s(10.0),
+            right: x + s(12.0) + width,
+            bottom: y + s(10.0) + height,
+        };
+        let brush = CreateSolidBrush(0x00F2_3A3A);
+        let pen = CreatePen(0, 1, 0x00F2_3A3A);
+        let old_brush = SelectObject(dc, brush as HGDIOBJ);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        windows_sys::Win32::Graphics::Gdi::RoundRect(
+            dc,
+            pill.left,
+            pill.top,
+            pill.right,
+            pill.bottom,
+            height,
+            height,
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen as *mut _);
+        DeleteObject(brush as *mut _);
+        SetTextColor(dc, 0x00FF_FFFF);
+        let mut text_rect = pill;
+        DrawTextW(
+            dc,
+            wide(&text).as_ptr(),
+            -1,
+            &mut text_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_font);
+    }
+}
+
 fn draw_line(dc: HDC, a: (i32, i32), b: (i32, i32), width: i32, scale: f32) {
     let (ax, ay) = scaled(a, scale);
     let (bx, by) = scaled(b, scale);
@@ -2455,11 +2533,19 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     let width = stroke_width(editor.scale, editor.stroke);
     if let (Some(from), Some(to)) = (editor.drag_from, editor.drag_to) {
         match editor.tool {
-            Tool::Arrow => draw_arrow(dc, from, to, width, editor.scale),
+            Tool::Arrow => {
+                let to = snap_angle(from, to);
+                draw_arrow(dc, from, to, width, editor.scale);
+                draw_angle_hint(dc, from, to, editor.scale);
+            }
             Tool::Rect => draw_rect(dc, from, to, width, editor.scale),
             Tool::Square => draw_rect(dc, from, squared(from, to), width, editor.scale),
             Tool::Ellipse => draw_ellipse(dc, from, to, width, editor.scale),
-            Tool::Line => draw_line(dc, from, to, width, editor.scale),
+            Tool::Line => {
+                let to = snap_angle(from, to);
+                draw_line(dc, from, to, width, editor.scale);
+                draw_angle_hint(dc, from, to, editor.scale);
+            }
             Tool::Numbered => draw_numbered(dc, to, editor.next_number, editor.scale),
             Tool::Spotlight => draw_spotlight(dc, from, to, editor.scale, editor),
             Tool::Mosaic => {
@@ -4562,14 +4648,14 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     Tool::Line if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
                         editor.push_shape(Shape::Line {
                             a: from,
-                            b: to,
+                            b: snap_angle(from, to),
                             stroke: editor.stroke,
                         })
                     }
                     Tool::Arrow if (from.0 - to.0).abs() >= 3 || (from.1 - to.1).abs() >= 3 => {
                         editor.push_shape(Shape::Arrow {
                             a: from,
-                            b: to,
+                            b: snap_angle(from, to),
                             stroke: editor.stroke,
                         })
                     }
