@@ -194,6 +194,21 @@ fn main() {
             return;
         }
 
+        // 调试用：直接把结果窗按示例内容打开（点按钮、试悬停时用）
+        if std::env::var_os("NST_OCR_DEMO").is_some() {
+            let source = "Latency budget\nThe panel samples the taskbar twice a second.\nIf sampling fails, the last good color is kept for 30 seconds before we retry,\nso the background never flickers between two close shades.";
+            let translated = "延迟预算\n面板每秒采样任务栏两次。\n如果采样失败，会保留上一次成功的颜色 30 秒再重试，\n所以背景不会在两种接近的色值之间来回跳。";
+            ocr_ui::open_translate(std::ptr::null_mut(), source, translated, None);
+        }
+
+        // 调试用：把取字 / 翻译结果窗离屏画成 PNG（改这块布局时做像素比对）
+        if let Some(path) = std::env::var_os("NST_OCR_PREVIEW") {
+            let view = std::env::var("NST_OCR_PREVIEW_VIEW").unwrap_or_else(|_| "lines".into());
+            let ok = ocr_ui::preview_png(&path.to_string_lossy(), &view);
+            crate::debug_log(&format!("ocr preview -> {ok}"));
+            return;
+        }
+
         // 调试用：把用量历史窗离屏画成 PNG（改图表布局时做像素比对）
         if let Some(path) = std::env::var_os("NST_HISTORY_PREVIEW") {
             let ok = history_ui::preview_png(&path.to_string_lossy());
@@ -1224,17 +1239,13 @@ unsafe extern "system" fn wnd_proc(
             let pointer = wparam as *mut translate::TranslateOutcome;
             if !pointer.is_null() {
                 let outcome = Box::from_raw(pointer);
-                let mut text = String::new();
-                if !outcome.source.is_empty() {
-                    text.push_str(&outcome.source);
-                }
-                if !outcome.translated.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\r\n\r\n\r\n");
-                    }
-                    text.push_str(&outcome.translated);
-                }
-                ocr_ui::open(hwnd, &text, outcome.error.as_deref());
+                // 原文和译文分开给：结果窗自己按「逐句 / 整段」排
+                ocr_ui::open_translate(
+                    hwnd,
+                    &outcome.source,
+                    &outcome.translated,
+                    outcome.error.as_deref(),
+                );
             }
             0
         }

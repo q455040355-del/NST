@@ -24,6 +24,7 @@ pub const DT_CENTER: u32 = 0x0001;
 pub const DT_LEFT: u32 = 0x0000;
 pub const DT_RIGHT: u32 = 0x0002;
 pub const DT_VCENTER: u32 = 0x0004;
+pub const DT_WORDBREAK: u32 = 0x0010;
 
 // 窗口配色统一走 theme::ui()（跟随系统明暗）；这里只留非颜色的常量
 pub const IDC_HAND: *const u16 = 32649 as *const u16;
@@ -266,6 +267,37 @@ impl Painter {
             (units.len() - 1) as i32,
             &mut rect,
             align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(self.dc, old);
+    }
+
+    /// 多行文字：按宽度自动折行（逐句 / 整段视图用）
+    pub unsafe fn text_block(
+        &self,
+        text: &str,
+        font: HFONT,
+        color: u32,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) {
+        let old = SelectObject(self.dc, font as HGDIOBJ);
+        SetBkMode(self.dc, 1);
+        SetTextColor(self.dc, color);
+        let mut rect = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let units = wide(text);
+        DrawTextW(
+            self.dc,
+            units.as_ptr(),
+            (units.len() - 1) as i32,
+            &mut rect,
+            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
         );
         SelectObject(self.dc, old);
     }
