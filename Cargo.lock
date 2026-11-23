@@ -392,10 +392,11 @@ dependencies = [
 
 [[package]]
 name = "netspeed-app"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "image",
  "netspeed-core",
+ "serde_json",
  "simd-paddle-ocr-rs",
  "windows",
  "windows-sys",
@@ -403,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "netspeed-core"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "rusqlite",
  "ruzstd",
