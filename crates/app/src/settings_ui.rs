@@ -37,10 +37,15 @@ const WM_APP_PICK: u32 = WM_APP + 0x31;
 const DT_NOPREFIX: u32 = 0x0800;
 
 
+#[allow(dead_code)]
 const ID_WIDTH_LABEL: usize = 2001;
+#[allow(dead_code)]
 const ID_GAUGE_LABEL: usize = 2004;
+#[allow(dead_code)]
 const ID_INTERFACE_LABEL: usize = 2007;
+#[allow(dead_code)]
 const ID_REFRESH_LABEL: usize = 2009;
+#[allow(dead_code)]
 const ID_FONT_LABEL: usize = 2011;
 
 /// 面板字号（显示文案, 百分比）
@@ -696,15 +701,14 @@ fn text_of_row(state: &State, row: usize) -> String {
     }
 }
 
-fn row_label(row: usize) -> &'static str {
-    match row {
-        ID_FONT_LABEL => "字号",
-        ID_WIDTH_LABEL => "面板宽度",
-        ID_GAUGE_LABEL => "底部指示条",
-        ID_INTERFACE_LABEL => "网卡",
-        _ => "刷新间隔",
-    }
+/// 每一行的标题。加/改设置先动这张表，绘制按行号查它。
+const ROW_TITLES: [&str; ROW_COUNT] = ["字号", "面板宽度", "底部指示条", "网卡", "刷新间隔"];
+
+/// 某一行的标题（按行号查表，越界返回空串而不是 panic）
+fn row_title(row: usize) -> &'static str {
+    ROW_TITLES.get(row).copied().unwrap_or("")
 }
+
 
 // ---------------------------------------------------------------- 绘画
 
@@ -815,13 +819,7 @@ unsafe fn paint(hwnd: HWND) {
         let bottom = p.s(ROW_FIRST + ROW_STEP * (row + 1) as f32);
         let center = (top + bottom) / 2 - p.s(6.0);
 
-        let label = match row {
-            0 => row_label(ID_FONT_LABEL),
-            1 => row_label(ID_WIDTH_LABEL),
-            2 => row_label(ID_GAUGE_LABEL),
-            3 => row_label(ID_INTERFACE_LABEL),
-            _ => row_label(ID_REFRESH_LABEL),
-        };
+        let label = row_title(row);
         p.text(
             label,
             state.fonts.label,
