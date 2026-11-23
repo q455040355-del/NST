@@ -1331,6 +1331,8 @@ struct Editor {
     beautify: bool,
     /// 顶部窗口栏高度（拖窗口用）
     title_h: i32,
+    /// 顶部窗口栏的实际矩形（宽度跟图片一致）
+    title_rect: RECT,
     /// 图片下方的带子高度（工具栏浮在这条带子里）
     top_margin: i32,
     /// 诊断用：只探测一次窗口顶部压着什么
@@ -2345,7 +2347,7 @@ unsafe fn editor_paint(hwnd: HWND) {
     // 只保留「图片」和「工具栏」两块区域，其余裁掉 —— 于是图片上方那条带子
     // 既不显示底色、也不吃点击，看起来就是一条浮在桌面上的工具栏。
     // 先关掉：区域和图片位置一错位，整块编辑区就变成「点不到」，比留白更难受。
-    if false {
+    {
         let image_top = editor.image_top;
         let image_bottom =
             image_top + (editor.base.height as f32 * editor.scale).round() as i32;
@@ -2358,6 +2360,21 @@ unsafe fn editor_paint(hwnd: HWND) {
             image_right.min(client.right),
             image_bottom.min(client.bottom),
         );
+        // 窗口栏 + 工具栏：这两块也要留着
+        let title = editor.title_rect;
+        let title_rgn = windows_sys::Win32::Graphics::Gdi::CreateRectRgn(
+            title.left,
+            title.top,
+            title.right,
+            title.bottom,
+        );
+        windows_sys::Win32::Graphics::Gdi::CombineRgn(
+            image,
+            image,
+            title_rgn,
+            windows_sys::Win32::Graphics::Gdi::RGN_OR,
+        );
+        windows_sys::Win32::Graphics::Gdi::DeleteObject(title_rgn as *mut _);
         let bar = editor.bar;
         let bar_rgn = windows_sys::Win32::Graphics::Gdi::CreateRoundRectRgn(
             bar.left - s(6.0),
@@ -2590,29 +2607,37 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     // 顶部窗口栏：一条浅色条 + 底线，拖它移动窗口
     {
         let ui = crate::theme::ui();
-        let brush = CreateSolidBrush(ui.surface);
+        // 窗口栏宽度跟图片一致（图很窄时至少放得下三个按钮）
+        let image_w = (editor.base.width as f32 * editor.scale) as i32;
+        let bar_w = image_w.max(s(96.0));
+        let bar_left = ((client.right - bar_w) / 2).max(0);
         let strip_rect = RECT {
-            left: 0,
+            left: bar_left,
             top: 0,
-            right: client.right,
+            right: bar_left + bar_w,
             bottom: editor.title_h,
         };
-        FillRect(dc, &strip_rect, brush);
-        DeleteObject(brush as *mut _);
-        let pen = CreatePen(0, 1, ui.border);
-        let old = SelectObject(dc, pen as HGDIOBJ);
-        MoveToEx(dc, 0, editor.title_h - 1, std::ptr::null_mut());
-        LineTo(dc, client.right, editor.title_h - 1);
-        SelectObject(dc, old);
-        DeleteObject(pen as *mut _);
+        {
+            let brush = CreateSolidBrush(ui.surface);
+            FillRect(dc, &strip_rect, brush);
+            DeleteObject(brush as *mut _);
+            let pen = CreatePen(0, 1, ui.border);
+            let old = SelectObject(dc, pen as HGDIOBJ);
+            MoveToEx(dc, strip_rect.left, editor.title_h - 1, std::ptr::null_mut());
+            LineTo(dc, strip_rect.right, editor.title_h - 1);
+            SelectObject(dc, old);
+            DeleteObject(pen as *mut _);
+        }
+        editor.title_rect = strip_rect;
+
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, ui.text2);
         let font = cached_font(9.0, 600);
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let mut text_rect = RECT {
-            left: s(12.0),
+            left: strip_rect.left + s(10.0),
             top: 0,
-            right: client.right - s(12.0),
+            right: strip_rect.right - s(84.0),
             bottom: editor.title_h,
         };
         DrawTextW(
@@ -2623,6 +2648,21 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
         );
         SelectObject(dc, old_font);
+
+        // 右上角三个按钮：最小化 / 关闭 / 完成
+        let btn = s(24.0);
+        let mut bx = strip_rect.right - s(6.0) - btn * 3 - s(4.0) * 2;
+        for action in [Action::Minimize, Action::Close, Action::Done] {
+            let rect = RECT {
+                left: bx,
+                top: (editor.title_h - btn) / 2,
+                right: bx + btn,
+                bottom: (editor.title_h - btn) / 2 + btn,
+            };
+            draw_action_icon(dc, action, rect, ui.text2, editor.stroke);
+            editor.buttons.push((rect, action));
+            bx += btn + s(4.0);
+        }
     }
 
     // 图片四周一圈极淡的描边：让「图」和窗口底色分开，知道边界在哪。
@@ -2687,9 +2727,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         (Action::Copy, false),
         (Action::Save, false),
         (Action::Pin, false),
-        (Action::Minimize, true),
-        (Action::Close, false),
-        (Action::Done, false),
     ];
 
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
@@ -2947,6 +2984,12 @@ pub unsafe fn preview_png(path: &str) -> bool {
         next_number: 1,
         beautify: false,
         title_h: 0,
+        title_rect: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
         top_margin: 0,
         probed: false,
         bar: RECT {
@@ -3764,6 +3807,7 @@ impl Editor {
             next_number: self.next_number,
             beautify: self.beautify,
             title_h: self.title_h,
+            title_rect: self.title_rect,
             top_margin: self.top_margin,
             probed: true,
             bar: self.bar,
@@ -4290,7 +4334,10 @@ unsafe fn editor_command(hwnd: HWND, action: Action) {
 unsafe fn hit_button(editor: &Editor, point: POINT) -> Option<Action> {
     // 不在底栏那一条里就不可能是点按钮：直接放行给画布
     let bar = editor.bar;
-    if point.y < bar.top || point.y > bar.bottom {
+    let title = editor.title_rect;
+    let in_bar = point.y >= bar.top && point.y <= bar.bottom;
+    let in_title = point.y >= title.top && point.y <= title.bottom;
+    if !in_bar && !in_title {
         return None;
     }
     for (rect, action) in &editor.buttons {
@@ -4986,6 +5033,12 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         next_number: 1,
         beautify: false,
         title_h: s(30.0),
+        title_rect: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
         top_margin: strip,
         probed: false,
         bar: RECT {
