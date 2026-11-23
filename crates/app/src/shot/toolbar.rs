@@ -20,7 +20,13 @@ pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) ->
 
     // bool = 这一格前面要不要画一条分组竖线
 
-    let layout_items = TOOLBAR_ITEMS;
+    // 没配置翻译 Key 时不显示「翻译」按钮
+    let layout_items: Vec<(Action, bool)> = TOOLBAR_ITEMS
+        .iter()
+        .copied()
+        .filter(|(action, _)| !matches!(action, Action::Tool(Tool::Translate)) || translate_enabled())
+        .collect();
+    let layout_items = layout_items.as_slice();
     let groups = layout_items.iter().filter(|(_, sep)| *sep).count() as i32;
     let measure = |item: i32, gap: i32, sep_w: i32| -> i32 {
         layout_items.len() as i32 * item

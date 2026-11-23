@@ -14,7 +14,6 @@ mod menu;
 mod ocr;
 mod ocr_ui;
 mod translate;
-mod translate_settings;
 mod panel;
 mod settings_ui;
 mod scroll;
@@ -134,7 +133,6 @@ const ID_PANEL_HIDE: usize = 1200;
 const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
 const ID_OCR: usize = 1303;
-const ID_TRANSLATE_SETTINGS: usize = 1305;
 const ID_GIF: usize = 1304;
 const ID_QUIT: usize = 1099;
 
@@ -309,6 +307,7 @@ fn main() {
 
         // 全局热键按设置注册（截图 / 取字都有开关，关掉的不占组合键）
         shot::set_ocr_enabled(settings.ocr_enabled);
+        shot::set_translate_enabled(!settings.translate_key.trim().is_empty());
         register_hotkeys(hwnd);
 
         // 调试/快捷入口：netspeed.exe --settings 直接打开设置窗口
@@ -1396,7 +1395,9 @@ fn show_menu(hwnd: HWND) {
     }
     rows.push(menu::Entry::radio(ID_GAUGE_NONE, "关闭", gauge == "none"));
     rows.push(menu::Entry::separator());
-    rows.push(menu::Entry::item(ID_HISTORY, "Token 用量历史…"));
+    if ai {
+        rows.push(menu::Entry::item(ID_HISTORY, "Token 用量历史…"));
+    }
     rows.push(menu::Entry::item(ID_SETTINGS, "设置…"));
     rows.push(menu::Entry::separator());
     if panel.settings.shot_enabled {
@@ -1409,9 +1410,7 @@ fn show_menu(hwnd: HWND) {
             panel.settings.ocr_hotkey.clone(),
         ));
     }
-    if panel.settings.shot_enabled {
-        rows.push(menu::Entry::item(ID_TRANSLATE_SETTINGS, "翻译设置…"));
-    }
+
     if panel.settings.gif_enabled {
         rows.push(menu::Entry::hotkey(
             ID_GIF,
@@ -1455,9 +1454,6 @@ fn handle_command(hwnd: HWND, command: usize) {
             }
             ID_OCR => {
                 shot::request_ocr(hwnd);
-            }
-            ID_TRANSLATE_SETTINGS => {
-                translate_settings::open(hwnd);
             }
             ID_GIF => {
                 if gifrec::is_recording() {
@@ -1588,6 +1584,7 @@ pub(crate) fn apply_translate_settings(
         panel.settings.translate_model = model.to_string();
         panel.settings.translate_base = base.to_string();
         panel.settings.save();
+        crate::shot::set_translate_enabled(!key.trim().is_empty());
     }
 }
 

@@ -75,6 +75,16 @@ use crate::WM_APP_SHOT_FIRE;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 设置里的取字（OCR）开关：关掉后截图工具栏不出现 OCR，热键也不会触发
 static OCR_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 设置里填了翻译 Key 之后，工具栏才出现「翻译」
+static TRANSLATE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_translate_enabled(enabled: bool) {
+    TRANSLATE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn translate_enabled() -> bool {
+    TRANSLATE_ENABLED.load(Ordering::Relaxed)
+}
 
 pub fn set_ocr_enabled(enabled: bool) {
     OCR_ENABLED.store(enabled, Ordering::Relaxed);
