@@ -49,6 +49,12 @@ if (-not (Test-Path $source)) { throw "build output missing: $source" }
 if (Test-Path $target) { Copy-Item $target $backup -Force }
 Copy-Item $source $target -Force
 
+# 图标素材包跟着一起部署（程序会从 exe 同目录读 icons.png）
+$iconsSource = Join-Path (Split-Path -Parent $PSScriptRoot) "icons.png"
+if (Test-Path $iconsSource) {
+    Copy-Item $iconsSource (Join-Path (Split-Path -Parent $target) "icons.png") -Force
+}
+
 $expected = (Get-FileHash $source -Algorithm MD5).Hash
 $actual = (Get-FileHash $target -Algorithm MD5).Hash
 if ($expected -ne $actual) {

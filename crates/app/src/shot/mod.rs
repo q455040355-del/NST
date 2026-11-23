@@ -2408,13 +2408,13 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
 // exe 同目录下有 icons.png 时，优先用里面抠好的微信图标（蒙版 + 着色），
 // 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
 
-const PACK_CELL: u32 = 176;
-/// 16 枚来自设计稿 + 贴图/置顶 + 正方形画框
-const PACK_COUNT: usize = 19;
+const PACK_CELL: i32 = 96;
+/// 27 格：工具栏 24 个 + 最小化 / 关闭 / 完成
+const PACK_COUNT: usize = 27;
 
 struct IconPack {
-    /// 每格 PACK_CELL×PACK_CELL 的灰度蒙版（0=透明，255=实心）
-    masks: Vec<Vec<u8>>,
+    /// 每格 PACK_CELL×PACK_CELL 的 RGBA 像素（彩色，直通 alpha）
+    cells: Vec<Vec<u8>>,
 }
 
 static PACK: std::sync::OnceLock<Option<IconPack>> = std::sync::OnceLock::new();
@@ -2438,79 +2438,84 @@ fn load_icon_pack() -> Option<IconPack> {
         path.pop();
         path.push("icons.png");
         let bytes = std::fs::read(&path).ok()?;
-        let img = image::load_from_memory(&bytes).ok()?.to_luma8();
-        let (w, h) = img.dimensions();
-        if h != PACK_CELL || w < PACK_CELL * PACK_COUNT as u32 {
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (width, height) = img.dimensions();
+        if height != PACK_CELL as u32 || width < PACK_CELL as u32 * PACK_COUNT as u32 {
             return None;
         }
-        let mut masks = Vec::with_capacity(PACK_COUNT);
-        for i in 0..PACK_COUNT {
-            let mut cell = Vec::with_capacity((PACK_CELL * PACK_CELL) as usize);
-            for y in 0..PACK_CELL {
-                for x in 0..PACK_CELL {
-                    cell.push(img.get_pixel(i as u32 * PACK_CELL + x, y).0[0]);
+        let mut cells = Vec::with_capacity(PACK_COUNT);
+        for index in 0..PACK_COUNT {
+            let mut cell = Vec::with_capacity((PACK_CELL * PACK_CELL * 4) as usize);
+            for y in 0..PACK_CELL as u32 {
+                for x in 0..PACK_CELL as u32 {
+                    let pixel = img.get_pixel(index as u32 * PACK_CELL as u32 + x, y).0;
+                    cell.extend_from_slice(&pixel);
                 }
             }
-            // 微信原图里撤销是浅灰的，蒙版直接当透明度会发飘：每格按最黑那点归一化，
-            // 这样所有图标看起来一样实
-            if let Some(max) = cell.iter().copied().max() {
-                if max > 40 && max < 235 {
-                    let gain = 255.0 / max as f32;
-                    for value in cell.iter_mut() {
-                        *value = ((*value as f32) * gain).min(255.0) as u8;
-                    }
-                }
-            }
-            masks.push(cell);
+            cells.push(cell);
         }
-        crate::debug_log("editor: 图标用 icons.png（微信那套）");
-        Some(IconPack { masks })
+        crate::debug_log("editor: 图标用 icons.png（彩色素材包）");
+        Some(IconPack { cells })
     }
 }
 
-/// 动作 → 素材包里的第几格（顺序照设计稿 01..16，见 target/make_design_sheet.py）
+/// 动作 → 素材包里的第几格（顺序 = 工具栏顺序 + 窗口栏三个，见 .scratch/pack_extract2.py）
 fn pack_index(action: Action) -> Option<usize> {
     Some(match action {
         Action::Tool(Tool::Rect) => 0,
-        Action::Tool(Tool::Square) => 18,
-        Action::Tool(Tool::Ellipse) => 1,
-        Action::Tool(Tool::Arrow) => 3,
-        Action::Tool(Tool::Pen) => 4,
-        Action::Tool(Tool::Mosaic) => 5,
-        Action::Tool(Tool::Text) => 6,
-        Action::Tool(Tool::Ocr) => 8,
-        Action::Scroll => 9,
-        Action::Undo => 10,
-        Action::Save => 11,
-        // 贴图用设计稿的 13 号图钉；17 号是按设计稿画法补的「窗口+上箭头」给置顶用
-        Action::Pin => 12,
-        Action::Topmost => 17,
-        Action::Close => 14,
-        Action::Done => 15,
+        Action::Tool(Tool::Square) => 1,
+        Action::Tool(Tool::Ellipse) => 2,
+        Action::Tool(Tool::Line) => 3,
+        Action::Tool(Tool::Arrow) => 4,
+        Action::Tool(Tool::Pen) => 5,
+        Action::Tool(Tool::Marker) => 6,
+        Action::Tool(Tool::Spotlight) => 7,
+        Action::Tool(Tool::Numbered) => 8,
+        Action::Tool(Tool::Mosaic) => 9,
+        Action::Tool(Tool::Eraser) => 10,
+        Action::Tool(Tool::Text) => 11,
+        Action::Tool(Tool::Ocr) => 12,
+        Action::Tool(Tool::Translate) => 13,
+        Action::Scroll => 14,
+        Action::Rotate => 15,
+        Action::Beautify => 16,
+        Action::Stroke => 17,
+        Action::Undo => 18,
+        Action::Redo => 19,
+        Action::Topmost => 20,
+        Action::Copy => 21,
+        Action::Save => 22,
+        Action::Pin => 23,
+        Action::Minimize => 24,
+        Action::Close => 25,
+        Action::Done => 26,
         _ => return None,
     })
 }
 
 thread_local! {
-    /// 着色后的图标位图缓存：key = (格子, 颜色, 宽, 高)
-    static TINTED: RefCell<HashMap<(usize, u32, i32, i32), (HDC, HBITMAP)>> =
+    /// 缩放/着色后的图标位图缓存：key = (格子, 颜色, 宽, 高, 是否彩色)
+    static TINTED: RefCell<HashMap<(usize, u32, i32, i32, bool), (HDC, HBITMAP)>> =
         RefCell::new(HashMap::new());
 }
 
-/// 用素材包画一个图标：盒采样到目标尺寸 → 按颜色预乘 → AlphaBlend
-unsafe fn draw_pack_icon(dc: HDC, index: usize, rect: RECT, color: u32) {
+/// 用素材包画一个图标：盒采样到目标尺寸 → 预乘 → AlphaBlend。
+///
+/// `colored = true` 时保留素材本身的颜色（规范里的彩色图标）；
+/// 否则用 `color` 当作纯色（选中 / 悬停时的反白图标）。
+unsafe fn draw_pack_icon(dc: HDC, index: usize, rect: RECT, color: u32, colored: bool) {
     let Some(pack) = icon_pack() else {
         return;
     };
     let width = (rect.right - rect.left).max(1);
     let height = (rect.bottom - rect.top).max(1);
-    let key = (index, color, width, height);
+    let key = (index, if colored { 0 } else { color }, width, height, colored);
 
     let cached = TINTED.with(|cell| cell.borrow().get(&key).copied());
     let source = match cached {
         Some(handle) => handle,
         None => {
-            let mask = &pack.masks[index];
+            let cell = &pack.cells[index];
             let (mem, dib, bits) = make_dib(width, height);
             if mem.is_null() || dib.is_null() || bits.is_null() {
                 if !dib.is_null() {
@@ -2528,88 +2533,89 @@ unsafe fn draw_pack_icon(dc: HDC, index: usize, rect: RECT, color: u32) {
                 ((color >> 16) & 0xFF) as u32,
             );
             for y in 0..height {
-                // 目标一行对应源图的哪几行
                 let sy0 = (y as f32 * PACK_CELL as f32 / height as f32) as i32;
                 let sy1 = (((y + 1) as f32 * PACK_CELL as f32 / height as f32).ceil() as i32)
                     .max(sy0 + 1)
-                    .min(PACK_CELL as i32);
+                    .min(PACK_CELL);
                 for x in 0..width {
                     let sx0 = (x as f32 * PACK_CELL as f32 / width as f32) as i32;
                     let sx1 = (((x + 1) as f32 * PACK_CELL as f32 / width as f32).ceil() as i32)
                         .max(sx0 + 1)
-                        .min(PACK_CELL as i32);
-                    // 盒采样：这个目标像素覆盖的源像素取平均
-                    let mut sum = 0u32;
+                        .min(PACK_CELL);
+                    // 盒采样：目标像素覆盖的源像素取平均（彩色时 RGB 和 alpha 都平均）
+                    let mut sum_r = 0u32;
+                    let mut sum_g = 0u32;
+                    let mut sum_b = 0u32;
+                    let mut sum_a = 0u32;
                     let mut count = 0u32;
                     for sy in sy0..sy1 {
                         for sx in sx0..sx1 {
-                            sum += mask[(sy * PACK_CELL as i32 + sx) as usize] as u32;
+                            let offset = ((sy * PACK_CELL + sx) * 4) as usize;
+                            let alpha = cell[offset + 3] as u32;
+                            // 这里存的是"直通色"，最后统一预乘一次（预乘两次会发黑）
+                            sum_r += cell[offset] as u32;
+                            sum_g += cell[offset + 1] as u32;
+                            sum_b += cell[offset + 2] as u32;
+                            sum_a += alpha;
                             count += 1;
                         }
                     }
-                    let alpha = if count > 0 { (sum / count) as u8 } else { 0 };
                     let offset = ((y * width + x) * 4) as usize;
-                    if alpha == 0 {
+                    if count == 0 || sum_a == 0 {
                         *bits.add(offset) = 0;
                         *bits.add(offset + 1) = 0;
                         *bits.add(offset + 2) = 0;
                         *bits.add(offset + 3) = 0;
+                        continue;
+                    }
+                    let alpha = (sum_a / count) as u8;
+                    let a = alpha as u32;
+                    if colored {
+                        let r = sum_r / count * a / 255;
+                        let g = sum_g / count * a / 255;
+                        let b = sum_b / count * a / 255;
+                        *bits.add(offset) = b.min(255) as u8;
+                        *bits.add(offset + 1) = g.min(255) as u8;
+                        *bits.add(offset + 2) = r.min(255) as u8;
                     } else {
-                        let a = alpha as u32;
-                        // AlphaBlend 要预乘
                         *bits.add(offset) = (blue * a / 255) as u8;
                         *bits.add(offset + 1) = (green * a / 255) as u8;
                         *bits.add(offset + 2) = (red * a / 255) as u8;
-                        *bits.add(offset + 3) = alpha;
                     }
+                    *bits.add(offset + 3) = alpha;
                 }
             }
-            TINTED.with(|cell| cell.borrow_mut().insert(key, (mem, dib)));
+            TINTED.with(|cache| cache.borrow_mut().insert(key, (mem, dib)));
             (mem, dib)
         }
     };
 
     let blend = BLENDFUNCTION {
-        BlendOp: 0, // AC_SRC_OVER
+        BlendOp: 0,
         BlendFlags: 0,
         SourceConstantAlpha: 255,
-        AlphaFormat: 1, // AC_SRC_ALPHA
+        AlphaFormat: 1,
     };
-    AlphaBlend(
-        dc,
-        rect.left,
-        rect.top,
-        width,
-        height,
-        source.0,
-        0,
-        0,
-        width,
-        height,
-        blend,
-    );
+    let old = SelectObject(source.0, source.1 as HGDIOBJ);
+    AlphaBlend(dc, rect.left, rect.top, width, height, source.0, 0, 0, width, height, blend);
+    SelectObject(source.0, old);
 }
 
-/// 工具栏按钮的图标：照微信那套画法——**细描边、不填充、该包框的包框**
-/// 工具栏彩色图标的配色（按《截图与标注工具彩色图标设计规范》）
-///
-/// 六组语义色：基础图形/标注=科技蓝，涂鸦/高亮/聚焦=活力琥珀，
-/// 智能识别/图像效果=灵感紫，历史/图层/操作=青碧，保存/确认=翠绿，关闭/擦除=朱红。
-/// 返回值是 0x00BBGGRR（GDI 的 COLORREF）。
+/// 没有素材包时的兜底配色（规范六组语义色，0x00BBGGRR）
 fn icon_color(action: Action) -> (u32, u32) {
-    const BLUE: u32 = 0x00EB6225; // #2562EB
-    const BLUE_FILL: u32 = 0x00FBD4BF; // 浅蓝
-    const AMBER: u32 = 0x000577D9; // #D97705
-    const AMBER_FILL: u32 = 0x00AAD6FE; // 浅琥珀
-    const PURPLE: u32 = 0x00EC3A7C; // #7C3AEC
-    const PURPLE_FILL: u32 = 0x00FADBEF; // 浅紫
-    const TEAL: u32 = 0x0087940D; // #0D9487
-    const TEAL_FILL: u32 = 0x00E0E6B8; // 浅青
-    const GREEN: u32 = 0x004AA216; // #16A24A
-    const GREEN_FILL: u32 = 0x00C8E9BB; // 浅绿
-    const RED: u32 = 0x00481CE1; // #E11C48
-    const RED_FILL: u32 = 0x00C5D2F8; // 浅朱红
-    const ORANGE: u32 = 0x000C58E9; // #E9580C（画笔）
+    const BLUE: u32 = 0x00EB6225;
+    const BLUE_FILL: u32 = 0x00FBD4BF;
+    const AMBER: u32 = 0x000577D9;
+    const AMBER_FILL: u32 = 0x00AAD6FE;
+    const PURPLE: u32 = 0x00EC3A7C;
+    const PURPLE_FILL: u32 = 0x00FADBEF;
+    const TEAL: u32 = 0x0087940D;
+    const TEAL_FILL: u32 = 0x00E0E6B8;
+    const GREEN: u32 = 0x004AA216;
+    const GREEN_FILL: u32 = 0x00C8E9BB;
+    const RED: u32 = 0x00481CE1;
+    const RED_FILL: u32 = 0x00C5D2F8;
+    const ORANGE: u32 = 0x000C58E9;
 
     match action {
         Action::Tool(Tool::Rect)
@@ -2620,9 +2626,9 @@ fn icon_color(action: Action) -> (u32, u32) {
         | Action::Tool(Tool::Numbered)
         | Action::Tool(Tool::Text)
         | Action::Stroke => (BLUE, BLUE_FILL),
-        Action::Tool(Tool::Marker)
-        | Action::Tool(Tool::Spotlight)
-        | Action::Pin => (AMBER, AMBER_FILL),
+        Action::Tool(Tool::Marker) | Action::Tool(Tool::Spotlight) | Action::Pin => {
+            (AMBER, AMBER_FILL)
+        }
         Action::Tool(Tool::Pen) => (ORANGE, AMBER_FILL),
         Action::Tool(Tool::Ocr)
         | Action::Tool(Tool::Translate)
@@ -2650,7 +2656,7 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8,
                 right: rect.right - inset,
                 bottom: rect.bottom - inset,
             };
-            unsafe { draw_pack_icon(dc, index, target, color) };
+            unsafe { draw_pack_icon(dc, index, target, color, colored) };
             return;
         }
     }
