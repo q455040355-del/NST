@@ -2997,6 +2997,58 @@ fn toggle_source(state: &mut State, index: usize) {
     crate::apply_ai_sources(state.parent, state.ai_sources);
 }
 
+/// 读剪贴板里的文字（CF_UNICODETEXT）
+fn clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        let mut text = None;
+        if !handle.is_null() {
+            let pointer = GlobalLock(handle as *mut _) as *const u16;
+            if !pointer.is_null() {
+                let mut length = 0usize;
+                while *pointer.add(length) != 0 {
+                    length += 1;
+                }
+                text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                    pointer, length,
+                )));
+                GlobalUnlock(handle as *mut _);
+            }
+        }
+        CloseClipboard();
+        text
+    }
+}
+
+/// 把一段文字插到光标的当前位置（换行/制表符会被丢掉，key 里不可能有这些）
+fn insert_at_caret(state: &mut State, field: TrField, text: &str) {
+    let clean: String = text
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\t')
+        .collect();
+    let buffer = match field {
+        TrField::Key => &mut state.tr_key,
+        TrField::Model => &mut state.tr_model,
+        TrField::Base => &mut state.tr_base,
+    };
+    let mut chars: Vec<char> = buffer.chars().collect();
+    let caret = state.tr_caret.min(chars.len());
+    let mut added = 0usize;
+    for ch in clean.chars() {
+        chars.insert(caret + added, ch);
+        added += 1;
+    }
+    *buffer = chars.into_iter().collect();
+    state.tr_caret = caret + added;
+    state.models_error = None;
+}
+
 /// 去服务商拉模型列表（后台线程），回来再弹选择框
 fn start_model_fetch(state: &mut State) {
     if state.models_busy {
@@ -3759,6 +3811,24 @@ unsafe extern "system" fn dialog_proc(
                 };
                 let count = buffer.chars().count();
                 let caret = state.tr_caret.min(count);
+                let ctrl = unsafe { GetKeyState(0x11) } < 0;
+                let shift = unsafe { GetKeyState(0x10) } < 0;
+                // 粘贴：Ctrl+V，或者 Shift+Insert（老的输入习惯也认）
+                if (ctrl && (wparam as u32) == 0x56) || (shift && (wparam as u32) == 0x2D) {
+                    if let Some(text) = clipboard_text() {
+                        insert_at_caret(state, field, &text);
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                // 复制：Ctrl+C 把整格内容拷走（Key 打码时也能拷到真值）
+                if ctrl && (wparam as u32) == 0x43 {
+                    let text = buffer.clone();
+                    if !text.is_empty() {
+                        crate::ocr::copy_text(&text);
+                    }
+                    return 0;
+                }
                 match wparam as u32 {
                     0x08 => {
                         // 退格
