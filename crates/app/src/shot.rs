@@ -1329,7 +1329,9 @@ struct Editor {
     next_number: i32,
     /// 美化：导出时加留白、背景和圆角
     beautify: bool,
-    /// 图片上方的透明带高度（工具栏浮在这条带子里）
+    /// 顶部窗口栏高度（拖窗口用）
+    title_h: i32,
+    /// 图片下方的带子高度（工具栏浮在这条带子里）
     top_margin: i32,
     /// 诊断用：只探测一次窗口顶部压着什么
     probed: bool,
@@ -2407,12 +2409,13 @@ fn clamp_image(editor: &mut Editor, client: RECT) {
     // 图片始终贴顶：垂直居中会留一条空白带，点上去会被当成「在图片外」而没反应。
     // 注意 clamp 的 min 必须 <= max：图比显示区矮的时候 view_h - height 是正数，
     // 直接 clamp(正数, 0) 会 panic（之前就是这个把整个绘制打断的）。
-    // 带子在底部：图片贴顶，只有比显示区高时才允许往上滚
+    // 上面是窗口栏、下面是工具栏带子，图片在中间这段里活动
+    let title = editor.title_h;
     let view_h = (view_h - editor.top_margin).max(0);
-    if height >= view_h {
-        editor.image_top = editor.image_top.clamp(view_h - height, 0);
+    if height >= view_h - title {
+        editor.image_top = editor.image_top.clamp(view_h - height, title);
     } else {
-        editor.image_top = 0;
+        editor.image_top = title;
     }
 }
 
@@ -2583,6 +2586,44 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
 
     SetViewportOrgEx(dc, old_origin.x, old_origin.y, std::ptr::null_mut());
+
+    // 顶部窗口栏：一条浅色条 + 底线，拖它移动窗口
+    {
+        let ui = crate::theme::ui();
+        let brush = CreateSolidBrush(ui.surface);
+        let strip_rect = RECT {
+            left: 0,
+            top: 0,
+            right: client.right,
+            bottom: editor.title_h,
+        };
+        FillRect(dc, &strip_rect, brush);
+        DeleteObject(brush as *mut _);
+        let pen = CreatePen(0, 1, ui.border);
+        let old = SelectObject(dc, pen as HGDIOBJ);
+        MoveToEx(dc, 0, editor.title_h - 1, std::ptr::null_mut());
+        LineTo(dc, client.right, editor.title_h - 1);
+        SelectObject(dc, old);
+        DeleteObject(pen as *mut _);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, ui.text2);
+        let font = cached_font(9.0, 600);
+        let old_font = SelectObject(dc, font as HGDIOBJ);
+        let mut text_rect = RECT {
+            left: s(12.0),
+            top: 0,
+            right: client.right - s(12.0),
+            bottom: editor.title_h,
+        };
+        DrawTextW(
+            dc,
+            wide("截图").as_ptr(),
+            -1,
+            &mut text_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        SelectObject(dc, old_font);
+    }
 
     // 图片四周一圈极淡的描边：让「图」和窗口底色分开，知道边界在哪。
     // 画在图片边界「里面」并夹进客户区：图片贴着窗口左边/上边时，画外面会被裁掉，
@@ -2905,6 +2946,7 @@ pub unsafe fn preview_png(path: &str) -> bool {
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        title_h: 0,
         top_margin: 0,
         probed: false,
         bar: RECT {
@@ -3721,6 +3763,7 @@ impl Editor {
             undone: Vec::new(),
             next_number: self.next_number,
             beautify: self.beautify,
+            title_h: self.title_h,
             top_margin: self.top_margin,
             probed: true,
             bar: self.bar,
@@ -4425,6 +4468,12 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 return 0;
             }
 
+            if point.y < (*editor).title_h {
+                // 顶部窗口栏：直接交给系统拖动
+                ReleaseCapture();
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
+                return 0;
+            }
             if let Some(action) = hit_button(&*editor, point) {
                 // 先记下「按着」，松开鼠标才执行 —— 按下有反馈，滑出去松开就不算点击
                 let editor = &mut *editor;
@@ -4533,25 +4582,6 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 GetClientRect(hwnd, &mut client);
                 let dx = cursor_point.x - start_x;
                 let dy = cursor_point.y - start_y;
-                let image_w = (editor.base.width as f32 * editor.scale) as i32;
-                let image_h = (editor.base.height as f32 * editor.scale) as i32;
-                let fits = image_w <= client.right && image_h <= client.bottom;
-                if fits {
-                    // 图整张都在窗口里：拖动的应该是「窗口」本身（没有标题栏，就靠这个挪）
-                    let mut rect: RECT = std::mem::zeroed();
-                    GetWindowRect(hwnd, &mut rect);
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        rect.left + dx,
-                        rect.top + dy,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                    editor.pan = Some(((cursor_point.x, cursor_point.y), (left, top)));
-                    return 0;
-                }
                 editor.image_left = left + dx;
                 editor.image_top = top + dy;
                 clamp_image(editor, client);
@@ -4916,11 +4946,12 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
 
     // 图片上方留一条带子放工具栏；这条带子会被窗口区域裁掉，看起来是透明的
     let strip = s(54.0);
+    let title = s(30.0);
     let client_w = image_w.max(toolbar_width()).max(s(240.0));
-    let client_h = (strip + image_h).max(s(120.0));
+    let client_h = (title + image_h + strip).max(s(120.0));
 
     let image_left = (client_w - image_w) / 2;
-    let mut image_top = 0;
+    let mut image_top = title;
     let mut window_x = rect.0 - image_left;
     let mut window_y = rect.1;
     if !fits_in_place(scale) {
@@ -4954,6 +4985,7 @@ pub unsafe fn open_editor(panel: HWND, bitmap: Bitmap, rect: (i32, i32, i32, i32
         undone: Vec::new(),
         next_number: 1,
         beautify: false,
+        title_h: s(30.0),
         top_margin: strip,
         probed: false,
         bar: RECT {
