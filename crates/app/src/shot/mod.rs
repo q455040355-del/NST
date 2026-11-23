@@ -47,6 +47,7 @@ use crate::theme::wide;
 
 mod annotations;
 mod iconexport;
+mod specicons;
 mod geometry;
 mod titlebar;
 mod toolbar;
@@ -2652,6 +2653,10 @@ fn draw_action_icon(dc: HDC, action: Action, rect: RECT, color: u32, stroke: u8,
             unsafe { draw_pack_icon(dc, index, target, color) };
             return;
         }
+    }
+    // 彩色模式下优先用「规范版」画法（软盘、U 型箭头、图钉…），不认识的再走老画法
+    if colored && unsafe { specicons::draw(dc, action, rect) } {
+        return;
     }
     let (color, fill) = if colored {
         let (ink, tint) = icon_color(action);
