@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const GAUGE_MEMORY: &str = "mem";
 pub const GAUGE_AI: &str = "ai";
@@ -113,8 +113,13 @@ impl Settings {
     }
 
     pub fn load() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    /// 从指定文件读（测试用；正常走 load()）
+    pub fn load_from(path: &Path) -> Self {
         let mut settings = Settings::default();
-        let Ok(text) = fs::read_to_string(Self::path()) else {
+        let Ok(text) = fs::read_to_string(path) else {
             return settings;
         };
 
@@ -202,7 +207,11 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let path = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    /// 写到指定文件（测试用；正常走 save()）
+    pub fn save_to(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
@@ -565,5 +574,147 @@ mod tests {
         assert!(parse_hotkey("Ctrl+A+B").is_none());
         assert!(parse_hotkey("Ctrl+F25").is_none());
         assert!(parse_hotkey("Ctrl+中文").is_none());
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+
+    /// 每个字段都填一个和默认值不同的值，用来验证「保存 → 读回」不丢东西
+    fn sample() -> Settings {
+        let mut settings = Settings::default();
+        settings.panel_width = 137;
+        settings.panel_x = 42;
+        settings.panel_y = -7;
+        settings.network_interface = "以太网 2".to_string();
+        settings.gauge_source = "ai".to_string();
+        settings.refresh_ms = 2000;
+        settings.font_scale = 125;
+        settings.view = "cpu".to_string();
+        settings.ai_enabled = true;
+        settings.ai_opencode = true;
+        settings.ai_claude = true;
+        settings.ai_codex = true;
+        settings.ai_dsh = true;
+        settings.ai_workbuddy = true;
+        settings.ai_workbuddy_ai = true;
+        settings.auto_start = true;
+        settings.shot_enabled = false;
+        settings.ocr_enabled = true;
+        settings.shot_hotkey = "Ctrl+Alt+Q".to_string();
+        settings.ocr_hotkey = "Ctrl+Alt+W".to_string();
+        settings.gif_enabled = true;
+        settings.gif_fps = 60;
+        settings.gif_quality = 80;
+        settings.gif_seconds = 10;
+        settings.gif_hotkey = "Ctrl+Alt+E".to_string();
+        settings.shot_topmost = true;
+        settings.translate_provider = "deepseek".to_string();
+        settings.translate_key = "sk-test-123".to_string();
+        settings.translate_model = "deepseek-chat".to_string();
+        settings.translate_base = "https://api.example.com/v1".to_string();
+        settings
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("nst-settings-test-{}-{}", std::process::id(), name));
+        dir.push("settings.ini");
+        dir
+    }
+
+    #[test]
+    fn fields_survive_a_save_and_load_roundtrip() {
+        let path = temp_path("roundtrip");
+        let original = sample();
+        original.save_to(&path);
+
+        let loaded = Settings::load_from(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+
+        // 逐字段比较，失败时能直接看出是哪个字段丢了
+        assert_eq!(loaded.panel_width, original.panel_width, "panel_width");
+        assert_eq!(loaded.panel_x, original.panel_x, "panel_x");
+        assert_eq!(loaded.panel_y, original.panel_y, "panel_y");
+        assert_eq!(loaded.network_interface, original.network_interface, "network_interface");
+        assert_eq!(loaded.gauge_source, original.gauge_source, "gauge_source");
+        assert_eq!(loaded.refresh_ms, original.refresh_ms, "refresh_ms");
+        assert_eq!(loaded.font_scale, original.font_scale, "font_scale");
+        assert_eq!(loaded.view, original.view, "view");
+        assert_eq!(loaded.ai_enabled, original.ai_enabled, "ai_enabled");
+        assert_eq!(loaded.ai_opencode, original.ai_opencode, "ai_opencode");
+        assert_eq!(loaded.ai_claude, original.ai_claude, "ai_claude");
+        assert_eq!(loaded.ai_codex, original.ai_codex, "ai_codex");
+        assert_eq!(loaded.ai_dsh, original.ai_dsh, "ai_dsh");
+        assert_eq!(loaded.ai_workbuddy, original.ai_workbuddy, "ai_workbuddy");
+        assert_eq!(loaded.ai_workbuddy_ai, original.ai_workbuddy_ai, "ai_workbuddy_ai");
+        assert_eq!(loaded.auto_start, original.auto_start, "auto_start");
+        assert_eq!(loaded.shot_enabled, original.shot_enabled, "shot_enabled");
+        assert_eq!(loaded.ocr_enabled, original.ocr_enabled, "ocr_enabled");
+        assert_eq!(loaded.shot_hotkey, original.shot_hotkey, "shot_hotkey");
+        assert_eq!(loaded.ocr_hotkey, original.ocr_hotkey, "ocr_hotkey");
+        assert_eq!(loaded.gif_enabled, original.gif_enabled, "gif_enabled");
+        assert_eq!(loaded.gif_fps, original.gif_fps, "gif_fps");
+        assert_eq!(loaded.gif_quality, original.gif_quality, "gif_quality");
+        assert_eq!(loaded.gif_seconds, original.gif_seconds, "gif_seconds");
+        assert_eq!(loaded.gif_hotkey, original.gif_hotkey, "gif_hotkey");
+        assert_eq!(loaded.shot_topmost, original.shot_topmost, "shot_topmost");
+        assert_eq!(loaded.translate_provider, original.translate_provider, "translate_provider");
+        assert_eq!(loaded.translate_key, original.translate_key, "translate_key");
+        assert_eq!(loaded.translate_model, original.translate_model, "translate_model");
+        assert_eq!(loaded.translate_base, original.translate_base, "translate_base");
+    }
+
+    #[test]
+    fn unknown_keys_are_kept_for_the_next_version() {
+        // 别的版本写进去、当前程序不认识的键要原样留着，不能被覆盖丢掉
+        let path = temp_path("extra");
+        let mut settings = Settings::default();
+        settings.save_to(&path);
+
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("SomeFutureKey=hello\n");
+        fs::write(&path, text).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.extra.get("SomeFutureKey").map(String::as_str), Some("hello"));
+
+        // 再存一次也不能把它弄丢
+        loaded.save_to(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        assert!(text.contains("SomeFutureKey=hello"), "未知键要保留");
+    }
+
+    #[test]
+    fn missing_file_falls_back_to_defaults() {
+        // 第一次运行（没有 ini）不能 panic，也不能读到半个配置
+        let path = temp_path("missing");
+        let loaded = Settings::load_from(&path);
+        let defaults = Settings::default();
+        assert_eq!(loaded.panel_width, defaults.panel_width);
+        assert_eq!(loaded.refresh_ms, defaults.refresh_ms);
+    }
+
+    #[test]
+    fn broken_values_fall_back_instead_of_dropping_everything() {
+        // 某一行值坏了：该字段回默认，其余字段照常读出来
+        let path = temp_path("broken");
+        let mut settings = Settings::default();
+        settings.panel_x = 77;
+        settings.save_to(&path);
+
+        let text = fs::read_to_string(&path).unwrap();
+        let broken = text.replace(
+            &format!("PanelWidth={}\n", settings.panel_width),
+            "PanelWidth=not-a-number\n",
+        );
+        fs::write(&path, broken).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(loaded.panel_width, Settings::default().panel_width, "坏值回默认");
+        assert_eq!(loaded.panel_x, 77, "其它字段不受影响");
     }
 }
