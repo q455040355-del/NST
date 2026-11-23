@@ -713,13 +713,10 @@ fn row_title(row: usize) -> &'static str {
 // ---------------------------------------------------------------- 绘画
 
 unsafe fn paint(hwnd: HWND) {
-    let c = crate::theme::ui();
     let state = state_of(hwnd);
     if state.is_null() {
         return;
     }
-    let state = &mut *state;
-
     let mut client = RECT {
         left: 0,
         top: 0,
@@ -730,6 +727,15 @@ unsafe fn paint(hwnd: HWND) {
     if client.right <= 0 || client.bottom <= 0 {
         return;
     }
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    paint_into(hdc, &mut *state, client);
+    EndPaint(hwnd, &mut ps);
+}
+
+/// 把界面画到任意 DC（窗口的 WM_PAINT、WM_PRINTCLIENT、离屏预览共用）
+unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
+    let c = crate::theme::ui();
 
     let (dc, dib, _bits) = make_dib(client.right, client.bottom);
     if dc.is_null() || dib.is_null() {
@@ -1568,10 +1574,7 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     // 提交
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
     BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
-    EndPaint(hwnd, &mut ps);
 
     DeleteObject(dib as *mut _);
     DeleteDC(dc);
@@ -2075,12 +2078,72 @@ pub fn open(parent: HWND, settings: &Settings) {
         }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+        LAST_HWND.with(|cell| cell.set(hwnd as isize));
         round_corners(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         SetFocus(hwnd);
         UpdateWindow(hwnd);
     }
+}
+
+thread_local! {
+    /// 最近一次打开的设置窗（离屏预览用）
+    static LAST_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// 最近一次打开的设置窗句柄
+pub fn last_hwnd() -> HWND {
+    LAST_HWND.with(|cell| cell.get() as HWND)
+}
+
+/// 离屏渲染设置窗到 PNG（改布局时用来做像素比对）
+pub unsafe fn preview_png(path: &str) -> bool {
+    let settings = Settings::load();
+    open(std::ptr::null_mut(), &settings);
+    let hwnd = last_hwnd();
+    if hwnd.is_null() {
+        return false;
+    }
+    // 让它把第一帧画完
+    let mut message: MSG = std::mem::zeroed();
+    for _ in 0..6 {
+        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
+
+    let (dc, dib, bits) = make_dib(width, height);
+    if dc.is_null() || bits.is_null() {
+        DestroyWindow(hwnd);
+        return false;
+    }
+    // 走 WM_PRINTCLIENT：和真实绘制同一条代码路径，不依赖 PrintWindow
+    SendMessageW(hwnd, WM_PRINTCLIENT, dc as usize, 0);
+
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for index in 0..(width * height) as usize {
+        let offset = index * 4;
+        rgba.push(*bits.add(offset + 2));
+        rgba.push(*bits.add(offset + 1));
+        rgba.push(*bits.add(offset));
+        rgba.push(255);
+    }
+    let saved = match image::RgbaImage::from_raw(width as u32, height as u32, rgba) {
+        Some(buffer) => buffer.save(path).is_ok(),
+        None => false,
+    };
+    DeleteObject(dib as *mut _);
+    DeleteDC(dc);
+    DestroyWindow(hwnd);
+    saved
 }
 
 /// Win11 圆角（Win10 上会失败，无所谓）
@@ -2445,6 +2508,18 @@ unsafe extern "system" fn dialog_proc(
         // 系统切了明暗主题：整套颜色会变，重画一次就够了（内部按 2 秒缓存读注册表）
         WM_SETTINGCHANGE => {
             InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        // 离屏渲染（NST_SETTINGS_PREVIEW / 系统打印对话框）走同一条绘制路径
+        WM_PRINTCLIENT => {
+            let state = state_of(hwnd);
+            if !state.is_null() {
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                if client.right > 0 && client.bottom > 0 {
+                    paint_into(wparam as HDC, &mut *state, client);
+                }
+            }
             0
         }
         WM_PAINT => {
