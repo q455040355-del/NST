@@ -2502,6 +2502,8 @@ fn toolbar_width() -> i32 {
 }
 
 unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
+    // 每帧重排按钮表（窗口栏那三个 + 工具栏那一排都在这里登记）
+    editor.buttons.clear();
     let toolbar = s(44.0);
     let bg = CreateSolidBrush(crate::theme::ui().bg);
     let all = RECT {
@@ -2722,7 +2724,6 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
     }
 
     // 工具栏：微信那种一条圆角底栏，纯图标（文字靠 hover 小标签提示）
-    editor.buttons.clear();
     let ui = crate::theme::ui();
     let bar_h = s(38.0);
     // 工具栏固定在窗口底部，图片缩放不影响它的位置
