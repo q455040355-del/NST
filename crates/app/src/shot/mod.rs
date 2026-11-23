@@ -46,10 +46,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::theme::wide;
 
 mod annotations;
+mod iconexport;
 mod geometry;
 mod titlebar;
 mod toolbar;
 use annotations::*;
+pub use iconexport::export as export_icons;
 use geometry::*;
 use titlebar::draw_title_bar;
 use toolbar::draw_toolbar;
@@ -319,8 +321,22 @@ fn use_scale_at(point: POINT) {
     );
 }
 
+thread_local! {
+    /// 图标导出的额外倍率（平时是 1.0）。导出时放大，线条才够粗。
+    static ICON_EXPORT_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+pub(super) fn icon_export_scale() -> f32 {
+    ICON_EXPORT_SCALE.with(|cell| cell.get())
+}
+
+pub(super) fn set_icon_export_scale(value: f32) {
+    ICON_EXPORT_SCALE.with(|cell| cell.set(value));
+}
+
 pub(crate) fn s(value: f32) -> i32 {
-    (value * ui_scale()).round() as i32
+    let extra = ICON_EXPORT_SCALE.with(|cell| cell.get());
+    (value * ui_scale() * extra).round() as i32
 }
 
 fn make_font(points: f32, weight: i32) -> HFONT {

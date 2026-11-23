@@ -216,6 +216,13 @@ fn main() {
             return;
         }
 
+        // 调试用：把工具栏每个图标导出成独立 PNG + 一张总表（拿去重设计用）
+        if let Some(dir) = std::env::var_os("NST_ICONS_EXPORT") {
+            let ok = shot::export_icons(&dir.to_string_lossy());
+            crate::debug_log(&format!("icons export -> {ok}"));
+            return;
+        }
+
         // 调试用：把截图编辑窗（含一条底栏）离屏画成 PNG，不弹窗、不进托盘。
         // 改工具栏 / 图标时用：NST_EDITOR_PREVIEW=D:\tmp\editor.png netspeed.exe
         if let Some(path) = std::env::var_os("NST_EDITOR_PREVIEW") {
