@@ -174,9 +174,37 @@ fn http_request(method: &str, url: &str, headers: &str, body: Option<&[u8]>) -> 
                         .map(|message| message.to_string())
                 })
                 .unwrap_or_else(|| text.chars().take(200).collect());
-            return Err(format!("HTTP {status}：{detail}"));
+            // OpenCode 的免费模型只在它自己的客户端里生效，走 API 会报 FreeUsageLimitError
+            let hint = if detail.contains("Free usage limit") || detail.contains("FreeUsageLimit") {
+                "免费模型只限 OpenCode 客户端"
+            } else {
+                match status {
+                    401 => "Key 不对或已失效",
+                    402 => "余额不足，去服务商充值",
+                    403 => "这个 Key 没权限用该模型",
+                    404 => "地址或模型名不对",
+                    429 => "请求太频繁，等会儿再试",
+                    500..=599 => "服务端出错",
+                    _ => "",
+                }
+            };
+            return if hint.is_empty() {
+                Err(format!("HTTP {status}：{detail}"))
+            } else {
+                // 一行放得下：状态码 + 人话，别把服务端那一大段英文拼进来
+                Err(format!("{status} · {hint}"))
+            };
         }
         Ok(text)
+    }
+}
+
+/// 服务商的默认模型（设置里没填模型时用）
+pub fn default_model(provider: &str) -> &'static str {
+    match provider.trim().to_lowercase().as_str() {
+        "deepseek" => "deepseek-chat",
+        "opencode" => "deepseek-v4-flash-free",
+        _ => "gpt-4o-mini",
     }
 }
 
@@ -187,6 +215,51 @@ pub fn default_base(provider: &str) -> &'static str {
         "opencode" => "https://opencode.ai/zen/v1",
         _ => "https://api.openai.com/v1",
     }
+}
+
+/// 测一下这套配置通不通：真发一条最短的 chat/completions，能拿到 choices 就算通。
+/// 返回一句给人看的话（模型 + 往返耗时），失败返回服务端给的原因。
+pub fn test_connection(
+    provider: &str,
+    base: &str,
+    key: &str,
+    model: &str,
+) -> Result<String, String> {
+    if key.trim().is_empty() {
+        return Err("还没填 API Key".to_string());
+    }
+    let base = base.trim();
+    let base = if base.is_empty() {
+        default_base(provider)
+    } else {
+        base
+    };
+    let model = model.trim();
+    let model = if model.is_empty() {
+        default_model(provider)
+    } else {
+        model
+    };
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "ping" }]
+    });
+    let headers = format!(
+        "Content-Type: application/json\r\nAuthorization: Bearer {}\r\n",
+        key.trim()
+    );
+    let started = std::time::Instant::now();
+    let raw = http_request("POST", &url, &headers, Some(payload.to_string().as_bytes()))?;
+    let elapsed = started.elapsed().as_millis();
+
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| "服务端返回的不是 JSON".to_string())?;
+    if value.get("choices").is_none() {
+        return Err("连通了，但返回里没有 choices（模型名可能不对）".to_string());
+    }
+    Ok(format!("往返 {elapsed} ms"))
 }
 
 /// 拉服务商的模型列表：GET {base}/models（OpenAI 兼容的 `{"data":[{"id":..}]}`）。

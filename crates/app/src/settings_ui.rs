@@ -37,6 +37,8 @@ const WM_APP_PICK: u32 = WM_APP + 0x31;
 const WM_APP_ANIM: u32 = WM_APP + 0x36;
 /// 模型列表拉回来了（lparam 是 Box<Result<Vec<(id, name)>, String>>）
 const WM_APP_MODELS: u32 = WM_APP + 0x37;
+/// 连接测试的结果回来了（lparam 是 Box<Result<String, String>>）
+const WM_APP_TEST: u32 = WM_APP + 0x38;
 
 const DT_NOPREFIX: u32 = 0x0800;
 
@@ -432,6 +434,10 @@ struct State {
     models_busy: bool,
     /// 拉模型失败的原因（显示在模型那一行下面）
     models_error: Option<String>,
+    /// 正在测连接
+    test_busy: bool,
+    /// 上一次测连接的结果：(成功?, 说明)
+    test_result: Option<(bool, String)>,
     /// 光标位置（按 char 计）
     tr_caret: usize,
     /// 正在录制快捷键：0 = 没在录，1 = 截图，2 = 取字，3 = 录 GIF
@@ -503,6 +509,8 @@ struct Layout {
     tr_opencode: RECT,
     /// 模型那一格右边的「获取」
     tr_fetch: RECT,
+    /// 「测试连接」
+    tr_test: RECT,
 }
 
 /// 翻译区块里可编辑的输入框
@@ -684,6 +692,13 @@ fn layout(state: &State, client: RECT) -> Layout {
             top: s(TR_ROW1_TOP, scale),
             right,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
+        },
+        // Base URL 下面那行「测试连接」
+        tr_test: RECT {
+            left: right_left,
+            top: s(TR_ROW4_TOP + TR_BOX_H + 8.0, scale),
+            right: right_left + s(92.0, scale),
+            bottom: s(TR_ROW4_TOP + TR_BOX_H + 32.0, scale),
         },
         // 模型那一格右边的「获取」
         tr_fetch: RECT {
@@ -1716,7 +1731,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         let mut shade_saved: i32 = 0;
         if shade_open {
             let shade_top = p.s(TR_ROW1_TOP - 14.0);
-            let shade_full = p.s(TR_ROW4_TOP + TR_BOX_H + 6.0) - shade_top;
+            let shade_full = p.s(TR_ROW4_TOP + TR_BOX_H + 40.0) - shade_top;
             let shade_bottom = shade_top + (shade_full as f32 * state.tr_open).round() as i32;
             let slide = (((1.0 - state.tr_open) * -10.0) * state.scale).round() as i32;
             shade_saved = SaveDC(dc);
@@ -1882,6 +1897,43 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
         }
         if shade_saved != 0 {
             RestoreDC(dc, shade_saved);
+        }
+        // 测连接：一颗胶囊 + 结果文字（通了是强调色，不通是红字）
+        {
+            let test = l.tr_test;
+            let label = if state.test_busy { "测试中…" } else { "测试连接" };
+            let tint = if state.test_busy { c.text3 } else { c.accent };
+            p.round(
+                test.left,
+                test.top,
+                test.right,
+                test.bottom,
+                p.s(8.0),
+                c.chip,
+                c.chip,
+            );
+            p.text(
+                label,
+                state.fonts.small,
+                tint,
+                test.left + p.s(4.0),
+                test.top,
+                test.right - p.s(4.0),
+                test.bottom,
+                DT_CENTER,
+            );
+            if let Some((ok, message)) = &state.test_result {
+                p.text(
+                    message,
+                    state.fonts.small,
+                    if *ok { c.accent } else { 0x003C3CC8 },
+                    test.right + p.s(10.0),
+                    test.top,
+                    content_right,
+                    test.bottom,
+                    DT_LEFT,
+                );
+            }
         }
         if shade_open {
             if let Some(aa) = &p.aa {
@@ -2605,6 +2657,8 @@ pub fn open(parent: HWND, settings: &Settings) {
             models: Vec::new(),
             models_busy: false,
             models_error: None,
+            test_busy: false,
+            test_result: None,
             tr_caret: 0,
             capture: 0,
             fonts: Fonts::create(scale),
@@ -3081,6 +3135,38 @@ fn start_model_fetch(state: &mut State) {
     });
 }
 
+/// 测连接：后台发一条最短的 chat/completions，结果投回窗口
+fn start_connection_test(state: &mut State) {
+    if state.test_busy {
+        return;
+    }
+    state.test_busy = true;
+    state.test_result = None;
+    let raw = state.hwnd as isize;
+    let provider = match state.tr_provider {
+        1 => "deepseek",
+        2 => "opencode",
+        _ => "chatgpt",
+    }
+    .to_string();
+    let base = state.tr_base.clone();
+    let key = state.tr_key.clone();
+    let model = state.tr_model.clone();
+    unsafe {
+        InvalidateRect(state.hwnd, std::ptr::null(), 0);
+    }
+    std::thread::spawn(move || {
+        let result = crate::translate::test_connection(&provider, &base, &key, &model);
+        let boxed = Box::into_raw(Box::new(result));
+        unsafe {
+            let hwnd = raw as HWND;
+            if PostMessageW(hwnd, WM_APP_TEST, 0, boxed as isize) == 0 {
+                drop(Box::from_raw(boxed));
+            }
+        }
+    });
+}
+
 /// 起一轮动效：后台线程按 16ms 往窗口里投 WM_APP_ANIM，直到所有值都到位
 fn start_anim(hwnd: HWND) {
     use std::sync::atomic::Ordering;
@@ -3499,6 +3585,12 @@ unsafe extern "system" fn dialog_proc(
                     start_model_fetch(state);
                     return 0;
                 }
+
+                // 「测试连接」：真发一条最短的请求，通了才算配好
+                if inside(l.tr_test) && !state.test_busy {
+                    start_connection_test(state);
+                    return 0;
+                }
                 let hit = if state.translate_enabled && inside(l.tr_key) && !inside(l.tr_reveal) {
                     Some(TrField::Key)
                 } else if state.translate_enabled && inside(l.tr_model) {
@@ -3675,6 +3767,21 @@ unsafe extern "system" fn dialog_proc(
             if !state.is_null() {
                 advance_anim(&mut *state);
             }
+            0
+        }
+        WM_APP_TEST => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let result = Box::from_raw(lparam as *mut Result<String, String>);
+            state.test_busy = false;
+            state.test_result = Some(match *result {
+                Ok(message) => (true, format!("连通 · {message}")),
+                Err(error) => (false, error),
+            });
+            InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_APP_MODELS => {
