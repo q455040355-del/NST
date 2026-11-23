@@ -1574,6 +1574,23 @@ pub(crate) fn apply_font_scale(parent: HWND, percent: i32) {
     }
 }
 
+/// 设置窗里改了翻译配置：立刻落盘（下次翻译就用新的）
+pub(crate) fn apply_translate_settings(
+    parent: HWND,
+    provider: &str,
+    key: &str,
+    model: &str,
+    base: &str,
+) {
+    if let Some(panel) = panel_mut(parent) {
+        panel.settings.translate_provider = provider.to_string();
+        panel.settings.translate_key = key.to_string();
+        panel.settings.translate_model = model.to_string();
+        panel.settings.translate_base = base.to_string();
+        panel.settings.save();
+    }
+}
+
 pub(crate) fn apply_network_interface(parent: HWND, interface: &str) {
     if let Some(panel) = panel_mut(parent) {
         panel.set_network_interface(interface);

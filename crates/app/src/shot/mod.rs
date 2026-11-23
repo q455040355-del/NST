@@ -2282,6 +2282,14 @@ pub unsafe fn preview_png(path: &str) -> bool {
     ok
 }
 
+/// 量文字宽度（设置窗画光标用）
+pub(crate) unsafe fn text_width(dc: HDC, text: &str, font: HFONT) -> i32 {
+    let old = SelectObject(dc, font as HGDIOBJ);
+    let width = wide_width(dc, text);
+    SelectObject(dc, old);
+    width
+}
+
 fn wide_width(dc: HDC, text: &str) -> i32 {
     unsafe {
         let mut rect = RECT {
