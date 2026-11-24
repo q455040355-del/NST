@@ -64,6 +64,8 @@ const ROW_GAP: f32 = 5.0;
 enum Hit {
     Close,
     Copy,
+    /// 翻失败时，底栏那个按钮变成「重试」
+    Retry,
     CopySource,
     ViewLines,
     ViewProse,
@@ -780,7 +782,7 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         );
     }
 
-    let hover = state.hover == Some(Hit::Copy);
+    let hover = state.hover == Some(Hit::Copy) || state.hover == Some(Hit::Retry);
     let fill = if hover { c.accent_pressed } else { c.accent };
     p.round(
         l.copy.left,
@@ -791,8 +793,15 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         fill,
         fill,
     );
+    let primary = if state.error.is_some() {
+        "重试"
+    } else if state.view == View::Ocr {
+        "复制"
+    } else {
+        "复制全部"
+    };
     p.text(
-        if state.view == View::Ocr { "复制" } else { "复制全部" },
+        primary,
         state.fonts.small,
         0x00FF_FFFF,
         l.copy.left,
@@ -1161,6 +1170,10 @@ fn request_retranslate(hwnd: HWND, target: usize) {
             return;
         }
         let state = &mut *state;
+        // 上一次还没回来就别再发：连点两下语言会同时跑两个请求、白花钱
+        if state.pending != 0 {
+            return;
+        }
         state.pending = 1;
         state.status = format!(
             "正在译成 {}…",
@@ -1592,7 +1605,11 @@ unsafe extern "system" fn window_proc(
             let mut hover = if contains(&l.close, point) {
                 Some(Hit::Close)
             } else if contains(&l.copy, point) {
-                Some(Hit::Copy)
+                Some(if state.error.is_some() {
+                    Hit::Retry
+                } else {
+                    Hit::Copy
+                })
             } else if state.has_translation() && contains(&l.copy_source, point) {
                 Some(Hit::CopySource)
             } else if state.has_translation() && contains(&l.view_lines, point) {
@@ -1709,12 +1726,26 @@ unsafe extern "system" fn window_proc(
             };
             GetClientRect(hwnd, &mut client);
             let l = layout(&*state, client);
+            // 点了别的控件 / 空白：先把下拉收掉（胶囊自己除外，它负责开关）
+            let popup = (*state).lang_popup;
+            if !popup.is_null() && IsWindow(popup) != 0 && !contains(&l.target, point) {
+                DestroyWindow(popup);
+                (*state).lang_popup = std::ptr::null_mut();
+            }
             if contains(&l.close, point) {
                 DestroyWindow(hwnd);
                 return 0;
             }
             if contains(&l.copy, point) {
-                copy_all(hwnd);
+                if (*state).error.is_some() {
+                    // 翻失败：再来一次，不用重新截图
+                    (*state).status = "正在重试…".to_string();
+                    (*state).error = None;
+                    request_retranslate(hwnd, (*state).target);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                } else {
+                    copy_all(hwnd);
+                }
                 return 0;
             }
             if (*state).has_translation() {
@@ -1744,10 +1775,12 @@ unsafe extern "system" fn window_proc(
                 }
                 if contains(&l.target, point) {
                     // 弹下拉挑语言（点一下换一个太容易点错）
-                    if !(*state).lang_popup.is_null() {
-                        DestroyWindow((*state).lang_popup);
+                    let popup = (*state).lang_popup;
+                    if !popup.is_null() && IsWindow(popup) != 0 {
+                        DestroyWindow(popup);
                         (*state).lang_popup = std::ptr::null_mut();
                     } else {
+                        (*state).lang_popup = std::ptr::null_mut();
                         let flags = &*state;
                         (*state).lang_popup = open_lang_popup(hwnd, flags, client);
                     }
@@ -1848,7 +1881,14 @@ unsafe extern "system" fn window_proc(
             let state = &mut *state;
             match wparam as u32 {
                 0x1B => {
-                    DestroyWindow(hwnd);
+                    // 下拉开着就先收下拉，别一下把窗口关了
+                    let popup = state.lang_popup;
+                    if !popup.is_null() && IsWindow(popup) != 0 {
+                        DestroyWindow(popup);
+                        state.lang_popup = std::ptr::null_mut();
+                    } else {
+                        DestroyWindow(hwnd);
+                    }
                 }
                 // ↑ / ↓：在句与句之间走
                 0x26 | 0x28 => {
