@@ -157,7 +157,7 @@ pub(super) unsafe fn draw_toolbar(dc: HDC, editor: &mut Editor, client: RECT) ->
 
     // 图标没有文字，靠 hover 时在底栏上方弹一个小标签（微信也是这么做的）
     if let Some((action, rect)) = hovered {
-        draw_bar_tooltip(dc, action, rect, bar_top, editor.stroke);
+        draw_bar_tooltip(dc, action, rect, bar_top, client.right, editor.stroke);
     }
 
     editor.bar
@@ -216,7 +216,14 @@ pub(super) fn tool_for_letter(key: u32, shift: bool) -> Option<Tool> {
     })
 }
 
-pub(super) fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke: u8) {
+pub(super) fn draw_bar_tooltip(
+    dc: HDC,
+    action: Action,
+    anchor: RECT,
+    bar_top: i32,
+    client_right: i32,
+    stroke: u8,
+) {
     unsafe {
         let name = match action {
             Action::Stroke => STROKE_LABELS[stroke.min(2) as usize],
@@ -236,16 +243,11 @@ pub(super) fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let width = wide_width(dc, &label) + s(20.0);
         let height = s(20.0);
-        // 编辑窗只有「图 + 底栏 + 提示」那么高：图很矮时标签会顶出客户区被裁掉，
-        // 所以左右上下都夹在窗口内，宁可压在图上也要看得见。
-        let mut client: RECT = std::mem::zeroed();
-        let owner = windows_sys::Win32::Graphics::Gdi::WindowFromDC(dc);
-        if !owner.is_null() {
-            GetClientRect(owner, &mut client);
-        }
-        let max_left = (client.right - width - s(4.0)).max(s(4.0));
+        // 水平：对准悬停的那个图标；左右夹在客户区里，别跑出窗口
+        let max_left = (client_right - width - s(4.0)).max(s(4.0));
         let left = ((anchor.left + anchor.right) / 2 - width / 2).clamp(s(4.0), max_left);
-        let top = (bar_top - height - s(5.0)).max(s(2.0));
+        // 垂直：压在底栏上沿，图很矮时也看得见（不会飘到图片中间去）
+        let top = (bar_top - height - s(4.0)).max(s(2.0));
         let rect = RECT {
             left,
             top,
