@@ -450,6 +450,8 @@ struct State {
     tr_target: usize,
     /// 拉模型 / 测连接是给哪家发起的（回来时对不上就丢弃，免得串到别家）
     models_for: usize,
+    /// 每个服务商这次会话里拉到的模型列表：再点「获取」直接用，别重复计费
+    models_cache: [Vec<(String, String)>; 2],
     test_for: usize,
     /// 正在测连接
     test_busy: bool,
@@ -2707,6 +2709,7 @@ pub fn open(parent: HWND, settings: &Settings) {
                 .position(|(_, key)| *key == settings.translate_target.trim().to_lowercase())
                 .unwrap_or(0),
             models_for: 0,
+            models_cache: [Vec::new(), Vec::new()],
             test_for: 0,
             test_busy: false,
             test_result: None,
@@ -3190,6 +3193,18 @@ fn insert_at_caret(state: &mut State, field: TrField, text: &str) {
 /// 去服务商拉模型列表（后台线程），回来再弹选择框
 fn start_model_fetch(state: &mut State) {
     if state.models_busy {
+        return;
+    }
+    // 这次会话里已经拉过同一家：直接用，省一次请求
+    let cached = state.models_cache[state.tr_provider.min(1)].clone();
+    if !cached.is_empty() {
+        state.models = cached;
+        state.models_error = None;
+        let hwnd = state.hwnd;
+        unsafe {
+            open_popup(hwnd, 0, true);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
         return;
     }
     state.models_busy = true;
@@ -3920,6 +3935,9 @@ unsafe extern "system" fn dialog_proc(
                 // 这中间换了服务商：这一批模型不是这家的，丢掉
                 return 0;
             }
+            if let Ok(list) = result.as_ref() {
+                state.models_cache[state.tr_provider.min(1)] = list.clone();
+            }
             match *result {
                 Ok(models) => {
                     state.models = models;
@@ -4075,7 +4093,7 @@ unsafe extern "system" fn dialog_proc(
                         _ => snapshot.clone(),
                     };
                     if !text.is_empty() {
-                        crate::ocr::copy_text(&text);
+                        let _ = crate::ocr::copy_text(&text);
                     }
                     return 0;
                 }

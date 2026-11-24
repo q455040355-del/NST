@@ -51,6 +51,8 @@ mod specicons;
 mod geometry;
 mod titlebar;
 mod toolbar;
+
+use toolbar::tool_for_letter;
 use annotations::*;
 pub use iconexport::export as export_icons;
 use geometry::*;
@@ -1053,7 +1055,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                                 "#{:02X}{:02X}{:02X}",
                                 pixel[2], pixel[1], pixel[0]
                             );
-                            crate::ocr::copy_text(&hex);
+                            let _ = crate::ocr::copy_text(&hex);
                         }
                     }
                 }
@@ -1481,59 +1483,6 @@ fn text_of_action(action: Action) -> &'static str {
         Action::Minimize => "最小化",
         Action::Close => "取消",
     }
-}
-
-/// 工具 / 动作的快捷键：tooltip 里显示，键盘处理也按这张表走
-fn shortcut_of(action: Action) -> &'static str {
-    match action {
-        Action::Tool(Tool::Arrow) => "A",
-        Action::Tool(Tool::Rect) => "R",
-        Action::Tool(Tool::Square) => "Shift+R",
-        Action::Tool(Tool::Ellipse) => "O",
-        Action::Tool(Tool::Line) => "L",
-        Action::Tool(Tool::Marker) => "H",
-        Action::Tool(Tool::Spotlight) => "P",
-        Action::Tool(Tool::Numbered) => "N",
-        Action::Tool(Tool::Eraser) => "E",
-        Action::Tool(Tool::Pen) => "B",
-        Action::Tool(Tool::Text) => "T",
-        Action::Tool(Tool::Mosaic) => "M",
-        Action::Tool(Tool::Ocr) => "Ctrl+Shift+O",
-        Action::Tool(Tool::Translate) => "Ctrl+Shift+T",
-        Action::Undo => "Ctrl+Z",
-        Action::Redo => "Ctrl+Y",
-        Action::Copy => "Ctrl+C",
-        Action::Save => "Ctrl+S",
-        Action::Rotate => "Ctrl+R",
-        Action::Done => "Enter",
-        Action::Close => "Esc",
-        Action::Minimize => "-",
-        _ => "",
-    }
-}
-
-/// 字母键 → 工具（没按修饰键时生效）
-fn tool_for_letter(key: u32, shift: bool) -> Option<Tool> {
-    Some(match key {
-        0x41 => Tool::Arrow,      // A
-        0x52 => {
-            if shift {
-                Tool::Square
-            } else {
-                Tool::Rect
-            }
-        } // R / Shift+R
-        0x4F => Tool::Ellipse,    // O
-        0x4C => Tool::Line,       // L
-        0x48 => Tool::Marker,     // H
-        0x50 => Tool::Spotlight,  // P
-        0x4E => Tool::Numbered,   // N
-        0x45 => Tool::Eraser,     // E
-        0x42 => Tool::Pen,        // B
-        0x54 => Tool::Text,       // T
-        0x4D => Tool::Mosaic,     // M
-        _ => return None,
-    })
 }
 
 /// 图形都存「图片坐标」，画到窗口上要乘显示缩放。
@@ -3071,64 +3020,6 @@ fn draw_glyph_sized(dc: HDC, text: &str, rect: RECT, color: u32, points: f32) {
 }
 
 /// hover 时在底栏上方弹一个小标签（图标没文字，靠它认工具）
-fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke: u8) {
-    unsafe {
-        let name = match action {
-            Action::Stroke => STROKE_LABELS[stroke.min(2) as usize],
-            _ => text_of_action(action),
-        };
-        if name.is_empty() {
-            return;
-        }
-        // 「矩形  R」：图标没文字，光看名字也认不出快捷键
-        let key = shortcut_of(action);
-        let label = if key.is_empty() {
-            name.to_string()
-        } else {
-            format!("{name}   {key}")
-        };
-        let font = cached_font(8.5, 500);
-        let old_font = SelectObject(dc, font as HGDIOBJ);
-        let width = wide_width(dc, &label) + s(20.0);
-        let height = s(20.0);
-        // 编辑窗只有「图 + 底栏 + 提示」那么高：图很矮时标签会顶出客户区被裁掉，
-        // 所以左右上下都夹在窗口内，宁可压在图上也要看得见。
-        let mut client: RECT = std::mem::zeroed();
-        let owner = windows_sys::Win32::Graphics::Gdi::WindowFromDC(dc);
-        if !owner.is_null() {
-            GetClientRect(owner, &mut client);
-        }
-        let max_left = (client.right - width - s(4.0)).max(s(4.0));
-        let left = ((anchor.left + anchor.right) / 2 - width / 2).clamp(s(4.0), max_left);
-        let top = (bar_top - height - s(5.0)).max(s(2.0));
-        let rect = RECT {
-            left,
-            top,
-            right: left + width,
-            bottom: top + height,
-        };
-
-        // 和底栏同色 + 1px 描边：浅色主题下是白底灰边，深色主题下是深底浅字，
-        // 弹在图片上方（图片大多偏亮）也看得清
-        let ui = crate::theme::ui();
-        let (fill, ink) = (ui.surface, ui.text);
-        round_rect_aa(dc, &rect, s(8.0), fill, ui.border);
-
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, ink);
-        let mut target = rect;
-        DrawTextW(
-            dc,
-            wide(&label).as_ptr(),
-            -1,
-            &mut target,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-        );
-        SelectObject(dc, old_font);
-    }
-}
-
-
 unsafe fn composite(editor: &Editor) -> Bitmap {
     let (dc, dib, bits) = make_dib(editor.base.width, editor.base.height);
     let mut out = Bitmap::new(editor.base.width, editor.base.height);

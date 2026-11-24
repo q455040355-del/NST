@@ -18,10 +18,14 @@ param(
     [switch]$NoBuild,
     # 只演练：改完文件、刷完 lock、编完就回滚，不提交/不打 tag/不推
     [switch]$DryRun,
-    # 推完盯着 Release 流水线跑完，并列出资产
+    # 推完盯着 Release 流水线跑完，并列出资产（默认开；-NoWatch 关掉）
     [switch]$Watch,
-    # 推完把新 exe 部署到本机日常跑的那份（scripts\deploy.ps1：停进程 -> 备份 -> 覆盖 -> 重启）
+    # 关掉默认的「盯流水线」
+    [switch]$NoWatch,
+    # 推完把新 exe 部署到本机日常跑的那份（默认开；-NoDeploy 关掉）
     [switch]$Deploy,
+    # 关掉默认的「部署到本机」
+    [switch]$NoDeploy,
     # 部署目标目录；省略则用 deploy.ps1 的默认值（D:\OneDrive\桌面\NST）
     [string]$DeployPath = "",
     # 部署后不自动重启面板
@@ -164,7 +168,8 @@ Write-Host ""
 Write-Host "  当前版本 : $current"
 Write-Host "  目标版本 : $Version   (tag $tag)"
 Write-Host "  分支     : $branch（领先 origin $behind 个提交）"
-$wantDeploy = $Deploy -or ($DeployPath -ne "")
+$wantDeploy = -not $NoDeploy -or ($DeployPath -ne "")
+$wantWatch = -not $NoWatch
 if ($wantDeploy) {
     $target = if ($DeployPath -ne "") { $DeployPath } else { "scripts\deploy.ps1 的默认目录（D:\OneDrive\桌面\NST）" }
     Write-Host "  部署     : $target$(if ($NoRestart) { '（不重启）' } else { '（会重启面板）' })"
@@ -285,7 +290,7 @@ if ($wantDeploy) {
 
 # ---------------------------------------------------------------- 盯流水线
 
-if ($Watch) {
+if ($wantWatch) {
     Step "盯 Release 流水线（最多 15 分钟）"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $repo = "q455040355-del/NST"
@@ -323,4 +328,4 @@ if ($Watch) {
 
 Write-Host ""
 Write-Host "  看流水线: $runUrl"
-Write-Host "  下次想连资产一起等，加 -Watch。"
+Write-Host "  不想等流水线 / 不想部署：加 -NoWatch / -NoDeploy。"

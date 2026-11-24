@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{GlobalFree, HWND};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -134,10 +134,11 @@ pub fn recognize_async(owner: HWND, bitmap: Bitmap) {
     });
 }
 
-/// 把文字写进剪贴板（CF_UNICODETEXT）。
-pub fn copy_text(text: &str) {
+/// 把文字写进剪贴板（CF_UNICODETEXT）。**返回是否真的写进去了**：
+/// 剪贴板被别的程序占着时 OpenClipboard 会失败，调用方不能一律说「已复制」。
+pub fn copy_text(text: &str) -> bool {
     if text.is_empty() {
-        return;
+        return false;
     }
 
     unsafe {
@@ -145,20 +146,28 @@ pub fn copy_text(text: &str) {
         let size = wide.len() * 2;
         let handle = GlobalAlloc(GMEM_MOVEABLE, size);
         if handle.is_null() {
-            return;
+            return false;
         }
 
         let pointer = GlobalLock(handle) as *mut u8;
         if pointer.is_null() {
-            return;
+            GlobalFree(handle as *mut _);
+            return false;
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, pointer, size);
         GlobalUnlock(handle);
 
-        if OpenClipboard(std::ptr::null_mut()) != 0 {
-            EmptyClipboard();
-            SetClipboardData(CF_UNICODETEXT, handle as *mut _);
-            CloseClipboard();
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            // 占用中：把句柄还回去，别泄漏
+            GlobalFree(handle as *mut _);
+            return false;
         }
+        EmptyClipboard();
+        let ok = !SetClipboardData(CF_UNICODETEXT, handle as *mut _).is_null();
+        CloseClipboard();
+        if !ok {
+            GlobalFree(handle as *mut _);
+        }
+        ok
     }
 }

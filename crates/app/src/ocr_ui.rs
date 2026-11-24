@@ -60,7 +60,7 @@ const ROW_PAD_X: f32 = 24.0;
 const ROW_PAD_Y: f32 = 13.0;
 const ROW_GAP: f32 = 5.0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hit {
     Close,
     Copy,
@@ -118,6 +118,10 @@ struct State {
     aligned: bool,
     /// 语言下拉窗（同一时刻只开一个）
     lang_popup: HWND,
+    /// 当前视图的内容总高（滚动条和滚轮都用它算）
+    content_h: i32,
+    /// 正在拖滚动条：按下时手指在滑块里的偏移
+    scroll_drag: Option<i32>,
     /// 打字机：已显示多少个目标字
     reveal: usize,
     reveal_total: usize,
@@ -503,6 +507,44 @@ fn contains(rect: &RECT, point: POINT) -> bool {
 }
 
 /// 量一段文字在给定宽度下要占多高（和画的时候用同一套 flag，高度才准）
+/// 40 字符还没有空格就硬插一个换行（只影响显示，复制出去还是原文）
+fn soft_wrap(text: &str) -> std::borrow::Cow<'_, str> {
+    const MAX_RUN: usize = 40;
+    let mut run = 0usize;
+    let mut needed = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        if run > MAX_RUN {
+            needed = true;
+            break;
+        }
+    }
+    if !needed {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len() + text.len() / MAX_RUN + 4);
+    run = 0;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            run = 0;
+            out.push(ch);
+            continue;
+        }
+        if run == MAX_RUN {
+            out.push('\n');
+            run = 0;
+        }
+        out.push(ch);
+        run += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 unsafe fn measure(dc: HDC, font: HFONT, text: &str, width: i32) -> i32 {
     let old = SelectObject(dc, font as HGDIOBJ);
     let mut rect = RECT {
@@ -547,9 +589,9 @@ unsafe fn relayout_rows(state: &mut State, width: i32) {
         row.source_h = if row.source.is_empty() {
             0
         } else {
-            measure(dc, state.fonts.source, &row.source, width)
+            measure(dc, state.fonts.source, &soft_wrap(&row.source), width)
         };
-        row.target_h = measure(dc, state.fonts.body, &row.target, width);
+        row.target_h = measure(dc, state.fonts.body, &soft_wrap(&row.target), width);
         row.top = top;
         row.height = pad_y * 2
             + row.source_h
@@ -558,9 +600,77 @@ unsafe fn relayout_rows(state: &mut State, width: i32) {
         top += row.height;
     }
     DeleteDC(dc);
-    let total: i32 = state.rows.iter().map(|row| row.height).sum();
-    state.max_scroll = (total - state.viewport_h).max(0);
+    state.content_h = state.rows.iter().map(|row| row.height).sum();
+    state.max_scroll = (state.content_h - state.viewport_h).max(0);
     state.scroll = state.scroll.clamp(0, state.max_scroll);
+}
+
+/// 滚动条几何：返回 (轨道顶, 轨道底, 滑块高, 可走距离, x)
+fn scrollbar_geometry(state: &State, l: &Layout) -> Option<(i32, i32, i32, i32, i32)> {
+    if state.max_scroll <= 0 || state.content_h <= 0 {
+        return None;
+    }
+    let track_top = l.rows.top + ui::s(6.0, state.scale);
+    let track_bottom = l.rows.bottom - ui::s(6.0, state.scale);
+    if track_bottom <= track_top {
+        return None;
+    }
+    let visible = (l.rows.bottom - l.rows.top).max(1);
+    let thumb_h = ((visible as f32 / state.content_h as f32) * (track_bottom - track_top) as f32)
+        .max(ui::s(28.0, state.scale) as f32) as i32;
+    let thumb_h = thumb_h.min(track_bottom - track_top);
+    let travel = (track_bottom - track_top - thumb_h).max(1);
+    Some((
+        track_top,
+        track_bottom,
+        thumb_h,
+        travel,
+        l.rows.right + ui::s(4.0, state.scale),
+    ))
+}
+
+/// 鼠标落在哪个控件上（纯函数：布局 + 命中，方便测试）
+fn hit_test(state: &State, l: &Layout, point: POINT) -> Option<Hit> {
+    if contains(&l.close, point) {
+        return Some(Hit::Close);
+    }
+    if contains(&l.copy, point) {
+        return Some(if state.error.is_some() {
+            Hit::Retry
+        } else {
+            Hit::Copy
+        });
+    }
+    if state.has_translation() {
+        if contains(&l.copy_source, point) {
+            return Some(Hit::CopySource);
+        }
+        if contains(&l.view_lines, point) {
+            return Some(Hit::ViewLines);
+        }
+        if contains(&l.view_prose, point) {
+            return Some(Hit::ViewProse);
+        }
+        if contains(&l.view_ocr, point) {
+            return Some(Hit::ViewOcr);
+        }
+        if contains(&l.target, point) {
+            return Some(Hit::Target);
+        }
+    }
+    if state.view == View::Lines {
+        if let Some(index) = hit_row(state, l, point) {
+            // 行尾那块是「复制这句」，其余地方是选中这一行
+            let right = l.rows.right - ui::s(10.0, state.scale);
+            let near_copy = point.x >= right - ui::s(72.0, state.scale);
+            return Some(if near_copy {
+                Hit::RowCopy(index)
+            } else {
+                Hit::Row(index)
+            });
+        }
+    }
+    None
 }
 
 /// 鼠标落在哪一行
@@ -744,6 +854,26 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         View::Ocr => {}
     }
 
+    // 滚动条：细长一条，贴右边缘（逐句和整段都有）
+    if let Some((track_top, _bottom, thumb_h, travel, x)) = scrollbar_geometry(state, &l) {
+        let offset = if state.max_scroll > 0 {
+            (state.scroll as f32 / state.max_scroll as f32 * travel as f32) as i32
+        } else {
+            0
+        };
+        let dragging = state.scroll_drag.is_some();
+        let color = if dragging { c.text3 } else { c.border };
+        p.round(
+            x,
+            track_top + offset,
+            x + p.s(4.0),
+            track_top + offset + thumb_h,
+            p.s(3.0),
+            color,
+            color,
+        );
+    }
+
     // ---------------- 底部 ----------------
     p.fill(
         pad,
@@ -851,7 +981,7 @@ unsafe fn paint_lines(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
         let mut y = top + ui::s(ROW_PAD_Y, state.scale);
         if !row.source.is_empty() {
             p.text_block(
-                &row.source,
+                &soft_wrap(&row.source),
                 state.fonts.source,
                 c.text3,
                 text_left,
@@ -870,7 +1000,7 @@ unsafe fn paint_lines(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
         };
         offset += row.target.chars().count();
         p.text_block(
-            &target_text,
+            &soft_wrap(&target_text),
             state.fonts.body,
             c.text,
             text_left,
@@ -927,27 +1057,6 @@ unsafe fn paint_lines(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
         RestoreDC(p.dc, saved);
     }
 
-    // 滚动条：细长一条，贴右边缘
-    if state.max_scroll > 0 {
-        let track_top = l.rows.top + ui::s(6.0, state.scale);
-        let track_bottom = l.rows.bottom - ui::s(6.0, state.scale);
-        let total = state.rows.iter().map(|row| row.height).sum::<i32>().max(1);
-        let visible = (l.rows.bottom - l.rows.top).max(1);
-        let thumb_h = ((visible as f32 / total as f32) * (track_bottom - track_top) as f32)
-            .max(p.s(28.0) as f32) as i32;
-        let travel = (track_bottom - track_top - thumb_h).max(1);
-        let offset = (state.scroll as f32 / state.max_scroll as f32 * travel as f32) as i32;
-        let x = l.rows.right + ui::s(4.0, state.scale);
-        p.round(
-            x,
-            track_top + offset,
-            x + p.s(3.0),
-            track_top + offset + thumb_h,
-            p.s(3.0),
-            c.border,
-            c.border,
-        );
-    }
 }
 
 unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::Ui) {
@@ -964,9 +1073,9 @@ unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
     if !state.source.is_empty() {
         p.text("原文", state.fonts.label, c.text3, left, y, right, y + p.s(15.0), DT_LEFT);
         y += p.s(19.0);
-        let h = measure(p.dc, state.fonts.source, &state.source, width);
+        let h = measure(p.dc, state.fonts.source, &soft_wrap(&state.source), width);
         p.text_block(
-            &state.source,
+            &soft_wrap(&state.source),
             state.fonts.source,
             c.text2,
             left,
@@ -979,7 +1088,7 @@ unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
     if !state.translated.is_empty() {
         p.text("译文", state.fonts.label, c.text3, left, y, right, y + p.s(15.0), DT_LEFT);
         y += p.s(19.0);
-        let h = measure(p.dc, state.fonts.body, &state.translated, width);
+        let h = measure(p.dc, state.fonts.body, &soft_wrap(&state.translated), width);
         let shown = if state.reveal < state.reveal_total {
             state
                 .translated
@@ -989,7 +1098,7 @@ unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
         } else {
             state.translated.clone()
         };
-        p.text_block(&shown, state.fonts.body, c.text, left, y, left + width, y + h);
+        p.text_block(&soft_wrap(&shown), state.fonts.body, c.text, left, y, left + width, y + h);
     }
     if saved != 0 {
         RestoreDC(p.dc, saved);
@@ -1027,8 +1136,8 @@ unsafe fn layout_edit(hwnd: HWND) {
     state.viewport_h = l.rows.bottom - l.rows.top;
     relayout_rows(state, width);
     if state.view == View::Prose {
-        state.max_scroll = prose_height(state, width) - state.viewport_h;
-        state.max_scroll = state.max_scroll.max(0);
+        state.content_h = prose_height(state, width);
+        state.max_scroll = (state.content_h - state.viewport_h).max(0);
         state.scroll = state.scroll.clamp(0, state.max_scroll);
     }
 
@@ -1072,10 +1181,10 @@ unsafe fn prose_height(state: &State, width: i32) -> i32 {
     }
     let mut height = 12;
     if !state.source.is_empty() {
-        height += 19 + measure(dc, state.fonts.source, &state.source, width) + 26;
+        height += 19 + measure(dc, state.fonts.source, &soft_wrap(&state.source), width) + 26;
     }
     if !state.translated.is_empty() {
-        height += 19 + measure(dc, state.fonts.body, &state.translated, width);
+        height += 19 + measure(dc, state.fonts.body, &soft_wrap(&state.translated), width);
     }
     height += 12;
     DeleteDC(dc);
@@ -1095,8 +1204,11 @@ unsafe fn copy_from_edit(hwnd: HWND) {
     let mut buffer = vec![0u16; (length + 1) as usize];
     GetWindowTextW(state.edit, buffer.as_mut_ptr(), buffer.len() as i32);
     let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-    crate::ocr::copy_text(&text);
-    state.status = format!("已复制到剪贴板 · {} 字", text.chars().count());
+    if crate::ocr::copy_text(&text) {
+        state.status = format!("已复制到剪贴板 · {} 字", text.chars().count());
+    } else {
+        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
+    }
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -1115,9 +1227,12 @@ unsafe fn copy_row(hwnd: HWND, index: usize) {
     } else {
         row.target.clone()
     };
-    crate::ocr::copy_text(&text);
-    state.selected = Some(index);
-    state.status = format!("已复制第 {} 句", index + 1);
+    if crate::ocr::copy_text(&text) {
+        state.selected = Some(index);
+        state.status = format!("已复制第 {} 句", index + 1);
+    } else {
+        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
+    }
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -1137,8 +1252,11 @@ unsafe fn copy_all(hwnd: HWND) {
     } else {
         state.translated.clone()
     };
-    crate::ocr::copy_text(&text);
-    state.status = format!("已自动复制 · {} 字", text.chars().count());
+    if crate::ocr::copy_text(&text) {
+        state.status = format!("已自动复制 · {} 字", text.chars().count());
+    } else {
+        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
+    }
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -1152,9 +1270,181 @@ unsafe fn copy_source(hwnd: HWND) {
     if state.source.is_empty() {
         return;
     }
-    crate::ocr::copy_text(&state.source);
-    state.status = "已复制原文".to_string();
+    if crate::ocr::copy_text(&state.source) {
+        state.status = "已复制原文".to_string();
+    } else {
+        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
+    }
     InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// 造一个没有窗口的状态：只测矩形，不碰 GDI 句柄
+    fn state(scale: f32) -> State {
+        State {
+            edit: std::ptr::null_mut(),
+            status: String::new(),
+            error: None,
+            fonts: Fonts::create(scale),
+            scale,
+            hover: None,
+            edit_brush: std::ptr::null_mut(),
+            edit_color: 0,
+            view: View::Lines,
+            source: "Latency budget. The panel samples twice a second.".to_string(),
+            translated: "延迟预算。面板每秒采样两次。".to_string(),
+            rows: Vec::new(),
+            scroll: 0,
+            max_scroll: 0,
+            viewport_h: 0,
+            selected: None,
+            measured_width: -1,
+            target: 0,
+            pending: 0,
+            aligned: true,
+            lang_popup: std::ptr::null_mut(),
+            content_h: 0,
+            scroll_drag: None,
+            reveal: usize::MAX,
+            reveal_total: 0,
+            tracking_leave: false,
+        }
+    }
+
+    fn rect(state: &State, client: RECT) -> Layout {
+        layout(state, client)
+    }
+
+    fn inside(r: RECT, client: RECT) -> bool {
+        r.left >= client.left
+            && r.top >= client.top
+            && r.right <= client.right
+            && r.bottom <= client.bottom
+            && r.right > r.left
+            && r.bottom > r.top
+    }
+
+    #[test]
+    fn every_control_is_inside_a_normal_window() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let st = state(scale);
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: ui::s(WINDOW_W, scale),
+                bottom: ui::s(WINDOW_H, scale),
+            };
+            let l = rect(&st, client);
+            for (name, r) in [
+                ("close", l.close),
+                ("copy", l.copy),
+                ("copy_source", l.copy_source),
+                ("view_lines", l.view_lines),
+                ("view_prose", l.view_prose),
+                ("view_ocr", l.view_ocr),
+                ("target", l.target),
+                ("rows", l.rows),
+            ] {
+                assert!(
+                    inside(r, client),
+                    "scale {scale}: {name} 出界了：({},{})-({},{}) 客户区 ({},{})-({},{})",
+                    r.left,
+                    r.top,
+                    r.right,
+                    r.bottom,
+                    client.left,
+                    client.top,
+                    client.right,
+                    client.bottom,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_controls_do_not_overlap() {
+        let st = state(1.0);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: ui::s(WINDOW_W, 1.0),
+            bottom: ui::s(WINDOW_H, 1.0),
+        };
+        let l = rect(&st, client);
+        // 从左到右：目标 < 逐句 < 整段 < 只取字 < 关闭
+        assert!(l.target.right <= l.view_lines.left, "目标压到逐句了");
+        assert!(l.view_lines.right <= l.view_prose.left, "逐句压到整段了");
+        assert!(l.view_prose.right <= l.view_ocr.left, "整段压到只取字了");
+        assert!(l.view_ocr.right <= l.close.left, "只取字压到关闭了");
+    }
+
+    #[test]
+    fn small_window_keeps_rows_positive() {
+        let st = state(1.0);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 420,
+            bottom: 260,
+        };
+        let l = rect(&st, client);
+        assert!(l.rows.bottom > l.rows.top, "内容区被挤没了");
+        assert!(l.copy.bottom <= client.bottom, "底栏按钮出界");
+    }
+
+    #[test]
+    fn hit_test_matches_the_drawn_rects() {
+        let st = state(1.0);
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: ui::s(WINDOW_W, 1.0),
+            bottom: ui::s(WINDOW_H, 1.0),
+        };
+        let l = rect(&st, client);
+        let center = |r: RECT| POINT {
+            x: (r.left + r.right) / 2,
+            y: (r.top + r.bottom) / 2,
+        };
+        assert_eq!(hit_test(&st, &l, center(l.close)), Some(Hit::Close));
+        assert_eq!(hit_test(&st, &l, center(l.target)), Some(Hit::Target));
+        assert_eq!(
+            hit_test(&st, &l, center(l.view_lines)),
+            Some(Hit::ViewLines)
+        );
+    }
+}
+
+#[cfg(test)]
+mod soft_wrap_tests {
+    use super::soft_wrap;
+
+    #[test]
+    fn short_words_are_untouched() {
+        let text = "Latency budget. The panel samples twice a second.";
+        assert!(matches!(soft_wrap(text), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn long_url_gets_line_breaks() {
+        let url = "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wrapped = soft_wrap(url);
+        assert!(wrapped.contains('\n'), "长串要断行：{wrapped:?}");
+        // 断行只是插了换行，字符顺序不能变
+        let stripped: String = wrapped.chars().filter(|ch| *ch != '\n').collect();
+        assert_eq!(stripped, url);
+    }
+
+    #[test]
+    fn text_round_trips_when_breaks_are_removed() {
+        let text = "a b 0123456789012345678901234567890123456789012345678901234567890 end";
+        let wrapped = soft_wrap(text);
+        let stripped: String = wrapped.chars().filter(|ch| *ch != '\n').collect();
+        assert_eq!(stripped, text);
+    }
 }
 
 /// 后台翻译回来的东西
@@ -1426,6 +1716,8 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             pending: 0,
             aligned: false,
             lang_popup: std::ptr::null_mut(),
+            content_h: 0,
+            scroll_drag: None,
             reveal: usize::MAX,
             reveal_total: 0,
             tracking_leave: false,
@@ -1494,7 +1786,10 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             } else {
                 translated_text.as_str()
             };
-            crate::ocr::copy_text(to_copy);
+            let copied = crate::ocr::copy_text(to_copy);
+            if !copied {
+                (*state).status = "剪贴板被别的程序占着，点「复制」再试".to_string();
+            }
         }
 
         ui::round_corners(hwnd);
@@ -1594,6 +1889,23 @@ unsafe extern "system" fn window_proc(
                 return 0;
             }
             let state = &mut *state;
+            if let Some(grab) = state.scroll_drag {
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                let l = layout(state, client);
+                if let Some((track_top, _bottom, _thumb_h, travel, _x)) = scrollbar_geometry(state, &l)
+                {
+                    let y = ((lparam as i32) >> 16) & 0xFFFF;
+                    let thumb_top = (y - grab).clamp(track_top, track_top + travel);
+                    let ratio = (thumb_top - track_top) as f32 / travel as f32;
+                    let next = (ratio * state.max_scroll as f32).round() as i32;
+                    if next != state.scroll {
+                        state.scroll = next.clamp(0, state.max_scroll);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
+                return 0;
+            }
             let point = POINT {
                 x: (lparam as i32) & 0xFFFF,
                 y: ((lparam as i32) >> 16) & 0xFFFF,
@@ -1607,40 +1919,7 @@ unsafe extern "system" fn window_proc(
             GetClientRect(hwnd, &mut client);
             let l = layout(state, client);
 
-            let mut hover = if contains(&l.close, point) {
-                Some(Hit::Close)
-            } else if contains(&l.copy, point) {
-                Some(if state.error.is_some() {
-                    Hit::Retry
-                } else {
-                    Hit::Copy
-                })
-            } else if state.has_translation() && contains(&l.copy_source, point) {
-                Some(Hit::CopySource)
-            } else if state.has_translation() && contains(&l.view_lines, point) {
-                Some(Hit::ViewLines)
-            } else if state.has_translation() && contains(&l.view_prose, point) {
-                Some(Hit::ViewProse)
-            } else if state.has_translation() && contains(&l.view_ocr, point) {
-                Some(Hit::ViewOcr)
-            } else if state.has_translation() && contains(&l.target, point) {
-                Some(Hit::Target)
-            } else {
-                None
-            };
-
-            if hover.is_none() && state.view == View::Lines {
-                if let Some(index) = hit_row(state, &l, point) {
-                    // 行尾那块是「复制这句」，其余地方是选中这一行
-                    let right = l.rows.right - ui::s(10.0, state.scale);
-                    let near_copy = point.x >= right - ui::s(72.0, state.scale);
-                    hover = Some(if near_copy {
-                        Hit::RowCopy(index)
-                    } else {
-                        Hit::Row(index)
-                    });
-                }
-            }
+            let hover = hit_test(state, &l, point);
 
             if !state.tracking_leave {
                 let mut track = TRACKMOUSEEVENT {
@@ -1714,9 +1993,47 @@ unsafe extern "system" fn window_proc(
             apply_update(hwnd, *update);
             0
         }
+        WM_LBUTTONDOWN => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let point = POINT {
+                x: (lparam as i32) & 0xFFFF,
+                y: ((lparam as i32) >> 16) & 0xFFFF,
+            };
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            let l = layout(state, client);
+            if let Some((track_top, _bottom, thumb_h, travel, x)) = scrollbar_geometry(state, &l) {
+                // 命中区域放宽到 10px：4px 的条子太细，不好抓
+                if point.x >= x - ui::s(6.0, state.scale) && point.x <= x + ui::s(10.0, state.scale) {
+                    let offset = if state.max_scroll > 0 {
+                        (state.scroll as f32 / state.max_scroll as f32 * travel as f32) as i32
+                    } else {
+                        0
+                    };
+                    let thumb_top = track_top + offset;
+                    let grab = (point.y - thumb_top).clamp(0, thumb_h);
+                    let _ = thumb_h;
+                    state.scroll_drag = Some(grab);
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+            }
+            0
+        }
         WM_LBUTTONUP => {
             let state = state_of(hwnd);
             if state.is_null() {
+                return 0;
+            }
+            if (*state).scroll_drag.is_some() {
+                (*state).scroll_drag = None;
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                InvalidateRect(hwnd, std::ptr::null(), 0);
                 return 0;
             }
             let point = POINT {
