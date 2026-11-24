@@ -370,8 +370,10 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
     };
     let scale = crate::scale_at(center);
     let (width, height) = measure(hint, scale);
-    // 同一次悬停里宽度只增不减：每秒刷新时数字长短一变就重排窗口的话，
-    // 会看到「框先变、内容后到」的半截画面（放大后的新区域要等下一次 WM_PAINT）
+    // 宽度先按 16px 一档对齐：数字长短差几个像素时不会因为「263 还是 266」改窗口，
+    // 再按这次悬停见过的最宽的档位记住——同一次悬停里宽度只增不减，
+    // 免得每秒重排一次窗口（看起来就是气泡左右抽、内容还慢半拍）
+    let width = quantize(width, scale);
     let width = match hint.tag {
         Some(tag) => remember_width(tag, width),
         None => width,
@@ -494,22 +496,34 @@ pub fn hide() {
     forget_width();
 }
 
+/// 宽度按 16px 一档向上取整：邻近两档内的数字变化不会触发窗口改尺寸。
+fn quantize(width: i32, scale: f32) -> i32 {
+    let step = ui::s(16.0, scale).max(8);
+    ((width + step - 1) / step) * step
+}
+
 /// 这次悬停见过的最宽值（同 tag 才累加）；`hide()` 时清零。
+///
+/// 只增不减：数据每秒跳一下，宽度跟着跳就会左右抽；这次悬停里保持最宽的那档，
+/// 结束（鼠标移开）后自然还原。
 fn remember_width(tag: &'static str, width: i32) -> i32 {
     use std::sync::{Mutex, OnceLock};
 
     static SLOT: OnceLock<Mutex<Option<(&'static str, i32)>>> = OnceLock::new();
-    let cell = SLOT.get_or_init(|| Mutex::new(None));
 
+    let cell = SLOT.get_or_init(|| Mutex::new(None));
     if let Ok(mut slot) = cell.lock() {
-        if let Some((saved, widest)) = *slot {
-            if saved == tag {
+        match *slot {
+            Some((saved, widest)) if saved == tag => {
                 let widest = widest.max(width);
                 *slot = Some((tag, widest));
                 return widest;
             }
+            _ => {
+                *slot = Some((tag, width));
+                return width;
+            }
         }
-        *slot = Some((tag, width));
     }
     width
 }

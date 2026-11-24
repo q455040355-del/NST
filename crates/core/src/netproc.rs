@@ -411,8 +411,8 @@ impl NetProcessWatcher {
             Err(_) => return NetProcessSnapshot::default(),
         };
 
-        let mut up: Vec<(u32, f64)> = Vec::new();
-        let mut down: Vec<(u32, f64)> = Vec::new();
+        let mut up: Vec<(String, f64, u32)> = Vec::new();
+        let mut down: Vec<(String, f64, u32)> = Vec::new();
         let mut total_up = 0.0;
         let mut total_down = 0.0;
 
@@ -424,40 +424,20 @@ impl NetProcessWatcher {
             total_up += up_rate;
             total_down += down_rate;
             if up_rate >= 1.0 {
-                up.push((*pid, up_rate));
+                up.push((self.name_of(*pid), up_rate, *pid));
             }
             if down_rate >= 1.0 {
-                down.push((*pid, down_rate));
+                down.push((self.name_of(*pid), down_rate, *pid));
             }
         }
         self.previous = totals;
 
-        up.sort_by(|a, b| b.1.total_cmp(&a.1));
-        down.sort_by(|a, b| b.1.total_cmp(&a.1));
-        up.truncate(TOP);
-        down.truncate(TOP);
-
-        let mut snapshot = NetProcessSnapshot {
+        let snapshot = NetProcessSnapshot {
             total_up,
             total_down,
-            ..Default::default()
+            up: top_traffic(up),
+            down: top_traffic(down),
         };
-        snapshot.up = up
-            .into_iter()
-            .map(|(pid, rate)| ProcTraffic {
-                name: self.name_of(pid),
-                pid,
-                bytes_per_sec: rate,
-            })
-            .collect();
-        snapshot.down = down
-            .into_iter()
-            .map(|(pid, rate)| ProcTraffic {
-                name: self.name_of(pid),
-                pid,
-                bytes_per_sec: rate,
-            })
-            .collect();
 
         // PID 会复用：同一时刻最多几十个进程在跑，缓存超过 512 条就整个作废
         if self.names.len() > 512 {
@@ -492,6 +472,32 @@ impl Drop for NetProcessWatcher {
             map.clear();
         }
     }
+}
+
+/// 同名进程合并成一行（浏览器常开好几个同名进程），按速率取前 `TOP` 个。
+fn top_traffic(items: Vec<(String, f64, u32)>) -> Vec<ProcTraffic> {
+    let mut merged: HashMap<String, (f64, u32, f64)> = HashMap::new();
+    for (name, rate, pid) in items {
+        let entry = merged.entry(name).or_insert((0.0, pid, 0.0));
+        entry.0 += rate;
+        // pid 留「贡献最大」的那个，方便对着任务管理器查
+        if rate > entry.2 {
+            entry.2 = rate;
+            entry.1 = pid;
+        }
+    }
+
+    let mut list: Vec<ProcTraffic> = merged
+        .into_iter()
+        .map(|(name, (bytes_per_sec, pid, _))| ProcTraffic {
+            name,
+            pid,
+            bytes_per_sec,
+        })
+        .collect();
+    list.sort_by(|a, b| b.bytes_per_sec.total_cmp(&a.bytes_per_sec));
+    list.truncate(TOP);
+    list
 }
 
 #[cfg(test)]
@@ -594,6 +600,34 @@ mod tests {
         ipv6[8] = 0x20;
         ipv6[9] = 0x01;
         assert!(!is_loopback(26, &ipv6));
+    }
+
+    #[test]
+    fn same_name_processes_are_merged() {
+        let list = top_traffic(vec![
+            ("chrome".to_string(), 300.0, 100),
+            ("Code".to_string(), 900.0, 200),
+            ("chrome".to_string(), 500.0, 300),
+        ]);
+        assert_eq!(list.len(), 2, "同名只留一行");
+        assert_eq!(list[0].name, "Code");
+        assert_eq!(list[0].pid, 200);
+        // chrome 两条 300 + 500 并成一条
+        assert_eq!(list[1].name, "chrome");
+        assert_eq!(list[1].bytes_per_sec, 800.0);
+        // pid 记贡献最大的那个
+        assert_eq!(list[1].pid, 300);
+    }
+
+    #[test]
+    fn top_list_is_capped_and_sorted() {
+        let items: Vec<(String, f64, u32)> = (0..10)
+            .map(|index| (format!("p{index}"), index as f64 * 100.0, index as u32 + 1))
+            .collect();
+        let list = top_traffic(items);
+        assert_eq!(list.len(), TOP);
+        assert_eq!(list[0].name, "p9", "速率最大的排第一");
+        assert!(list.windows(2).all(|pair| pair[0].bytes_per_sec >= pair[1].bytes_per_sec));
     }
 
     #[test]
