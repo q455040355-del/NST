@@ -1483,6 +1483,59 @@ fn text_of_action(action: Action) -> &'static str {
     }
 }
 
+/// 工具 / 动作的快捷键：tooltip 里显示，键盘处理也按这张表走
+fn shortcut_of(action: Action) -> &'static str {
+    match action {
+        Action::Tool(Tool::Arrow) => "A",
+        Action::Tool(Tool::Rect) => "R",
+        Action::Tool(Tool::Square) => "Shift+R",
+        Action::Tool(Tool::Ellipse) => "O",
+        Action::Tool(Tool::Line) => "L",
+        Action::Tool(Tool::Marker) => "H",
+        Action::Tool(Tool::Spotlight) => "P",
+        Action::Tool(Tool::Numbered) => "N",
+        Action::Tool(Tool::Eraser) => "E",
+        Action::Tool(Tool::Pen) => "B",
+        Action::Tool(Tool::Text) => "T",
+        Action::Tool(Tool::Mosaic) => "M",
+        Action::Tool(Tool::Ocr) => "Ctrl+Shift+O",
+        Action::Tool(Tool::Translate) => "Ctrl+Shift+T",
+        Action::Undo => "Ctrl+Z",
+        Action::Redo => "Ctrl+Y",
+        Action::Copy => "Ctrl+C",
+        Action::Save => "Ctrl+S",
+        Action::Rotate => "Ctrl+R",
+        Action::Done => "Enter",
+        Action::Close => "Esc",
+        Action::Minimize => "-",
+        _ => "",
+    }
+}
+
+/// 字母键 → 工具（没按修饰键时生效）
+fn tool_for_letter(key: u32, shift: bool) -> Option<Tool> {
+    Some(match key {
+        0x41 => Tool::Arrow,      // A
+        0x52 => {
+            if shift {
+                Tool::Square
+            } else {
+                Tool::Rect
+            }
+        } // R / Shift+R
+        0x4F => Tool::Ellipse,    // O
+        0x4C => Tool::Line,       // L
+        0x48 => Tool::Marker,     // H
+        0x50 => Tool::Spotlight,  // P
+        0x4E => Tool::Numbered,   // N
+        0x45 => Tool::Eraser,     // E
+        0x42 => Tool::Pen,        // B
+        0x54 => Tool::Text,       // T
+        0x4D => Tool::Mosaic,     // M
+        _ => return None,
+    })
+}
+
 /// 图形都存「图片坐标」，画到窗口上要乘显示缩放。
 ///
 /// 大图（整屏截图）会被缩到工作区的 85% 显示，之前只平移没缩放，
@@ -3020,16 +3073,23 @@ fn draw_glyph_sized(dc: HDC, text: &str, rect: RECT, color: u32, points: f32) {
 /// hover 时在底栏上方弹一个小标签（图标没文字，靠它认工具）
 fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke: u8) {
     unsafe {
-        let label = match action {
+        let name = match action {
             Action::Stroke => STROKE_LABELS[stroke.min(2) as usize],
             _ => text_of_action(action),
         };
-        if label.is_empty() {
+        if name.is_empty() {
             return;
         }
+        // 「矩形  R」：图标没文字，光看名字也认不出快捷键
+        let key = shortcut_of(action);
+        let label = if key.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}   {key}")
+        };
         let font = cached_font(8.5, 500);
         let old_font = SelectObject(dc, font as HGDIOBJ);
-        let width = wide_width(dc, label) + s(16.0);
+        let width = wide_width(dc, &label) + s(20.0);
         let height = s(20.0);
         let left = ((anchor.left + anchor.right) / 2 - width / 2).max(s(4.0));
         let top = bar_top - height - s(5.0);
@@ -3051,7 +3111,7 @@ fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke:
         let mut target = rect;
         DrawTextW(
             dc,
-            wide(label).as_ptr(),
+            wide(&label).as_ptr(),
             -1,
             &mut target,
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
@@ -4180,6 +4240,28 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             0
         }
         WM_KEYDOWN => {
+            // 正在输入文字时，字母归输入框
+            let typing = {
+                let editor = editor_state(hwnd);
+                !editor.is_null() && (*editor).text.is_some()
+            };
+            if !typing {
+                let ctrl = GetKeyState(0x11) < 0;
+                let alt = GetKeyState(0x12) < 0;
+                if !ctrl && !alt {
+                    let shift = GetKeyState(0x10) < 0;
+                    if let Some(tool) = tool_for_letter(wparam as u32, shift) {
+                        let editor = editor_state(hwnd);
+                        if !editor.is_null() {
+                            (*editor).tool = tool;
+                            (*editor).drag_from = None;
+                            (*editor).drag_to = None;
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
+                    }
+                }
+            }
             match wparam as u32 {
                 // + / = 放大，- 缩小，0 回到适配大小（锚点取窗口中心）
                 0xBB | 0x6B | 0x6A => {
