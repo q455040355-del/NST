@@ -65,6 +65,8 @@ pub struct Settings {
     pub translate_model: String,
     /// Base URL；空 = 用服务商默认值
     pub translate_base: String,
+    /// 译成什么语言："auto"（中→英、其它→中）/ "zh" / "en" / "ja" / "ko"
+    pub translate_target: String,
     /// 三家服务商各自的 Key / 模型 / Base：切换服务商时照着搬，切回来还是上次填的
     pub translate_profiles: [TranslateProfile; TRANSLATE_PROVIDERS.len()],
     /// 未识别的键原样保留，写回时补上，避免把 C# 版的设置弄丢。
@@ -127,6 +129,7 @@ impl Default for Settings {
             translate_key: String::new(),
             translate_model: String::new(),
             translate_base: String::new(),
+            translate_target: "auto".to_string(),
             translate_profiles: Default::default(),
             extra: BTreeMap::new(),
         }
@@ -209,6 +212,7 @@ impl Settings {
                 "TranslateKey" => settings.translate_key = value.to_string(),
                 "TranslateModel" => settings.translate_model = value.to_string(),
                 "TranslateBase" => settings.translate_base = value.to_string(),
+                "TranslateTarget" => settings.translate_target = value.to_string(),
                 "GifHotkey" => {
                     if let Some((mods, vk)) = parse_hotkey(value) {
                         settings.gif_hotkey = format_hotkey(mods, vk);
@@ -340,6 +344,7 @@ impl Settings {
         out.push_str(&format!("TranslateKey={}\n", self.translate_key));
         out.push_str(&format!("TranslateModel={}\n", self.translate_model));
         out.push_str(&format!("TranslateBase={}\n", self.translate_base));
+        out.push_str(&format!("TranslateTarget={}\n", self.translate_target));
         for (index, name) in TRANSLATE_PROVIDERS.iter().enumerate() {
             if let Some(profile) = self.translate_profiles.get(index) {
                 out.push_str(&format!("TranslateKey.{name}={}\n", profile.key));

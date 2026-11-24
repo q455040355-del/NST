@@ -67,6 +67,14 @@ static ANIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 static ANIM_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ANIM_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 译成什么语言：(显示名, 存进 ini 的值)
+const TARGETS: [(&str, &str); 4] = [
+    ("自动", "auto"),
+    ("中文", "zh"),
+    ("English", "en"),
+    ("日本語", "ja"),
+];
+
 /// 面板字号（显示文案, 百分比）
 const FONT_OPTIONS: [(&str, i32); 4] = [("小", 90), ("标准", 100), ("大", 110), ("特大", 125)];
 
@@ -154,6 +162,7 @@ enum Hit {
     Update,
     /// 「翻译」区块右上角的总开关
     TrToggle,
+    TrTarget,
 }
 
 struct Fonts {
@@ -438,6 +447,8 @@ struct State {
     tr_profiles: [netspeed_core::settings::TranslateProfile; 2],
     /// 输入框里的选中范围（字符下标，start..end）；None = 没选中
     tr_sel: Option<(usize, usize)>,
+    /// 译成什么语言（TARGETS 的下标）
+    tr_target: usize,
     /// 正在测连接
     test_busy: bool,
     /// 上一次测连接的结果：(成功?, 说明)
@@ -513,6 +524,8 @@ struct Layout {
     tr_fetch: RECT,
     /// 「测试连接」
     tr_test: RECT,
+    /// 目标语言胶囊（翻译标题右边、总开关左边）
+    tr_target: RECT,
 }
 
 /// 翻译区块里可编辑的输入框
@@ -688,6 +701,13 @@ fn layout(state: &State, client: RECT) -> Layout {
             top: s(TR_ROW1_TOP, scale),
             right,
             bottom: s(TR_ROW1_TOP + TR_BOX_H, scale),
+        },
+        // 翻译标题右边、开关左边的「目标 自动」
+        tr_target: RECT {
+            left: right - s(150.0, scale),
+            top: s(TR_TITLE_TOP + 1.0, scale),
+            right: right - s(48.0, scale),
+            bottom: s(TR_TITLE_TOP + 27.0, scale),
         },
         // Base URL 下面那行「测试连接」
         tr_test: RECT {
@@ -1629,6 +1649,32 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             right_left + p.s(4.0),
             l.tr_toggle.left - p.s(10.0),
         );
+        // 目标语言：一颗小胶囊，点一下在 自动 / 中文 / English / 日本語 之间轮
+        {
+            let target = l.tr_target;
+            let hovered = state.hover == Some(Hit::TrTarget);
+            p.round(
+                target.left,
+                target.top,
+                target.right,
+                target.bottom,
+                p.s(8.0),
+                if hovered { c.chip } else { c.surface },
+                if hovered { c.chip } else { c.border },
+            );
+            let label = format!("目标 · {}", TARGETS[state.tr_target.min(TARGETS.len() - 1)].0);
+            p.text(
+                &label,
+                state.fonts.small,
+                if hovered { c.text } else { c.text2 },
+                target.left + p.s(8.0),
+                target.top,
+                target.right - p.s(8.0),
+                target.bottom,
+                DT_CENTER,
+            );
+        }
+
         // 总开关：关掉的时候下面四条整个收起来（手风琴）
         let toggle = l.tr_toggle;
         let toggle_mid = (toggle.top + toggle.bottom) / 2;
@@ -2649,6 +2695,10 @@ pub fn open(parent: HWND, settings: &Settings) {
                 settings.translate_profiles[1].clone(),
             ],
             tr_sel: None,
+            tr_target: TARGETS
+                .iter()
+                .position(|(_, key)| *key == settings.translate_target.trim().to_lowercase())
+                .unwrap_or(0),
             test_busy: false,
             test_result: None,
             tr_caret: 0,
@@ -2842,6 +2892,9 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.tr_toggle, point) {
         return Some(Hit::TrToggle);
     }
+    if state.translate_enabled && contains(&l.tr_target, point) {
+        return Some(Hit::TrTarget);
+    }
     // 快捷键胶囊比整行矮，得先判
     if contains(&l.shot_hotkey, point) {
         return Some(Hit::ShotHotkey);
@@ -2910,6 +2963,7 @@ fn nav_items(state: &State) -> Vec<Hit> {
     items.push(Hit::GifFps);
     items.push(Hit::GifHotkey);
     items.push(Hit::TrToggle);
+    items.push(Hit::TrTarget);
     items.push(Hit::AutoStart);
     items.push(Hit::Done);
     items
@@ -2933,6 +2987,7 @@ fn focus_rect(state: &State, client: RECT, hit: Hit) -> Option<RECT> {
         Hit::GifFps => l.gif_fps,
         Hit::GifHotkey => l.gif_hotkey,
         Hit::TrToggle => l.tr_toggle,
+        Hit::TrTarget => l.tr_target,
         Hit::AutoStart => l.auto_start,
         Hit::Done => l.done,
         _ => return None,
@@ -2956,6 +3011,7 @@ fn commit_translate(state: &State) {
         &state.tr_key,
         &state.tr_model,
         &state.tr_base,
+        TARGETS[state.tr_target.min(TARGETS.len() - 1)].1,
         &profiles,
     );
 }
@@ -3610,6 +3666,14 @@ unsafe extern "system" fn dialog_proc(
                     return 0;
                 }
 
+                // 目标语言：点一下换下一个
+                if inside(l.tr_target) {
+                    state.tr_target = (state.tr_target + 1) % TARGETS.len();
+                    commit_translate(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+
                 // 「测试连接」：真发一条最短的请求，通了才算配好
                 if inside(l.tr_test) && !state.test_busy {
                     start_connection_test(state);
@@ -3727,6 +3791,11 @@ unsafe extern "system" fn dialog_proc(
                 }
                 Some(Hit::TrToggle) => {
                     toggle_translate(state);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                Some(Hit::TrTarget) => {
+                    state.tr_target = (state.tr_target + 1) % TARGETS.len();
+                    commit_translate(state);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 Some(Hit::AutoStart) => {

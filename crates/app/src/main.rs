@@ -1609,6 +1609,7 @@ pub(crate) fn apply_translate_settings(
     key: &str,
     model: &str,
     base: &str,
+    target: &str,
     profiles: &[netspeed_core::settings::TranslateProfile],
 ) {
     if let Some(panel) = panel_mut(parent) {
@@ -1616,6 +1617,7 @@ pub(crate) fn apply_translate_settings(
         panel.settings.translate_key = key.to_string();
         panel.settings.translate_model = model.to_string();
         panel.settings.translate_base = base.to_string();
+        panel.settings.translate_target = target.to_string();
         // 每家一份：切换服务商时互不覆盖
         for (slot, profile) in panel.settings.translate_profiles.iter_mut().zip(profiles) {
             *slot = profile.clone();

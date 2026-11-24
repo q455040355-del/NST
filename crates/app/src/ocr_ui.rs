@@ -34,6 +34,9 @@ const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETSEL: u32 = 0x00B1;
 
 /// 窗口逻辑尺寸（比原来宽一点：逐句要并排放下「原文 + 译文」还不挤）
+/// 上次用的看法：0 逐句 / 1 整段（只取字不记，那是临时看一眼）
+static LAST_VIEW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 const WINDOW_W: f32 = 720.0;
 const WINDOW_H: f32 = 520.0;
 
@@ -849,7 +852,15 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             }
         }
 
-        let view = if can_lines { View::Lines } else { View::Ocr };
+        let view = if can_lines {
+            // 记住上次看的姿势：偏爱「整段」的人不用每回都切
+            match LAST_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => View::Prose,
+                _ => View::Lines,
+            }
+        } else {
+            View::Ocr
+        };
         let status = match error {
             Some(message) => message.to_string(),
             None => {
@@ -1140,6 +1151,7 @@ unsafe extern "system" fn window_proc(
                 }
                 if contains(&l.view_lines, point) {
                     (*state).view = View::Lines;
+                    LAST_VIEW.store(0, std::sync::atomic::Ordering::Relaxed);
                     (*state).scroll = 0;
                     layout_edit(hwnd);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -1147,6 +1159,7 @@ unsafe extern "system" fn window_proc(
                 }
                 if contains(&l.view_prose, point) {
                     (*state).view = View::Prose;
+                    LAST_VIEW.store(1, std::sync::atomic::Ordering::Relaxed);
                     (*state).scroll = 0;
                     layout_edit(hwnd);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -1287,6 +1300,25 @@ unsafe extern "system" fn window_proc(
                             Some(index) if state.view == View::Lines => copy_row(hwnd, index),
                             _ => copy_all(hwnd),
                         }
+                    }
+                }
+                // 1 / 2 / 3：逐句 / 整段 / 只取字
+                0x31 | 0x32 | 0x33 => {
+                    if state.has_translation() {
+                        let next = match wparam as u32 {
+                            0x31 => View::Lines,
+                            0x32 => View::Prose,
+                            _ => View::Ocr,
+                        };
+                        state.view = next;
+                        state.scroll = 0;
+                        match next {
+                            View::Lines => LAST_VIEW.store(0, std::sync::atomic::Ordering::Relaxed),
+                            View::Prose => LAST_VIEW.store(1, std::sync::atomic::Ordering::Relaxed),
+                            View::Ocr => {}
+                        }
+                        layout_edit(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
                 }
                 0x21 => {

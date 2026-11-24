@@ -42,12 +42,21 @@ fn target_language(text: &str) -> &'static str {
     }
 }
 
-fn prompt(text: &str) -> String {
+/// 用户指定了目标语言就用指定的，否则按原文语种自动选
+fn target_for(settings: &netspeed_core::settings::Settings, text: &str) -> &'static str {
+    match settings.translate_target.trim().to_lowercase().as_str() {
+        "zh" | "chinese" => "Simplified Chinese",
+        "en" | "english" => "English",
+        "ja" | "japanese" => "Japanese",
+        "ko" | "korean" => "Korean",
+        _ => target_language(text),
+    }
+}
+
+fn prompt_for(text: &str, target: &str) -> String {
     format!(
-        "Translate the following text into {}. Keep the line breaks and the original order. \
-Only output the translation, no explanations, no quotes.\n\n{}",
-        target_language(text),
-        text
+        "Translate the following text into {target}. Keep the line breaks and the original order. \
+Only output the translation, no explanations, no quotes.\n\n{text}"
     )
 }
 
@@ -365,7 +374,7 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
         "temperature": 0.2,
         "messages": [
             { "role": "system", "content": "You are a translation engine. Output only the translation." },
-            { "role": "user", "content": prompt(text) }
+            { "role": "user", "content": prompt_for(text, target_for(settings, text)) }
         ]
     });
     let body = payload.to_string();
