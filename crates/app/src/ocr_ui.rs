@@ -40,7 +40,8 @@ const EM_SETSEL: u32 = 0x00B1;
 
 /// 窗口逻辑尺寸（比原来宽一点：逐句要并排放下「原文 + 译文」还不挤）
 /// 上次用的看法：0 逐句 / 1 整段（只取字不记，那是临时看一眼）
-static LAST_VIEW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 上次用的看法：0 逐句 / 1 整段。默认整段（逐句要自己点）
+static LAST_VIEW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
 const WINDOW_W: f32 = 720.0;
 const WINDOW_H: f32 = 520.0;
@@ -105,6 +106,8 @@ struct State {
     target: usize,
     /// 正在等什么：0 空闲 / 1 等整段译文 / 2 等按句对齐
     pending: u8,
+    /// 现在这组 rows 是不是按标点对过齐的（整段翻出来的不算）
+    aligned: bool,
     /// 打字机：已显示多少个目标字
     reveal: usize,
     reveal_total: usize,
@@ -907,6 +910,8 @@ struct AsyncUpdate {
     translated: String,
     error: Option<String>,
     pairs: Option<Vec<(String, String)>>,
+    /// pairs 来自「按句编号翻译」才算对齐
+    aligned: bool,
 }
 
 fn state_target(state: &State) -> usize {
@@ -938,6 +943,7 @@ fn request_retranslate(hwnd: HWND, target: usize) {
     std::thread::spawn(move || {
         let update = match crate::translate::translate_pairs(&settings, &source) {
             Ok(pairs) => AsyncUpdate {
+                aligned: true,
                 source: source.clone(),
                 translated: pairs
                     .iter()
@@ -948,6 +954,7 @@ fn request_retranslate(hwnd: HWND, target: usize) {
                 pairs: Some(pairs),
             },
             Err(error) => AsyncUpdate {
+                aligned: false,
                 source: source.clone(),
                 translated: String::new(),
                 error: Some(error),
@@ -1008,6 +1015,7 @@ unsafe fn apply_update(hwnd: HWND, update: AsyncUpdate) {
         }
         None => {
             state.error = None;
+            state.aligned = update.aligned;
             state.translated = update.translated.clone();
             state.rows.clear();
             if let Some(pairs) = update.pairs {
@@ -1163,6 +1171,7 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             measured_width: -1,
             target: settings_target_index(),
             pending: 0,
+            aligned: false,
             reveal: usize::MAX,
             reveal_total: 0,
             tracking_leave: false,
@@ -1461,8 +1470,8 @@ unsafe extern "system" fn window_proc(
                     (*state).view = View::Lines;
                     LAST_VIEW.store(0, std::sync::atomic::Ordering::Relaxed);
                     (*state).scroll = 0;
-                    // 整段只有一行时，切逐句要先按句拆开、再对照翻一次
-                    if (*state).rows.len() <= 1 && crate::translate::split_units(&(*state).source).len() > 1 {
+                    // 整段翻出来的 rows 是「按行」的，不是按句：先按标点拆开再对照翻一次
+                    if !(*state).aligned && crate::translate::split_units(&(*state).source).len() > 1 {
                         request_align(hwnd);
                     }
                     layout_edit(hwnd);
@@ -1732,8 +1741,8 @@ pub unsafe fn preview_png(path: &str, view: &str) -> bool {
     if hwnd.is_null() {
         return false;
     }
-    // 按名字切到指定视图再截
-    {
+    // 按名字切到指定视图再截（"default" = 不动，就用真实默认视图）
+    if view != "default" {
         let state = state_of(hwnd);
         if !state.is_null() {
             (*state).view = match view {
@@ -1842,6 +1851,7 @@ pub fn update_translation(
     unsafe {
         let pairs = pairs.or_else(|| build_pairs(source, translated));
         let update = AsyncUpdate {
+            aligned: false,
             source: source.to_string(),
             translated: translated.to_string(),
             error: error.map(|error| error.to_string()),

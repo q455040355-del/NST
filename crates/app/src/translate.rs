@@ -395,37 +395,37 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
     Ok(translated)
 }
 
-/// 把一段文字拆成「句」：先按换行，太长的行再按句号/问号/叹号/分号切。
-/// 逐句对照要靠它，模型的断行不可靠。
+/// 把一段文字拆成「句」：**按标点切，不看换行**。
+/// 换行只是 OCR 的排版痕迹（一行半句、两行一句都很常见），标点才是句子的边界。
 pub fn split_units(text: &str) -> Vec<String> {
     let mut units: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut current = String::new();
+    for ch in text.chars() {
+        // 换行、制表当成空格（不参与断句）
+        let ch = if ch == '\n' || ch == '\r' || ch == '\t' {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' && current.ends_with(' ') {
             continue;
         }
-        if line.chars().count() <= 90 {
-            units.push(line.to_string());
-            continue;
-        }
-        // 长行按中英文标点切，标点留在句尾
-        let mut current = String::new();
-        for ch in line.chars() {
-            current.push(ch);
-            let boundary = matches!(
-                ch,
-                '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；' | '，' | '、'
-            ) || (ch == ',' && current.chars().count() > 60);
-            // 边界停顿太短不切（「12. 5」这种），太长则无条件切（没有标点的长串）
-            if (boundary && current.chars().count() > 12) || current.chars().count() >= 200 {
-                units.push(current.trim().to_string());
-                current.clear();
-            }
-        }
-        if !current.trim().is_empty() {
+        current.push(ch);
+        let boundary = matches!(
+            ch,
+            '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；' | '…'
+        ) || (ch == ',' && current.chars().count() > 60);
+        let length = current.chars().count();
+        // 边界停顿太短不切（"12. 5" 这种），太长则无条件切（没有标点的长串）
+        if (boundary && length > 2) || length >= 200 {
             units.push(current.trim().to_string());
+            current.clear();
         }
     }
+    if !current.trim().is_empty() {
+        units.push(current.trim().to_string());
+    }
+    units.retain(|unit| !unit.is_empty());
     units
 }
 
@@ -551,20 +551,13 @@ pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
                         drop(Box::from_raw(early));
                     }
                 }
-                match translate_pairs(&settings, &source) {
-                Ok(pairs) => {
-                    let translated = pairs
-                        .iter()
-                        .map(|(_, target)| target.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    TranslateOutcome {
-                        source,
-                        translated,
-                        error: None,
-                        pairs: Some(pairs),
-                    }
-                }
+                match translate_text(&source, &settings) {
+                Ok(translated) => TranslateOutcome {
+                    source,
+                    translated,
+                    error: None,
+                    pairs: None,
+                },
                 Err(error) => TranslateOutcome {
                     source,
                     translated: String::new(),
@@ -595,6 +588,29 @@ pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_units_breaks_on_punctuation_not_newlines() {
+        // 换行只是排版，句子边界看标点
+        let text = "Latency budget. The panel samples the taskbar twice a second.\nIf sampling fails, the last good color is kept for 30 seconds.";
+        let units = split_units(text);
+        assert_eq!(units.len(), 3, "按句号切三句：{units:?}");
+        assert!(units[2].starts_with("If sampling"), "第二行要和上一句合并后重新按标点切");
+        assert!(!units[0].contains('\n'), "结果里不该留换行");
+    }
+
+    #[test]
+    fn split_units_handles_chinese_punctuation() {
+        let text = "面板每秒采样两次。如果失败，会保留上一次的颜色，三十秒后再试。";
+        let units = split_units(text);
+        assert_eq!(units.len(), 2, "中文句号也要切：{units:?}");
+    }
+
+    #[test]
+    fn split_units_does_not_split_short_numbers() {
+        let units = split_units("3.5 倍");
+        assert_eq!(units.len(), 1, "小数点不能被当成句号：{units:?}");
+    }
 
     #[test]
     fn missing_key_is_reported_before_any_request() {

@@ -205,7 +205,7 @@ fn main() {
 
         // 调试用：把取字 / 翻译结果窗离屏画成 PNG（改这块布局时做像素比对）
         if let Some(path) = std::env::var_os("NST_OCR_PREVIEW") {
-            let view = std::env::var("NST_OCR_PREVIEW_VIEW").unwrap_or_else(|_| "lines".into());
+            let view = std::env::var("NST_OCR_PREVIEW_VIEW").unwrap_or_else(|_| "default".into());
             let ok = ocr_ui::preview_png(&path.to_string_lossy(), &view);
             crate::debug_log(&format!("ocr preview -> {ok}"));
             return;
