@@ -401,13 +401,150 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
     Ok(translated)
 }
 
+/// 把一段文字拆成「句」：先按换行，太长的行再按句号/问号/叹号/分号切。
+/// 逐句对照要靠它，模型的断行不可靠。
+pub fn split_units(text: &str) -> Vec<String> {
+    let mut units: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.chars().count() <= 90 {
+            units.push(line.to_string());
+            continue;
+        }
+        // 长行按中英文标点切，标点留在句尾
+        let mut current = String::new();
+        for ch in line.chars() {
+            current.push(ch);
+            let boundary = matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；')
+                || (ch == ',' && current.chars().count() > 60);
+            if boundary && current.chars().count() > 12 {
+                units.push(current.trim().to_string());
+                current.clear();
+            }
+        }
+        if !current.trim().is_empty() {
+            units.push(current.trim().to_string());
+        }
+    }
+    units
+}
+
+/// 按句翻译：把 N 句编号发过去，要求原样返回 N 行，返回 (原文, 译文) 列表。
+/// 模型没按行返回就退回整段翻译，再按行硬分。
+pub fn translate_pairs(
+    settings: &netspeed_core::settings::Settings,
+    source: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let units = split_units(source);
+    if units.is_empty() {
+        return Err("没识别出文字".to_string());
+    }
+    if units.len() == 1 {
+        let translated = translate_text(source, settings)?;
+        return Ok(vec![(units[0].clone(), translated)]);
+    }
+    let target = target_for(settings, source);
+    let mut numbered = String::new();
+    for (index, unit) in units.iter().enumerate() {
+        numbered.push_str(&format!("{}. {}\n", index + 1, unit));
+    }
+    let instruction = format!(
+        "Translate each numbered line into {target}. Return exactly {} lines, \
+one translation per input line, keeping the same order and the same leading number \
+(\"1. ...\", \"2. ...\"). Do not merge or split lines. Output nothing else.",
+        units.len()
+    );
+
+    let (base, model) = endpoint(settings);
+    let url = format!("{base}/chat/completions");
+    let payload = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            { "role": "system", "content": "You are a translation engine. Output only the translation." },
+            { "role": "user", "content": format!("{instruction}\n\n{numbered}") }
+        ]
+    });
+    let headers = format!(
+        "Content-Type: application/json\r\nAuthorization: Bearer {}\r\n",
+        settings.translate_key.trim()
+    );
+    let raw = http_request("POST", &url, &headers, Some(payload.to_string().as_bytes()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| "服务端返回的不是 JSON".to_string())?;
+    let text = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // 去掉行首编号，按顺序配对
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let stripped = match line.find(['.', '、', '）', ')']) {
+            Some(index) if index <= 3 => line[index + 1..].trim().to_string(),
+            _ => line.to_string(),
+        };
+        if !stripped.is_empty() {
+            lines.push(stripped);
+        }
+    }
+    if lines.len() == units.len() {
+        for (unit, line) in units.iter().zip(lines.iter()) {
+            pairs.push((unit.clone(), line.clone()));
+        }
+        return Ok(pairs);
+    }
+    // 数量对不上：整段翻译一次，按行切，能切多少算多少
+    let block = translate_text(source, settings)?;
+    let block_lines: Vec<String> = block
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if block_lines.len() == units.len() {
+        for (unit, line) in units.iter().zip(block_lines.iter()) {
+            pairs.push((unit.clone(), line.clone()));
+        }
+        return Ok(pairs);
+    }
+    // 实在对不上：整段算一句，至少别丢内容
+    Ok(vec![(units.join(" "), block)])
+}
+
 /// 后台线程：OCR → 翻译 → 投递回 owner（`WM_APP_TRANSLATE_READY`，wparam 是 Box 指针）
 pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
     let settings = netspeed_core::settings::Settings::load();
     let handle = owner as usize;
     std::thread::spawn(move || {
         let outcome = match crate::ocr::recognize_pub(&bitmap) {
-            Ok(source) => match translate_text(&source, &settings) {
+            Ok(source) => {
+                // 先把原文投回去开窗（别让人对着空白等几秒），再慢慢翻译
+                let early = Box::into_raw(Box::new(source.clone()));
+                unsafe {
+                    if PostMessageW(
+                        handle as HWND,
+                        crate::WM_APP_TRANSLATE_OCR,
+                        early as usize,
+                        0,
+                    ) == 0
+                    {
+                        drop(Box::from_raw(early));
+                    }
+                }
+                match translate_text(&source, &settings) {
                 Ok(translated) => TranslateOutcome {
                     source,
                     translated,
@@ -418,7 +555,8 @@ pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
                     translated: String::new(),
                     error: Some(error),
                 },
-            },
+                }
+            }
             Err(error) => TranslateOutcome {
                 source: String::new(),
                 translated: String::new(),

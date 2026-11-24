@@ -68,7 +68,7 @@ static ANIM_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 static ANIM_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 译成什么语言：(显示名, 存进 ini 的值)
-const TARGETS: [(&str, &str); 5] = [
+pub(crate) const TARGETS: [(&str, &str); 5] = [
     ("自动", "auto"),
     ("中文", "zh"),
     ("English", "en"),

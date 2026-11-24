@@ -57,6 +57,8 @@ const WM_APP_SHOW_MENU: u32 = WM_APP + 3;
 pub(crate) const WM_APP_SHOT_FIRE: u32 = WM_APP + 4;
 const WM_APP_OCR_READY: u32 = WM_APP + 5;
 const WM_APP_TRANSLATE_READY: u32 = WM_APP + 11;
+/// OCR 好了、翻译还没好：先把窗口开出来显示原文
+const WM_APP_TRANSLATE_OCR: u32 = WM_APP + 12;
 pub(crate) const WM_APP_GIF_DONE: u32 = WM_APP + 9;
 pub(crate) const WM_APP_SCROLL_DONE: u32 = WM_APP + 10;
 const WM_APP_ANIM: u32 = WM_APP + 6;
@@ -1235,13 +1237,21 @@ unsafe extern "system" fn wnd_proc(
             show_menu(hwnd);
             0
         }
+        WM_APP_TRANSLATE_OCR => {
+            let pointer = wparam as *mut String;
+            if !pointer.is_null() {
+                let source = Box::from_raw(pointer);
+                ocr_ui::open_pending(&source);
+            }
+            0
+        }
         WM_APP_TRANSLATE_READY => {
             let pointer = wparam as *mut translate::TranslateOutcome;
             if !pointer.is_null() {
                 let outcome = Box::from_raw(pointer);
-                // 原文和译文分开给：结果窗自己按「逐句 / 整段」排
-                ocr_ui::open_translate(
-                    hwnd,
+                // 原文和译文分开给：结果窗自己按「逐句 / 整段」排；
+                // 窗口通常已经由 WM_APP_TRANSLATE_OCR 开出来了，这里只把译文填进去
+                ocr_ui::update_translation(
                     &outcome.source,
                     &outcome.translated,
                     outcome.error.as_deref(),

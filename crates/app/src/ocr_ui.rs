@@ -24,6 +24,11 @@ use crate::ui::{self, font, Painter, DT_CENTER};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.OcrResult";
 
+/// 打字机的一帧
+const WM_APP_REVEAL: u32 = WM_APP + 0x41;
+/// 结果回来了（lparam 是 Box<AsyncUpdate>）
+const WM_APP_RESULT: u32 = WM_APP + 0x42;
+
 /// windows-sys 0.59 没导出 WM_MOUSELEAVE（不自己定义的话它会变成通配绑定，后面的分支全被吃掉）
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const ID_EDIT: usize = 2001;
@@ -56,6 +61,7 @@ enum Hit {
     ViewLines,
     ViewProse,
     ViewOcr,
+    Target,
     Row(usize),
     RowCopy(usize),
 }
@@ -95,6 +101,13 @@ struct State {
     viewport_h: i32,
     selected: Option<usize>,
     measured_width: i32,
+    /// 目标语言下标（settings_ui::TARGETS）
+    target: usize,
+    /// 正在等什么：0 空闲 / 1 等整段译文 / 2 等按句对齐
+    pending: u8,
+    /// 打字机：已显示多少个目标字
+    reveal: usize,
+    reveal_total: usize,
     /// 已经在等 WM_MOUSELEAVE 了
     tracking_leave: bool,
 }
@@ -119,6 +132,48 @@ impl Fonts {
     }
 }
 
+/// 设置里存的目标语言 → TARGETS 下标
+fn settings_target_index() -> usize {
+    let target = netspeed_core::settings::Settings::load().translate_target;
+    crate::settings_ui::TARGETS
+        .iter()
+        .position(|(_, key)| key.eq_ignore_ascii_case(target.trim()))
+        .unwrap_or(0)
+}
+
+/// 打字机推进：后台线程每 16ms 投一帧（和设置页动效一个做法）
+static REVEAL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn start_reveal(hwnd: HWND, total: usize) {
+    use std::sync::atomic::Ordering;
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let state = state_of(hwnd);
+        if !state.is_null() {
+            (*state).reveal = 0;
+            (*state).reveal_total = total;
+        }
+    }
+    if REVEAL_RUNNING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let raw = hwnd as isize;
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            unsafe {
+                let hwnd = raw as HWND;
+                if IsWindow(hwnd) == 0 || PostMessageW(hwnd, WM_APP_REVEAL, 0, 0) == 0 {
+                    break;
+                }
+            }
+        }
+        REVEAL_RUNNING.store(false, Ordering::Relaxed);
+    });
+}
+
 fn state_of(hwnd: HWND) -> *mut State {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State }
 }
@@ -131,6 +186,7 @@ struct Layout {
     copy: RECT,
     copy_source: RECT,
     rows: RECT,
+    target: RECT,
 }
 
 fn layout(state: &State, client: RECT) -> Layout {
@@ -185,6 +241,14 @@ fn layout(state: &State, client: RECT) -> Layout {
         bottom: client.bottom - ui::s(FOOT_H, scale),
     };
 
+    // 「目标 · Srpski (lat.)」这类长名字要放得下
+    let target = RECT {
+        left: view_lines.left - ui::s(12.0, scale) - ui::s(146.0, scale),
+        top: chip_top,
+        right: view_lines.left - ui::s(12.0, scale),
+        bottom: chip_top + chip_h,
+    };
+
     Layout {
         close,
         view_lines,
@@ -193,6 +257,7 @@ fn layout(state: &State, client: RECT) -> Layout {
         copy,
         copy_source,
         rows,
+        target,
     }
 }
 
@@ -350,6 +415,29 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
     );
 
     if state.has_translation() {
+        // 目标语言：点一下换语言并重译
+        let label = format!("目标 · {}", crate::settings_ui::TARGETS[state.target.min(crate::settings_ui::TARGETS.len() - 1)].0);
+        let hovered = state.hover == Some(Hit::Target);
+        p.round(
+            l.target.left,
+            l.target.top,
+            l.target.right,
+            l.target.bottom,
+            p.s(7.0),
+            if hovered { c.chip } else { c.surface },
+            if hovered { c.chip } else { c.border },
+        );
+        p.text(
+            &label,
+            state.fonts.small,
+            if hovered { c.text } else { c.text2 },
+            l.target.left,
+            l.target.top,
+            l.target.right,
+            l.target.bottom,
+            DT_CENTER,
+        );
+
         for (rect, view, label, hit) in [
             (l.view_lines, View::Lines, "逐句", Hit::ViewLines),
             (l.view_prose, View::Prose, "整段", Hit::ViewProse),
@@ -488,6 +576,8 @@ unsafe fn paint_lines(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
     let pad_x = ui::s(ROW_PAD_X, state.scale);
     let text_left = l.rows.left + pad_x;
     let width = (l.rows.right - pad_x) - text_left;
+    let typer = state.reveal < state.reveal_total;
+    let mut offset = 0usize;
 
     for (index, row) in state.rows.iter().enumerate() {
         let top = l.rows.top + row.top - state.scroll;
@@ -519,8 +609,16 @@ unsafe fn paint_lines(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
             );
             y += row.source_h + ui::s(ROW_GAP, state.scale);
         }
+        let target_text = if typer {
+            let count = row.target.chars().count();
+            let visible = state.reveal.saturating_sub(offset).min(count);
+            row.target.chars().take(visible).collect::<String>()
+        } else {
+            row.target.clone()
+        };
+        offset += row.target.chars().count();
         p.text_block(
-            &row.target,
+            &target_text,
             state.fonts.body,
             c.text,
             text_left,
@@ -630,15 +728,16 @@ unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
         p.text("译文", state.fonts.label, c.text3, left, y, right, y + p.s(15.0), DT_LEFT);
         y += p.s(19.0);
         let h = measure(p.dc, state.fonts.body, &state.translated, width);
-        p.text_block(
-            &state.translated,
-            state.fonts.body,
-            c.text,
-            left,
-            y,
-            left + width,
-            y + h,
-        );
+        let shown = if state.reveal < state.reveal_total {
+            state
+                .translated
+                .chars()
+                .take(state.reveal)
+                .collect::<String>()
+        } else {
+            state.translated.clone()
+        };
+        p.text_block(&shown, state.fonts.body, c.text, left, y, left + width, y + h);
     }
     if saved != 0 {
         RestoreDC(p.dc, saved);
@@ -778,6 +877,142 @@ unsafe fn copy_source(hwnd: HWND) {
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
+/// 后台翻译回来的东西
+struct AsyncUpdate {
+    source: String,
+    translated: String,
+    error: Option<String>,
+    pairs: Option<Vec<(String, String)>>,
+}
+
+fn state_target(state: &State) -> usize {
+    state.target.min(crate::settings_ui::TARGETS.len() - 1)
+}
+
+/// 按指定语言重译整段（点语言胶囊时调）
+fn request_retranslate(hwnd: HWND, target: usize) {
+    let source = unsafe {
+        let state = state_of(hwnd);
+        if state.is_null() {
+            return;
+        }
+        let state = &mut *state;
+        state.pending = 1;
+        state.status = format!(
+            "正在译成 {}…",
+            crate::settings_ui::TARGETS[target.min(crate::settings_ui::TARGETS.len() - 1)].0
+        );
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+        (*state).source.clone()
+    };
+    let mut settings = netspeed_core::settings::Settings::load();
+    settings.translate_target =
+        crate::settings_ui::TARGETS[target.min(crate::settings_ui::TARGETS.len() - 1)]
+            .1
+            .to_string();
+    let raw = hwnd as isize;
+    std::thread::spawn(move || {
+        let update = match crate::translate::translate_pairs(&settings, &source) {
+            Ok(pairs) => AsyncUpdate {
+                source: source.clone(),
+                translated: pairs
+                    .iter()
+                    .map(|(_, target)| target.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                error: None,
+                pairs: Some(pairs),
+            },
+            Err(error) => AsyncUpdate {
+                source: source.clone(),
+                translated: String::new(),
+                error: Some(error),
+                pairs: None,
+            },
+        };
+        let payload = Box::into_raw(Box::new(update));
+        unsafe {
+            if PostMessageW(raw as HWND, WM_APP_RESULT, 0, payload as isize) == 0 {
+                drop(Box::from_raw(payload));
+            }
+        }
+    });
+}
+
+/// 切「逐句」时把整段按句拆开，再对照翻一次（保证一句对一句）
+fn request_align(hwnd: HWND) {
+    unsafe {
+        let state = state_of(hwnd);
+        if state.is_null() {
+            return;
+        }
+        let state = &mut *state;
+        if state.pending != 0 {
+            return;
+        }
+        state.pending = 2;
+        state.status = "正在按句拆分并对照翻译…".to_string();
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+    let target = unsafe { (*state_of(hwnd)).target };
+    request_retranslate(hwnd, target);
+}
+
+/// 把一次后台结果装进窗口
+unsafe fn apply_update(hwnd: HWND, update: AsyncUpdate) {
+    let state = state_of(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+    state.pending = 0;
+    if !update.source.is_empty() {
+        state.source = update.source.clone();
+    }
+    match update.error {
+        Some(error) => {
+            state.error = Some(error.clone());
+            state.status = error;
+            state.reveal = usize::MAX;
+            state.reveal_total = 0;
+        }
+        None => {
+            state.error = None;
+            state.translated = update.translated.clone();
+            state.rows.clear();
+            if let Some(pairs) = update.pairs {
+                for (source, target) in pairs {
+                    state.rows.push(Row {
+                        source,
+                        target,
+                        top: 0,
+                        height: 0,
+                        source_h: 0,
+                        target_h: 0,
+                    });
+                }
+            }
+            state.measured_width = -1;
+            state.scroll = 0;
+            state.selected = None;
+            if state.view == View::Ocr && !state.rows.is_empty() {
+                state.view = match LAST_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
+                    1 => View::Prose,
+                    _ => View::Lines,
+                };
+            }
+            state.status = format!("已自动复制 · {} 字", state.unit_count());
+            if !state.translated.is_empty() {
+                crate::ocr::copy_text(&state.translated);
+            }
+            let total = state.translated.chars().count();
+            start_reveal(hwnd, total);
+        }
+    }
+    layout_edit(hwnd);
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
 fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str>) {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
@@ -894,6 +1129,10 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             viewport_h: 0,
             selected: None,
             measured_width: -1,
+            target: settings_target_index(),
+            pending: 0,
+            reveal: usize::MAX,
+            reveal_total: 0,
             tracking_leave: false,
         }));
 
@@ -923,6 +1162,7 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             return;
         }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+        LAST_HWND.with(|cell| cell.set(hwnd as isize));
 
         // OCR 视图才用得上 EDIT（逐句 / 整段是自绘只读内容）
         // EDIT 里始终放 OCR 原文：「只取字」视图靠它显示，其余视图它是隐藏的。
@@ -1038,7 +1278,15 @@ unsafe extern "system" fn window_proc(
             };
             GetClientRect(hwnd, &mut client);
             let l = layout(&*state, client);
-            if point.y < ui::s(HEAD_H, (*state).scale) && !contains(&l.close, point) {
+            // 头部只有「空白处」可以拖窗口；按钮和胶囊要能点
+            let on_header = point.y < ui::s(HEAD_H, (*state).scale);
+            let on_widget = contains(&l.close, point)
+                || ((*state).has_translation()
+                    && (contains(&l.view_lines, point)
+                        || contains(&l.view_prose, point)
+                        || contains(&l.view_ocr, point)
+                        || contains(&l.target, point)));
+            if on_header && !on_widget {
                 return HTCAPTION as LRESULT;
             }
             HTCLIENT as LRESULT
@@ -1074,6 +1322,8 @@ unsafe extern "system" fn window_proc(
                 Some(Hit::ViewProse)
             } else if state.has_translation() && contains(&l.view_ocr, point) {
                 Some(Hit::ViewOcr)
+            } else if state.has_translation() && contains(&l.target, point) {
+                Some(Hit::Target)
             } else {
                 None
             };
@@ -1119,6 +1369,27 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_APP_REVEAL => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            if state.reveal_total == 0 || state.reveal >= state.reveal_total {
+                state.reveal = state.reveal_total;
+                return 0;
+            }
+            // 约 0.9 秒打完：每帧补 total/56 个字，最少 2 个
+            let step = (state.reveal_total / 56).max(2);
+            state.reveal = (state.reveal + step).min(state.reveal_total);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        WM_APP_RESULT => {
+            let update = Box::from_raw(lparam as *mut AsyncUpdate);
+            apply_update(hwnd, *update);
+            0
+        }
         WM_LBUTTONUP => {
             let state = state_of(hwnd);
             if state.is_null() {
@@ -1153,6 +1424,10 @@ unsafe extern "system" fn window_proc(
                     (*state).view = View::Lines;
                     LAST_VIEW.store(0, std::sync::atomic::Ordering::Relaxed);
                     (*state).scroll = 0;
+                    // 整段只有一行时，切逐句要先按句拆开、再对照翻一次
+                    if (*state).rows.len() <= 1 && crate::translate::split_units(&(*state).source).len() > 1 {
+                        request_align(hwnd);
+                    }
                     layout_edit(hwnd);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                     return 0;
@@ -1163,6 +1438,12 @@ unsafe extern "system" fn window_proc(
                     (*state).scroll = 0;
                     layout_edit(hwnd);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if contains(&l.target, point) {
+                    let next = (state_target(&*state) + 1) % crate::settings_ui::TARGETS.len();
+                    (*state).target = next;
+                    request_retranslate(hwnd, next);
                     return 0;
                 }
                 if contains(&l.view_ocr, point) {
@@ -1366,7 +1647,6 @@ pub unsafe fn preview_png(path: &str, view: &str) -> bool {
 
     // 找到刚创建的那个窗口，让它把第一帧画完
     let mut message: MSG = std::mem::zeroed();
-    let mut hwnd: HWND = std::ptr::null_mut();
     for _ in 0..6 {
         while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
             TranslateMessage(&message);
@@ -1380,7 +1660,7 @@ pub unsafe fn preview_png(path: &str, view: &str) -> bool {
         Some(enum_preview),
         &mut found as *mut HWND as isize,
     );
-    hwnd = found;
+    let hwnd: HWND = found;
     if hwnd.is_null() {
         return false;
     }
@@ -1450,4 +1730,85 @@ pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
 /// 翻译结果：原文 + 译文分开给，窗口自己决定怎么排
 pub fn open_translate(_parent: HWND, source: &str, translated: &str, error: Option<&str>) {
     open_inner(Some(source), Some(translated), error);
+}
+
+/// OCR 出来就先开窗（只有原文 + 「翻译中…」），别让人对着空白等几秒
+pub fn open_pending(source: &str) {
+    open_inner(Some(source), None, None);
+    // 标记成「等译文」状态
+    unsafe {
+        let hwnd = last_hwnd();
+        if hwnd.is_null() {
+            return;
+        }
+        let state = state_of(hwnd);
+        if state.is_null() {
+            return;
+        }
+        let state = &mut *state;
+        state.pending = 1;
+        state.status = "正在翻译…".to_string();
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
+/// 译文回来了：填进已经开着的窗口（带打字机效果）
+pub fn update_translation(source: &str, translated: &str, error: Option<&str>) {
+    let hwnd = last_hwnd();
+    if hwnd.is_null() {
+        open_inner(Some(source), Some(translated), error);
+        return;
+    }
+    unsafe {
+        let pairs = build_pairs(source, translated);
+        let update = AsyncUpdate {
+            source: source.to_string(),
+            translated: translated.to_string(),
+            error: error.map(|error| error.to_string()),
+            pairs,
+        };
+        apply_update(hwnd, update);
+    }
+}
+
+thread_local! {
+    /// 最近一次创建的取字窗（异步结果回来时找它）
+    static LAST_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn last_hwnd() -> HWND {
+    LAST_HWND.with(|cell| cell.get() as HWND)
+}
+
+/// 原文 / 译文按行配对；行数对不上就整段算一句
+fn build_pairs(source: &str, translated: &str) -> Option<Vec<(String, String)>> {
+    if translated.trim().is_empty() {
+        return None;
+    }
+    let source_lines: Vec<&str> = source
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let target_lines: Vec<&str> = translated
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if !source_lines.is_empty() && source_lines.len() == target_lines.len() {
+        return Some(
+            source_lines
+                .iter()
+                .zip(target_lines.iter())
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        );
+    }
+    if target_lines.is_empty() {
+        return None;
+    }
+    Some(vec![(
+        source_lines.join(" "),
+        target_lines.join(" "),
+    )])
 }
