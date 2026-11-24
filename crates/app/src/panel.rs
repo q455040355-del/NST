@@ -550,6 +550,7 @@ impl Panel {
     pub fn process_hint(&self, up: bool) -> crate::hint::Hint {
         use crate::hint::Hint;
         use crate::netproc::{self, Status};
+        use netspeed_core::netproc::MIN_RATE;
 
         let (speed, direction) = if up {
             (&self.up_text, "上传")
@@ -592,22 +593,29 @@ impl Panel {
         } else {
             (&report.down, report.down_total)
         };
-        if items.is_empty() {
-            return card.text("刚才没有流量");
-        }
 
-        // 面板上只放得下三行 + 一行「其他」：多的并到「其他」里，占比照样加起来是 100%
-        let mut shown = 0.0;
+        // 面板上只放得下三行 + 一行「其他」：多的并到「其他」里。
+        // 明细只列 0.1 M/s 以上的（助手那边就滤过了）；「其他」够门槛才露脸。
+        // 分母跟着变：有「其他」时按全部流量算，没有时按列出来的这些算，
+        // 保证画出来的百分比总是加起来 100%，不会出现「少了 40% 却没说去哪了」。
+        let listed: Vec<&(String, f64)> = items.iter().take(3).collect();
+        let shown: f64 = listed.iter().map(|(_, rate)| *rate).sum();
+        let rest = total - shown;
+        let show_rest = rest >= MIN_RATE;
+        let denominator = if show_rest { total } else { shown };
+
         let mut card = card;
-        for (name, rate) in items.iter().take(3) {
-            shown += *rate;
-            let value = format!("{}  {:.0}%", format_speed(*rate), share(*rate, total));
+        for (name, rate) in &listed {
+            let value = format!("{}  {:.0}%", format_speed(*rate), share(*rate, denominator));
             card = card.pair(shorten_name(name), value);
         }
-        let rest = total - shown;
-        if rest > 1.0 {
-            let value = format!("{}  {:.0}%", format_speed(rest), share(rest, total));
+        if show_rest {
+            let value = format!("{}  {:.0}%", format_speed(rest), share(rest, denominator));
             card = card.pair("其他", value);
+        }
+        if card.lines.len() == 1 {
+            // 这一秒全是零碎流量：说清楚为什么没有名字，别只留一个空标题
+            card = card.text(format!("刚才没有超过 {} 的进程", format_speed(MIN_RATE)));
         }
         card
     }

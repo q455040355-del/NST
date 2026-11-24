@@ -55,6 +55,12 @@ const KERNEL_NETWORK: GUID = GUID {
 /// 管道里每个方向带几条（面板上的气泡只画得下三条 + 「其他」）。
 pub const TOP: usize = 4;
 
+/// 上榜门槛：0.1 M/s（1024 进制）。
+///
+/// 几十 B/s 的进程占了位置却什么也说明不了（还都是 0%），干脆不列；
+/// 面板那边的「其他」也按同一个门槛决定要不要显示。
+pub const MIN_RATE: f64 = 0.1 * 1024.0 * 1024.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Up,
@@ -489,6 +495,8 @@ fn top_traffic(items: Vec<(String, f64, u32)>) -> Vec<ProcTraffic> {
 
     let mut list: Vec<ProcTraffic> = merged
         .into_iter()
+        // 合并之后再判门槛：两个同名进程各 60 K/s 合起来够 0.1 M 的话，也该上榜
+        .filter(|(_, (bytes_per_sec, _, _))| *bytes_per_sec >= MIN_RATE)
         .map(|(name, (bytes_per_sec, pid, _))| ProcTraffic {
             name,
             pid,
@@ -605,24 +613,50 @@ mod tests {
     #[test]
     fn same_name_processes_are_merged() {
         let list = top_traffic(vec![
-            ("chrome".to_string(), 300.0, 100),
-            ("Code".to_string(), 900.0, 200),
-            ("chrome".to_string(), 500.0, 300),
+            ("chrome".to_string(), 300_000.0, 100),
+            ("Code".to_string(), 900_000.0, 200),
+            ("chrome".to_string(), 500_000.0, 300),
         ]);
         assert_eq!(list.len(), 2, "同名只留一行");
         assert_eq!(list[0].name, "Code");
         assert_eq!(list[0].pid, 200);
-        // chrome 两条 300 + 500 并成一条
+        // chrome 两条 300K + 500K 并成一条
         assert_eq!(list[1].name, "chrome");
-        assert_eq!(list[1].bytes_per_sec, 800.0);
+        assert_eq!(list[1].bytes_per_sec, 800_000.0);
         // pid 记贡献最大的那个
         assert_eq!(list[1].pid, 300);
     }
 
     #[test]
+    fn tiny_traffic_is_ignored() {
+        // 50 K/s、1 K/s 这种不上榜；正好到 0.1 M/s 门槛的算
+        let list = top_traffic(vec![
+            ("noise".to_string(), 50_000.0, 1),
+            ("exactly".to_string(), MIN_RATE, 2),
+            ("tiny".to_string(), 1_000.0, 3),
+        ]);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "exactly");
+
+        // 同名两条小的合并后够门槛，也应该上榜（合并先于判门槛）
+        let merged = top_traffic(vec![
+            ("chatty".to_string(), 60_000.0, 1),
+            ("chatty".to_string(), 60_000.0, 2),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bytes_per_sec, 120_000.0);
+    }
+
+    #[test]
     fn top_list_is_capped_and_sorted() {
         let items: Vec<(String, f64, u32)> = (0..10)
-            .map(|index| (format!("p{index}"), index as f64 * 100.0, index as u32 + 1))
+            .map(|index| {
+                (
+                    format!("p{index}"),
+                    (index + 1) as f64 * 200_000.0,
+                    index as u32 + 1,
+                )
+            })
             .collect();
         let list = top_traffic(items);
         assert_eq!(list.len(), TOP);

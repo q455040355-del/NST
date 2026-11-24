@@ -425,6 +425,14 @@ fn run_mock_helper() {
         } else {
             vec![("explorer".to_string(), 90.0)]
         };
+        // 真实采集那边在 core 里按 0.1 M/s 门槛滤过一遍了，假数据也照做，
+        // 不然调试路径和线上看到的不一样
+        let keep = |list: Vec<(String, f64)>| -> Vec<(String, f64)> {
+            list.into_iter()
+                .filter(|(_, rate)| *rate >= netspeed_core::netproc::MIN_RATE)
+                .collect()
+        };
+        let (up, down) = (keep(up), keep(down));
         let report = WireReport {
             up_total: up.iter().map(|(_, rate)| rate).sum(),
             down_total: down.iter().map(|(_, rate)| rate).sum(),
