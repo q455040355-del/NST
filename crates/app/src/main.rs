@@ -59,6 +59,8 @@ const WM_APP_OCR_READY: u32 = WM_APP + 5;
 const WM_APP_TRANSLATE_READY: u32 = WM_APP + 11;
 /// OCR 好了、翻译还没好：先把窗口开出来显示原文
 const WM_APP_TRANSLATE_OCR: u32 = WM_APP + 12;
+/// 结果窗里换了目标语言：写进设置，下次翻译照这个来
+const WM_APP_OCR_TARGET: u32 = WM_APP + 13;
 pub(crate) const WM_APP_GIF_DONE: u32 = WM_APP + 9;
 pub(crate) const WM_APP_SCROLL_DONE: u32 = WM_APP + 10;
 const WM_APP_ANIM: u32 = WM_APP + 6;
@@ -1256,6 +1258,15 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_SHOW_MENU => {
 
             show_menu(hwnd);
+            0
+        }
+        WM_APP_OCR_TARGET => {
+            let index = (wparam as usize).min(settings_ui::TARGETS.len() - 1);
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut panel::Panel;
+            if !state.is_null() {
+                (*state).settings.translate_target = settings_ui::TARGETS[index].1.to_string();
+                (*state).settings.save();
+            }
             0
         }
         WM_APP_TRANSLATE_OCR => {

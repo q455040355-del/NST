@@ -24,6 +24,12 @@ use crate::ui::{self, font, Painter, DT_CENTER};
 
 const CLASS_NAME: &str = "NetSpeedTaskbarRs.OcrResult";
 
+/// 语言下拉：选中某一项
+const WM_APP_LANG_PICK: u32 = WM_APP + 0x44;
+/// 把选中的目标语言告诉面板（它负责落盘）。注意要和 main.rs 里同一个号。
+const WM_APP_OCR_TARGET: u32 = WM_APP + 13;
+const LANG_CLASS: &str = "NetSpeedTaskbarRs.OcrLang";
+
 /// 打字机的一帧
 const WM_APP_REVEAL: u32 = WM_APP + 0x41;
 /// 结果回来了（lparam 是 Box<AsyncUpdate>）
@@ -108,6 +114,8 @@ struct State {
     pending: u8,
     /// 现在这组 rows 是不是按标点对过齐的（整段翻出来的不算）
     aligned: bool,
+    /// 语言下拉窗（同一时刻只开一个）
+    lang_popup: HWND,
     /// 打字机：已显示多少个目标字
     reveal: usize,
     reveal_total: usize,
@@ -171,6 +179,234 @@ fn start_reveal(hwnd: HWND, total: usize) {
             }
         }
     });
+}
+
+/// 语言下拉的状态
+struct LangPopup {
+    parent: HWND,
+    hover: Option<usize>,
+    current: usize,
+    scale: f32,
+}
+
+fn lang_state(hwnd: HWND) -> *mut LangPopup {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut LangPopup }
+}
+
+const LANG_ITEM_H: f32 = 32.0;
+const LANG_PAD: f32 = 6.0;
+
+unsafe fn lang_paint(hwnd: HWND) {
+    let state = lang_state(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &*state;
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    if client.right <= 0 || client.bottom <= 0 {
+        return;
+    }
+    let Some(dib) = ui::Dib::new(client.right, client.bottom) else {
+        return;
+    };
+    let p = Painter::new(dib.dc, state.scale);
+    let c = crate::theme::ui();
+    p.round(
+        0,
+        0,
+        client.right,
+        client.bottom,
+        p.s(10.0),
+        c.surface,
+        c.border,
+    );
+
+    let item_h = ui::s(LANG_ITEM_H, state.scale);
+    let pad = ui::s(LANG_PAD, state.scale);
+    for (index, (label, _)) in crate::settings_ui::TARGETS.iter().enumerate() {
+        let top = pad + item_h * index as i32;
+        let bottom = top + item_h;
+        if state.hover == Some(index) {
+            p.round(
+                pad,
+                top,
+                client.right - pad,
+                bottom,
+                p.s(7.0),
+                c.chip,
+                c.chip,
+            );
+        }
+        p.text(
+            label,
+            ui::font(12.0, 400, state.scale),
+            if state.current == index { c.accent } else { c.text },
+            pad + p.s(10.0),
+            top,
+            client.right - p.s(28.0),
+            bottom,
+            DT_LEFT,
+        );
+        if state.current == index {
+            let ax = client.right - p.s(22.0);
+            let ay = (top + bottom) / 2;
+            p.line(ax, ay, ax + p.s(4.0), ay + p.s(4.0), c.accent, p.s(1.8));
+            p.line(
+                ax + p.s(4.0),
+                ay + p.s(4.0),
+                ax + p.s(11.0),
+                ay - p.s(5.0),
+                c.accent,
+                p.s(1.8),
+            );
+        }
+    }
+
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    BitBlt(hdc, 0, 0, client.right, client.bottom, dib.dc, 0, 0, SRCCOPY);
+    EndPaint(hwnd, &mut ps);
+}
+
+unsafe extern "system" fn lang_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            lang_paint(hwnd);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_MOUSEMOVE => {
+            let state = lang_state(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let pad = ui::s(LANG_PAD, state.scale);
+            let item_h = ui::s(LANG_ITEM_H, state.scale);
+            let y = ((lparam as i32) >> 16) & 0xFFFF;
+            let index = if y < pad {
+                None
+            } else {
+                Some(((y - pad) / item_h) as usize)
+            };
+            let index = index.filter(|index| *index < crate::settings_ui::TARGETS.len());
+            if state.hover != index {
+                state.hover = index;
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let state = lang_state(hwnd);
+            if !state.is_null() {
+                let state = &*state;
+                if let Some(index) = state.hover {
+                    PostMessageW(state.parent, WM_APP_LANG_PICK, index, 0);
+                }
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_ACTIVATE => {
+            if (wparam as u32 & 0xFFFF) == 0 {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            let state = lang_state(hwnd);
+            if !state.is_null() {
+                drop(Box::from_raw(state));
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 在胶囊下面弹出语言列表
+unsafe fn open_lang_popup(hwnd: HWND, state: &State, client: RECT) -> HWND {
+    let l = layout(state, client);
+    let instance = GetModuleHandleW(std::ptr::null());
+    let class = wide(LANG_CLASS);
+    let scale = state.scale;
+    let wc = WNDCLASSW {
+        style: CS_DROPSHADOW,
+        lpfnWndProc: Some(lang_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: instance,
+        hIcon: std::ptr::null_mut(),
+        hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: class.as_ptr(),
+    };
+    RegisterClassW(&wc);
+
+    let width = l.target.right - l.target.left;
+    let height = ui::s(LANG_PAD * 2.0, scale)
+        + ui::s(LANG_ITEM_H, scale) * crate::settings_ui::TARGETS.len() as i32;
+    let mut point = POINT {
+        x: l.target.left,
+        y: l.target.bottom + ui::s(6.0, scale),
+    };
+    windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+
+    let popup = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        class.as_ptr(),
+        wide("").as_ptr(),
+        WS_POPUP | WS_VISIBLE,
+        point.x,
+        point.y,
+        width,
+        height,
+        hwnd,
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    if popup.is_null() {
+        return std::ptr::null_mut();
+    }
+    let popup_state = Box::into_raw(Box::new(LangPopup {
+        parent: hwnd,
+        hover: None,
+        current: state.target.min(crate::settings_ui::TARGETS.len() - 1),
+        scale,
+    }));
+    SetWindowLongPtrW(popup, GWLP_USERDATA, popup_state as isize);
+    ui::round_corners(popup);
+    ShowWindow(popup, SW_SHOW);
+    SetForegroundWindow(popup);
+    SetFocus(popup);
+    InvalidateRect(popup, std::ptr::null(), 0);
+    popup
+}
+
+/// 面板窗口（按类名找）：结果窗里换了语言要通知它落盘
+unsafe fn find_panel() -> HWND {
+    let mut found: HWND = std::ptr::null_mut();
+    EnumWindows(Some(find_panel_win), &mut found as *mut HWND as isize);
+    found
+}
+
+unsafe extern "system" fn find_panel_win(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let mut class = [0u16; 64];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    let name = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+    if name == "NetSpeedTaskbarRs.Panel" {
+        *(lparam as *mut HWND) = hwnd;
+        return 0;
+    }
+    1
 }
 
 fn state_of(hwnd: HWND) -> *mut State {
@@ -415,7 +651,10 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
 
     if state.has_translation() {
         // 目标语言：点一下换语言并重译
-        let label = format!("目标 · {}", crate::settings_ui::TARGETS[state.target.min(crate::settings_ui::TARGETS.len() - 1)].0);
+        let label = format!(
+            "目标 · {}  ▾",
+            crate::settings_ui::TARGETS[state.target.min(crate::settings_ui::TARGETS.len() - 1)].0
+        );
         let hovered = state.hover == Some(Hit::Target);
         p.round(
             l.target.left,
@@ -914,10 +1153,6 @@ struct AsyncUpdate {
     aligned: bool,
 }
 
-fn state_target(state: &State) -> usize {
-    state.target.min(crate::settings_ui::TARGETS.len() - 1)
-}
-
 /// 按指定语言重译整段（点语言胶囊时调）
 fn request_retranslate(hwnd: HWND, target: usize) {
     let source = unsafe {
@@ -1172,6 +1407,7 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             target: settings_target_index(),
             pending: 0,
             aligned: false,
+            lang_popup: std::ptr::null_mut(),
             reveal: usize::MAX,
             reveal_total: 0,
             tracking_leave: false,
@@ -1412,6 +1648,26 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_APP_LANG_PICK => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let state = &mut *state;
+            let index = wparam.min(crate::settings_ui::TARGETS.len() - 1);
+            state.lang_popup = std::ptr::null_mut();
+            // 记进设置：下次截图翻译直接用这个语言（面板负责写盘）
+            let panel = find_panel();
+            if !panel.is_null() {
+                PostMessageW(panel, WM_APP_OCR_TARGET, index, 0);
+            }
+            if index != state.target {
+                state.target = index;
+                request_retranslate(hwnd, index);
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_APP_REVEAL => {
             let state = state_of(hwnd);
             if state.is_null() {
@@ -1487,9 +1743,14 @@ unsafe extern "system" fn window_proc(
                     return 0;
                 }
                 if contains(&l.target, point) {
-                    let next = (state_target(&*state) + 1) % crate::settings_ui::TARGETS.len();
-                    (*state).target = next;
-                    request_retranslate(hwnd, next);
+                    // 弹下拉挑语言（点一下换一个太容易点错）
+                    if !(*state).lang_popup.is_null() {
+                        DestroyWindow((*state).lang_popup);
+                        (*state).lang_popup = std::ptr::null_mut();
+                    } else {
+                        let flags = &*state;
+                        (*state).lang_popup = open_lang_popup(hwnd, flags, client);
+                    }
                     return 0;
                 }
                 if contains(&l.view_ocr, point) {
