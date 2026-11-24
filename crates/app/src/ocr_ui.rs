@@ -634,7 +634,12 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
 
     // 标题右边一句说明：几句 / 多少字
     let meta = if state.has_translation() {
-        format!("{} 句 · {} 字", state.rows.len(), state.unit_count())
+        let sentences = if state.aligned {
+            state.rows.len()
+        } else {
+            crate::translate::split_units(&state.source).len().max(1)
+        };
+        format!("{sentences} 句 · {} 字", state.unit_count())
     } else {
         format!("{} 字", state.unit_count())
     };
