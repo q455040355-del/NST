@@ -204,7 +204,7 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
-    fn new(width: i32, height: i32) -> Self {
+    pub(crate) fn new(width: i32, height: i32) -> Self {
         Self {
             width,
             height,
@@ -3091,8 +3091,16 @@ fn draw_bar_tooltip(dc: HDC, action: Action, anchor: RECT, bar_top: i32, stroke:
         let old_font = SelectObject(dc, font as HGDIOBJ);
         let width = wide_width(dc, &label) + s(20.0);
         let height = s(20.0);
-        let left = ((anchor.left + anchor.right) / 2 - width / 2).max(s(4.0));
-        let top = bar_top - height - s(5.0);
+        // 编辑窗只有「图 + 底栏 + 提示」那么高：图很矮时标签会顶出客户区被裁掉，
+        // 所以左右上下都夹在窗口内，宁可压在图上也要看得见。
+        let mut client: RECT = std::mem::zeroed();
+        let owner = windows_sys::Win32::Graphics::Gdi::WindowFromDC(dc);
+        if !owner.is_null() {
+            GetClientRect(owner, &mut client);
+        }
+        let max_left = (client.right - width - s(4.0)).max(s(4.0));
+        let left = ((anchor.left + anchor.right) / 2 - width / 2).clamp(s(4.0), max_left);
+        let top = (bar_top - height - s(5.0)).max(s(2.0));
         let rect = RECT {
             left,
             top,
@@ -4077,6 +4085,7 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 (*editor).hover = None;
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
+
             0
         }
         WM_LBUTTONUP => {

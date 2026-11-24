@@ -196,6 +196,27 @@ fn main() {
             return;
         }
 
+        // 调试用：用一张假图把编辑窗开出来（试悬停提示、工具栏位置时用）
+        if std::env::var_os("NST_EDITOR_DEMO").is_some() {
+            let width = 360;
+            let height = 22;
+            let mut bitmap = shot::Bitmap::new(width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    let index = ((y * width + x) * 4) as usize;
+                    bitmap.pixels[index] = 200;
+                    bitmap.pixels[index + 1] = 220;
+                    bitmap.pixels[index + 2] = 240;
+                    bitmap.pixels[index + 3] = 255;
+                }
+            }
+            shot::open_editor(
+                std::ptr::null_mut(),
+                bitmap,
+                (0, 0, width, height),
+            );
+        }
+
         // 调试用：直接把结果窗按示例内容打开（点按钮、试悬停时用）
         if std::env::var_os("NST_OCR_DEMO").is_some() {
             let source = "Latency budget\nThe panel samples the taskbar twice a second.\nIf sampling fails, the last good color is kept for 30 seconds before we retry,\nso the background never flickers between two close shades.";
