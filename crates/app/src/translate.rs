@@ -31,16 +31,12 @@ fn endpoint(settings: &netspeed_core::settings::Settings) -> (String, String) {
 }
 
 /// 目标语言：默认中文（截图来源基本是英文或塞尔维亚语）
-fn target_for(settings: &netspeed_core::settings::Settings, text: &str) -> &'static str {
+fn target_for(settings: &netspeed_core::settings::Settings) -> &'static str {
     match settings.translate_target.trim().to_lowercase().as_str() {
         "en" | "english" => "English",
         "sr" | "serbian" => "Serbian written in the Latin alphabet (not Cyrillic)",
-        "zh" | "chinese" => "Simplified Chinese",
-        // 老配置里的 auto / ja 之类统一落到中文
-        _ => {
-            let _ = text;
-            "Simplified Chinese"
-        }
+        // 默认（含老配置里的 auto / ja / ko）一律中文
+        _ => "Simplified Chinese",
     }
 }
 
@@ -366,7 +362,7 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
         "temperature": 0.2,
         "messages": [
             { "role": "system", "content": "You are a translation engine. Output only the translation." },
-            { "role": "user", "content": prompt_for(text, target_for(settings, text)) }
+            { "role": "user", "content": prompt_for(text, target_for(settings)) }
         ]
     });
     let body = payload.to_string();
@@ -378,6 +374,13 @@ fn translate_text(text: &str, settings: &netspeed_core::settings::Settings) -> R
     let raw = http_request("POST", &url, &headers, Some(body.as_bytes()))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| "服务端返回的不是 JSON".to_string())?;
+    if value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|reason| reason.as_str())
+        == Some("length")
+    {
+        return Err("译文被截断了（这块太长），分两次框选再翻".to_string());
+    }
     let translated = value
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -409,9 +412,12 @@ pub fn split_units(text: &str) -> Vec<String> {
         let mut current = String::new();
         for ch in line.chars() {
             current.push(ch);
-            let boundary = matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；')
-                || (ch == ',' && current.chars().count() > 60);
-            if boundary && current.chars().count() > 12 {
+            let boundary = matches!(
+                ch,
+                '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；' | '，' | '、'
+            ) || (ch == ',' && current.chars().count() > 60);
+            // 边界停顿太短不切（「12. 5」这种），太长则无条件切（没有标点的长串）
+            if (boundary && current.chars().count() > 12) || current.chars().count() >= 200 {
                 units.push(current.trim().to_string());
                 current.clear();
             }
@@ -437,7 +443,7 @@ pub fn translate_pairs(
         let translated = translate_text(source, settings)?;
         return Ok(vec![(units[0].clone(), translated)]);
     }
-    let target = target_for(settings, source);
+    let target = target_for(settings);
     let mut numbered = String::new();
     for (index, unit) in units.iter().enumerate() {
         numbered.push_str(&format!("{}. {}\n", index + 1, unit));
@@ -484,9 +490,19 @@ one translation per input line, keeping the same order and the same leading numb
         if line.is_empty() {
             continue;
         }
-        let stripped = match line.find(['.', '、', '）', ')']) {
-            Some(index) if index <= 3 => line[index + 1..].trim().to_string(),
-            _ => line.to_string(),
+        // 只剥「1. / 12、/ 3）」这种纯 ASCII 数字前缀。
+        // 不能直接 line[index+1..]：、） 是多字节，切在字符中间会 panic
+        let digits = line.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+        let stripped = if (1..=3).contains(&digits) {
+            let rest = &line[digits..];
+            match rest.chars().next() {
+                Some(sep) if matches!(sep, '.' | '、' | '）' | ')' | '．') => {
+                    rest[sep.len_utf8()..].trim().to_string()
+                }
+                _ => line.to_string(),
+            }
+        } else {
+            line.to_string()
         };
         if !stripped.is_empty() {
             lines.push(stripped);

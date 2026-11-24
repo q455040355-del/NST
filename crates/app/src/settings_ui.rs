@@ -448,6 +448,9 @@ struct State {
     tr_sel: Option<(usize, usize)>,
     /// 译成什么语言（TARGETS 的下标）
     tr_target: usize,
+    /// 拉模型 / 测连接是给哪家发起的（回来时对不上就丢弃，免得串到别家）
+    models_for: usize,
+    test_for: usize,
     /// 正在测连接
     test_busy: bool,
     /// 上一次测连接的结果：(成功?, 说明)
@@ -2395,6 +2398,11 @@ unsafe extern "system" fn popup_proc(
             0
         }
         WM_CLOSE => {
+            let state = state_of(hwnd);
+            if !state.is_null() && (*state).tr_edit.is_some() {
+                commit_translate(&*state);
+                (*state).tr_edit = None;
+            }
             DestroyWindow(hwnd);
             0
         }
@@ -2698,6 +2706,8 @@ pub fn open(parent: HWND, settings: &Settings) {
                 .iter()
                 .position(|(_, key)| *key == settings.translate_target.trim().to_lowercase())
                 .unwrap_or(0),
+            models_for: 0,
+            test_for: 0,
             test_busy: false,
             test_result: None,
             tr_caret: 0,
@@ -2891,7 +2901,7 @@ unsafe fn hit_test(state: &State, client: RECT, point: POINT) -> Option<Hit> {
     if contains(&l.tr_toggle, point) {
         return Some(Hit::TrToggle);
     }
-    if state.translate_enabled && contains(&l.tr_target, point) {
+    if contains(&l.tr_target, point) {
         return Some(Hit::TrTarget);
     }
     // 快捷键胶囊比整行矮，得先判
@@ -3184,6 +3194,7 @@ fn start_model_fetch(state: &mut State) {
     }
     state.models_busy = true;
     state.models_error = None;
+    state.models_for = state.tr_provider;
     let raw = state.hwnd as isize;
     let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" }.to_string();
     let base = state.tr_base.clone();
@@ -3211,6 +3222,7 @@ fn start_connection_test(state: &mut State) {
     }
     state.test_busy = true;
     state.test_result = None;
+    state.test_for = state.tr_provider;
     let raw = state.hwnd as isize;
     let provider = if state.tr_provider == 1 { "deepseek" } else { "chatgpt" }.to_string();
     let base = state.tr_base.clone();
@@ -3652,7 +3664,9 @@ unsafe extern "system" fn dialog_proc(
                         state.tr_sel = None;
                         state.models.clear();
                         state.models_error = None;
+                        state.models_busy = false;
                         state.test_result = None;
+                        state.test_busy = false;
                         commit_translate(state);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
@@ -3660,11 +3674,26 @@ unsafe extern "system" fn dialog_proc(
                 }
 
                 // 模型那一格右边的「获取」：去服务商拉模型列表
-                if inside(l.tr_fetch) && !state.models_busy {
+                if state.translate_enabled && inside(l.tr_fetch) && !state.models_busy {
                     start_model_fetch(state);
                     return 0;
                 }
 
+                if std::env::var_os("NST_CLICK_LOG").is_some() {
+                    crate::debug_log(&format!(
+                        "click ({},{}) view({},{}) target ({},{},{},{}) inside={} enabled={}",
+                        point.x,
+                        point.y,
+                        view_top,
+                        view_bottom,
+                        l.tr_target.left,
+                        l.tr_target.top,
+                        l.tr_target.right,
+                        l.tr_target.bottom,
+                        inside(l.tr_target),
+                        state.translate_enabled
+                    ));
+                }
                 // 目标语言：点一下换下一个
                 if inside(l.tr_target) {
                     state.tr_target = (state.tr_target + 1) % TARGETS.len();
@@ -3674,7 +3703,7 @@ unsafe extern "system" fn dialog_proc(
                 }
 
                 // 「测试连接」：真发一条最短的请求，通了才算配好
-                if inside(l.tr_test) && !state.test_busy {
+                if state.translate_enabled && inside(l.tr_test) && !state.test_busy {
                     start_connection_test(state);
                     return 0;
                 }
@@ -3869,6 +3898,9 @@ unsafe extern "system" fn dialog_proc(
             let state = &mut *state;
             let result = Box::from_raw(lparam as *mut Result<String, String>);
             state.test_busy = false;
+            if state.test_for != state.tr_provider {
+                return 0;
+            }
             state.test_result = Some(match *result {
                 Ok(message) => (true, format!("连通 · {message}")),
                 Err(error) => (false, error),
@@ -3884,6 +3916,10 @@ unsafe extern "system" fn dialog_proc(
             let state = &mut *state;
             let result = Box::from_raw(lparam as *mut Result<Vec<(String, String)>, String>);
             state.models_busy = false;
+            if state.models_for != state.tr_provider {
+                // 这中间换了服务商：这一批模型不是这家的，丢掉
+                return 0;
+            }
             match *result {
                 Ok(models) => {
                     state.models = models;

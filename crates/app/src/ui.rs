@@ -68,11 +68,12 @@ pub fn make_dib(width: i32, height: i32) -> (HDC, HBITMAP, *mut u8) {
 
 thread_local! {
     /// 字体缓存：CreateFontW 每次都要建字体，界面里每帧都建会明显发顿
-    static FONTS: RefCell<HashMap<(i32, i32), HFONT>> = RefCell::new(HashMap::new());
+    static FONTS: RefCell<HashMap<(i32, i32, i32), HFONT>> = RefCell::new(HashMap::new());
 }
 
 pub fn font(points: f32, weight: i32, scale: f32) -> HFONT {
-    let key = ((points * 10.0).round() as i32, weight);
+    // 缓存键必须带 scale：拖到 200% 的屏上要按新倍率重造字体
+    let key = ((points * 10.0).round() as i32, weight, (scale * 100.0).round() as i32);
     FONTS.with(|cell| {
         if let Some(handle) = cell.borrow().get(&key) {
             return *handle;

@@ -141,12 +141,10 @@ fn settings_target_index() -> usize {
         .unwrap_or(0)
 }
 
-/// 打字机推进：后台线程每 16ms 投一帧（和设置页动效一个做法）
-static REVEAL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+/// 打字机：为一个窗口起一条 16ms 的推帧线程，打完自己退出。
+/// 不能用全局标志（多个结果窗会互相把闸门占住，后来的窗永远不打字）。
 fn start_reveal(hwnd: HWND, total: usize) {
-    use std::sync::atomic::Ordering;
-    if hwnd.is_null() {
+    if hwnd.is_null() || total == 0 {
         return;
     }
     unsafe {
@@ -156,12 +154,11 @@ fn start_reveal(hwnd: HWND, total: usize) {
             (*state).reveal_total = total;
         }
     }
-    if REVEAL_RUNNING.swap(true, Ordering::Relaxed) {
-        return;
-    }
+    let step = (total / 56).max(2);
+    let frames = (total + step - 1) / step + 1;
     let raw = hwnd as isize;
     std::thread::spawn(move || {
-        loop {
+        for _ in 0..frames {
             std::thread::sleep(std::time::Duration::from_millis(16));
             unsafe {
                 let hwnd = raw as HWND;
@@ -170,7 +167,6 @@ fn start_reveal(hwnd: HWND, total: usize) {
                 }
             }
         }
-        REVEAL_RUNNING.store(false, Ordering::Relaxed);
     });
 }
 
@@ -765,14 +761,21 @@ unsafe fn layout_edit(hwnd: HWND) {
         return;
     }
     let state = &mut *state;
-    let mut client = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
+    let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
     let l = layout(state, client);
+
+    // 先更新视口和行布局（EDIT 建失败也要有行高，否则所有行会叠在顶端）
+    let width = (l.rows.right - ui::s(ROW_PAD_X, state.scale))
+        - (l.rows.left + ui::s(ROW_PAD_X, state.scale));
+    state.viewport_h = l.rows.bottom - l.rows.top;
+    relayout_rows(state, width);
+    if state.view == View::Prose {
+        state.max_scroll = prose_height(state, width) - state.viewport_h;
+        state.max_scroll = state.max_scroll.max(0);
+        state.scroll = state.scroll.clamp(0, state.max_scroll);
+    }
+
     if state.edit.is_null() {
         return;
     }
@@ -795,11 +798,32 @@ unsafe fn layout_edit(hwnd: HWND) {
     }
     ShowWindow(state.edit, if show { SW_SHOW } else { SW_HIDE });
 
-    // 逐句的行高依赖正文宽度，宽度一变就重排
-    let width = (l.rows.right - ui::s(ROW_PAD_X, state.scale))
-        - (l.rows.left + ui::s(ROW_PAD_X, state.scale));
-    state.viewport_h = l.rows.bottom - l.rows.top;
-    relayout_rows(state, width);
+    // 焦点跟着视图走：EDIT 藏起来以后键盘不能死在半空
+    if show {
+        SetFocus(state.edit);
+    } else {
+        SetFocus(hwnd);
+    }
+}
+
+/// 整段视图的高度（换行按实际宽度算）
+unsafe fn prose_height(state: &State, width: i32) -> i32 {
+    let screen = GetDC(std::ptr::null_mut());
+    let dc = CreateCompatibleDC(screen);
+    ReleaseDC(std::ptr::null_mut(), screen);
+    if dc.is_null() {
+        return 0;
+    }
+    let mut height = 12;
+    if !state.source.is_empty() {
+        height += 19 + measure(dc, state.fonts.source, &state.source, width) + 26;
+    }
+    if !state.translated.is_empty() {
+        height += 19 + measure(dc, state.fonts.body, &state.translated, width);
+    }
+    height += 12;
+    DeleteDC(dc);
+    height
 }
 
 unsafe fn copy_from_edit(hwnd: HWND) {
@@ -975,6 +999,12 @@ unsafe fn apply_update(hwnd: HWND, update: AsyncUpdate) {
             state.status = error;
             state.reveal = usize::MAX;
             state.reveal_total = 0;
+            // 旧译文不能再留在屏幕上（否则「复制全部」拷的是上一次的结果）
+            state.translated.clear();
+            state.rows.clear();
+            state.selected = None;
+            state.measured_width = -1;
+            state.view = View::Ocr;
         }
         None => {
             state.error = None;
@@ -1032,8 +1062,6 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
         RegisterClassW(&wc);
 
         let scale = crate::screen_scale();
-        let width = ui::s(WINDOW_W, scale);
-        let height = ui::s(WINDOW_H, scale);
 
         let mut work = RECT {
             left: 0,
@@ -1042,6 +1070,10 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             bottom: 0,
         };
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as *mut _, 0);
+        let max_w = (work.right - work.left - ui::s(24.0, scale)).max(ui::s(420.0, scale));
+        let max_h = (work.bottom - work.top - ui::s(24.0, scale)).max(ui::s(320.0, scale));
+        let width = ui::s(WINDOW_W, scale).min(max_w);
+        let height = ui::s(WINDOW_H, scale).min(max_h);
         let x = work.left + ((work.right - work.left) - width) / 2;
         let y = work.top + ((work.bottom - work.top) - height) / 3;
 
@@ -1177,7 +1209,8 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
                 | WS_VSCROLL
                 | WS_TABSTOP
                 | 0x0004  // ES_MULTILINE
-                | 0x0040, // ES_AUTOVSCROLL（不要 ES_AUTOHSCROLL：长行要折，不要横向滚）
+                | 0x0040  // ES_AUTOVSCROLL（不要 ES_AUTOHSCROLL：长行要折，不要横向滚）
+                | 0x0800, // ES_READONLY：结果窗的原文不该被改，改了会和自绘视图对不上
             0,
             0,
             0,
@@ -1207,7 +1240,8 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
         SetForegroundWindow(hwnd);
         if (*state).view == View::Ocr {
             SetFocus(edit);
-            SendMessageW(edit, EM_SETSEL, 0, -1);
+            // 停在开头：EM_SETSEL(0,-1) 会把视图滚到文末
+            SendMessageW(edit, EM_SETSEL, 0, 0);
         } else {
             SetFocus(hwnd);
         }
@@ -1386,6 +1420,9 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_APP_RESULT => {
+            if lparam == 0 {
+                return 0;
+            }
             let update = Box::from_raw(lparam as *mut AsyncUpdate);
             apply_update(hwnd, *update);
             0
@@ -1619,11 +1656,42 @@ unsafe extern "system" fn window_proc(
             0
         }
         // 系统切明暗主题：整窗重画（EDIT 的底色由 WM_CTLCOLOREDIT 自己更新）
+        WM_DPICHANGED => {
+            let state = state_of(hwnd);
+            if state.is_null() {
+                return 0;
+            }
+            let dpi = ((wparam >> 16) & 0xFFFF) as u32;
+            let scale = (dpi.max(96) as f32) / 96.0;
+            let state = &mut *state;
+            state.scale = scale;
+            state.fonts = Fonts::create(scale);
+            state.measured_width = -1;
+            let suggested = lparam as *const RECT;
+            if !suggested.is_null() {
+                let rect = *suggested;
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            layout_edit(hwnd);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_SETTINGCHANGE => {
             InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         WM_DESTROY => {
+            if LAST_HWND.with(|cell| cell.get()) == hwnd as isize {
+                LAST_HWND.with(|cell| cell.set(0));
+            }
             let state = state_of(hwnd);
             if !state.is_null() {
                 let state = Box::from_raw(state);
@@ -1734,10 +1802,17 @@ pub fn open_translate(_parent: HWND, source: &str, translated: &str, error: Opti
 
 /// OCR 出来就先开窗（只有原文 + 「翻译中…」），别让人对着空白等几秒
 pub fn open_pending(source: &str) {
+    // 同一时刻只留一个结果窗：旧窗先关掉，免得两次 OCR 的译文串到同一个窗里
+    let previous = last_hwnd_alive();
+    if !previous.is_null() {
+        unsafe {
+            DestroyWindow(previous);
+        }
+    }
     open_inner(Some(source), None, None);
     // 标记成「等译文」状态
     unsafe {
-        let hwnd = last_hwnd();
+        let hwnd = last_hwnd_alive();
         if hwnd.is_null() {
             return;
         }
@@ -1759,7 +1834,7 @@ pub fn update_translation(
     pairs: Option<Vec<(String, String)>>,
     error: Option<&str>,
 ) {
-    let hwnd = last_hwnd();
+    let hwnd = last_hwnd_alive();
     if hwnd.is_null() {
         open_inner(Some(source), Some(translated), error);
         return;
@@ -1783,6 +1858,31 @@ thread_local! {
 
 fn last_hwnd() -> HWND {
     LAST_HWND.with(|cell| cell.get() as HWND)
+}
+
+/// 记着的那个窗口还在不在（关掉以后指针就是野的了，用之前必须问一句）
+fn last_hwnd_alive() -> HWND {
+    let hwnd = last_hwnd();
+    if hwnd.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            LAST_HWND.with(|cell| cell.set(0));
+            return std::ptr::null_mut();
+        }
+        // 句柄可能已经被别的窗口复用：类名对不上就不是我们那个
+        let expected = wide(CLASS_NAME);
+        let mut buffer = [0u16; 64];
+        let length = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        let name = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+        if name != CLASS_NAME {
+            let _ = expected;
+            LAST_HWND.with(|cell| cell.set(0));
+            return std::ptr::null_mut();
+        }
+        hwnd
+    }
 }
 
 /// 原文 / 译文按行配对；行数对不上就整段算一句

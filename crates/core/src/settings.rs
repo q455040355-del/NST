@@ -85,13 +85,18 @@ pub struct TranslateProfile {
 pub const TRANSLATE_PROVIDERS: [&str; 2] = ["ChatGPT", "DeepSeek"];
 
 impl Settings {
-    /// 服务商名（"chatgpt"/"deepseek"/"opencode" 或显示名）→ 下标
-    pub fn translate_provider_index(name: &str) -> usize {
-        let name = name.trim().to_lowercase();
-        match name.as_str() {
-            "deepseek" => 1,
-            _ => 0,
+    /// 服务商名（"chatgpt"/"openai"/"deepseek" 或显示名）→ 下标；不认识返回 None
+    pub fn translate_provider_slot(name: &str) -> Option<usize> {
+        match name.trim().to_lowercase().as_str() {
+            "chatgpt" | "openai" | "gpt" => Some(0),
+            "deepseek" => Some(1),
+            _ => None,
         }
+    }
+
+    /// 老调用点用这个：认识就返回槽位，不认识按 0（只用于 UI 回显，不用于写盘）
+    pub fn translate_provider_index(name: &str) -> usize {
+        Self::translate_provider_slot(name).unwrap_or(0)
     }
 }
 
@@ -138,6 +143,10 @@ impl Default for Settings {
 
 impl Settings {
     pub fn path() -> PathBuf {
+        // 探针 / 测试用：指到别处去，别覆盖用户真正的配置
+        if let Some(override_path) = std::env::var_os("NST_SETTINGS_PATH") {
+            return PathBuf::from(override_path);
+        }
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir());
@@ -155,6 +164,7 @@ impl Settings {
             return settings;
         };
 
+        let mut saw_translate_enabled = false;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -207,7 +217,10 @@ impl Settings {
                     settings.gif_seconds = normalize_seconds(value.trim().parse().unwrap_or(20))
                 }
                 "ShotTopmost" => settings.shot_topmost = parse_bool(value),
-                "TranslateEnabled" => settings.translate_enabled = parse_bool(value),
+                "TranslateEnabled" => {
+                    saw_translate_enabled = true;
+                    settings.translate_enabled = parse_bool(value);
+                }
                 "TranslateProvider" => settings.translate_provider = value.to_string(),
                 "TranslateKey" => settings.translate_key = value.to_string(),
                 "TranslateModel" => settings.translate_model = value.to_string(),
@@ -223,7 +236,7 @@ impl Settings {
                     let mut stored = false;
                     if let Some((field, provider)) = key.split_once('.') {
                         if matches!(field, "TranslateKey" | "TranslateModel" | "TranslateBase") {
-                            let slot = Settings::translate_provider_index(provider);
+                            let slot = Settings::translate_provider_slot(provider).unwrap_or(usize::MAX);
                             if slot < TRANSLATE_PROVIDERS.len() {
                                 let profile = &mut settings.translate_profiles[slot];
                                 match field {
@@ -242,9 +255,22 @@ impl Settings {
             }
         }
 
-        // 老配置没有 TranslateEnabled 这一行：填过 Key 就算「开着」，升级不丢功能
-        if !text.contains("TranslateEnabled=") {
+        // 老配置没有 TranslateEnabled 这一行：填过 Key 就算「开着」，升级不丢功能。
+        // 注意不能用 text.contains("TranslateEnabled=")：写成 "TranslateEnabled = False" 会漏判
+        if !saw_translate_enabled {
             settings.translate_enabled = !settings.translate_key.trim().is_empty();
+        }
+
+        // 已经删掉的服务商（比如 opencode）：凭证还留在 ini 里，但界面和请求都不认它了。
+        // 直接当成 ChatGPT 会拿 Zen 的 Key 去打 api.openai.com，只有一个 401，清掉更诚实。
+        {
+            let provider = settings.translate_provider.trim().to_lowercase();
+            if !matches!(provider.as_str(), "chatgpt" | "openai" | "deepseek") {
+                settings.translate_provider = "chatgpt".to_string();
+                settings.translate_key.clear();
+                settings.translate_model.clear();
+                settings.translate_base.clear();
+            }
         }
 
         // 老配置只有一份（没有 TranslateKey.xxx）：把它当成当前服务商的那份
@@ -260,15 +286,17 @@ impl Settings {
                 base: settings.translate_base.clone(),
             };
         }
-        // 当前服务商那份和扁平字段对齐（扁平字段是「正在用的」，translate.rs 只读它）
+        // 当前服务商那份和扁平字段对齐（扁平字段是「正在用的」，translate.rs 只读它）。
+        // 扁平字段已经有值就以它为准：别的程序（C# 版）可能刚改过它，不能拿分段键盖回去。
+        if settings.translate_key.is_empty()
+            && settings.translate_model.is_empty()
+            && settings.translate_base.is_empty()
         {
             let index = Settings::translate_provider_index(&settings.translate_provider);
             if let Some(profile) = settings.translate_profiles.get(index) {
-                if !profile.key.is_empty() || !profile.model.is_empty() || !profile.base.is_empty() {
-                    settings.translate_key = profile.key.clone();
-                    settings.translate_model = profile.model.clone();
-                    settings.translate_base = profile.base.clone();
-                }
+                settings.translate_key = profile.key.clone();
+                settings.translate_model = profile.model.clone();
+                settings.translate_base = profile.base.clone();
             }
         }
 
