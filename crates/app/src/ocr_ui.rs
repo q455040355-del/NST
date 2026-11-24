@@ -1753,14 +1753,19 @@ pub fn open_pending(source: &str) {
 }
 
 /// 译文回来了：填进已经开着的窗口（带打字机效果）
-pub fn update_translation(source: &str, translated: &str, error: Option<&str>) {
+pub fn update_translation(
+    source: &str,
+    translated: &str,
+    pairs: Option<Vec<(String, String)>>,
+    error: Option<&str>,
+) {
     let hwnd = last_hwnd();
     if hwnd.is_null() {
         open_inner(Some(source), Some(translated), error);
         return;
     }
     unsafe {
-        let pairs = build_pairs(source, translated);
+        let pairs = pairs.or_else(|| build_pairs(source, translated));
         let update = AsyncUpdate {
             source: source.to_string(),
             translated: translated.to_string(),

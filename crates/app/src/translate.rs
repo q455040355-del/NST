@@ -12,6 +12,8 @@ pub struct TranslateOutcome {
     pub source: String,
     pub translated: String,
     pub error: Option<String>,
+    /// 按句配对（有的话结果窗直接逐句显示，不用再拆一次）
+    pub pairs: Option<Vec<(String, String)>>,
 }
 
 /// 把「服务商 + 模型 + base」统一成实际请求要用的三样东西
@@ -28,36 +30,25 @@ fn endpoint(settings: &netspeed_core::settings::Settings) -> (String, String) {
     (base.trim_end_matches('/').to_string(), model.to_string())
 }
 
-/// 目标语言：中文→英文，其它→中文（够用，先不做下拉）
-fn target_language(text: &str) -> &'static str {
-    let chinese = text
-        .chars()
-        .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
-        .count();
-    let letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    if chinese * 2 >= letters.max(1) {
-        "English"
-    } else {
-        "Chinese"
-    }
-}
-
-/// 用户指定了目标语言就用指定的，否则按原文语种自动选
+/// 目标语言：默认中文（截图来源基本是英文或塞尔维亚语）
 fn target_for(settings: &netspeed_core::settings::Settings, text: &str) -> &'static str {
     match settings.translate_target.trim().to_lowercase().as_str() {
-        "zh" | "chinese" => "Simplified Chinese",
         "en" | "english" => "English",
-        "ja" | "japanese" => "Japanese",
-        "ko" | "korean" => "Korean",
         "sr" | "serbian" => "Serbian written in the Latin alphabet (not Cyrillic)",
-        _ => target_language(text),
+        "zh" | "chinese" => "Simplified Chinese",
+        // 老配置里的 auto / ja 之类统一落到中文
+        _ => {
+            let _ = text;
+            "Simplified Chinese"
+        }
     }
 }
 
 fn prompt_for(text: &str, target: &str) -> String {
     format!(
-        "Translate the following text into {target}. Keep the line breaks and the original order. \
-Only output the translation, no explanations, no quotes.\n\n{text}"
+        "Translate the following screenshot text into {target}. The source is usually English \
+or Serbian. Keep the line breaks and the original order. Only output the translation, \
+no explanations, no quotes.\n\n{text}"
     )
 }
 
@@ -544,16 +535,25 @@ pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
                         drop(Box::from_raw(early));
                     }
                 }
-                match translate_text(&source, &settings) {
-                Ok(translated) => TranslateOutcome {
-                    source,
-                    translated,
-                    error: None,
-                },
+                match translate_pairs(&settings, &source) {
+                Ok(pairs) => {
+                    let translated = pairs
+                        .iter()
+                        .map(|(_, target)| target.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    TranslateOutcome {
+                        source,
+                        translated,
+                        error: None,
+                        pairs: Some(pairs),
+                    }
+                }
                 Err(error) => TranslateOutcome {
                     source,
                     translated: String::new(),
                     error: Some(error),
+                    pairs: None,
                 },
                 }
             }
@@ -561,6 +561,7 @@ pub fn translate_region_async(owner: HWND, bitmap: Bitmap) {
                 source: String::new(),
                 translated: String::new(),
                 error: Some(error),
+                pairs: None,
             },
         };
         let payload = Box::into_raw(Box::new(outcome));
@@ -607,10 +608,4 @@ mod tests {
         assert_eq!(model, "gpt-4.1-mini");
     }
 
-    #[test]
-    fn target_language_flips_by_script() {
-        assert_eq!(target_language("这是一段中文"), "English");
-        assert_eq!(target_language("this is english"), "Chinese");
-        assert_eq!(target_language("混合 mixed 内容"), "English");
     }
-}

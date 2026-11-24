@@ -4156,7 +4156,9 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                         let region = editor.base.crop(left, top, right - left, bottom - top);
                         editor.tool = Tool::None;
                         crate::translate::translate_region_async(PANEL, region);
-                        SetWindowTextW(hwnd, wide("截图编辑 · 正在翻译…").as_ptr());
+                        // 翻译结果窗接管屏幕：编辑窗直接关掉，别挡在后面
+                        DestroyWindow(hwnd);
+                        return 0;
                     }
                     Tool::Ocr if wide_enough => {
                         // 只对框里这块做 OCR
@@ -4164,7 +4166,9 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                         editor.tool = Tool::None;
                         let panel = PANEL;
                         crate::ocr::recognize_async(panel, region);
-                        SetWindowTextW(hwnd, wide("截图编辑 · 正在识别…").as_ptr());
+                        // 取字结果窗接管屏幕：编辑窗直接关掉
+                        DestroyWindow(hwnd);
+                        return 0;
                     }
                     _ => {}
                 }

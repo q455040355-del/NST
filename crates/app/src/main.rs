@@ -1254,6 +1254,7 @@ unsafe extern "system" fn wnd_proc(
                 ocr_ui::update_translation(
                     &outcome.source,
                     &outcome.translated,
+                    outcome.pairs.clone(),
                     outcome.error.as_deref(),
                 );
             }
