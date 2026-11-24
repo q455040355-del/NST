@@ -68,11 +68,12 @@ static ANIM_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 static ANIM_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 译成什么语言：(显示名, 存进 ini 的值)
-const TARGETS: [(&str, &str); 4] = [
+const TARGETS: [(&str, &str); 5] = [
     ("自动", "auto"),
     ("中文", "zh"),
     ("English", "en"),
     ("日本語", "ja"),
+    ("Srpski (lat.)", "sr"),
 ];
 
 /// 面板字号（显示文案, 百分比）
@@ -704,7 +705,7 @@ fn layout(state: &State, client: RECT) -> Layout {
         },
         // 翻译标题右边、开关左边的「目标 自动」
         tr_target: RECT {
-            left: right - s(150.0, scale),
+            left: right - s(184.0, scale),
             top: s(TR_TITLE_TOP + 1.0, scale),
             right: right - s(48.0, scale),
             bottom: s(TR_TITLE_TOP + 27.0, scale),
@@ -1647,7 +1648,7 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
             "翻译",
             p.s(TR_TITLE_TOP),
             right_left + p.s(4.0),
-            l.tr_toggle.left - p.s(10.0),
+            l.tr_target.left - p.s(12.0),
         );
         // 目标语言：一颗小胶囊，点一下在 自动 / 中文 / English / 日本語 之间轮
         {

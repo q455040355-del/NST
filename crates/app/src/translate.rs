@@ -49,6 +49,7 @@ fn target_for(settings: &netspeed_core::settings::Settings, text: &str) -> &'sta
         "en" | "english" => "English",
         "ja" | "japanese" => "Japanese",
         "ko" | "korean" => "Korean",
+        "sr" | "serbian" => "Serbian written in the Latin alphabet (not Cyrillic)",
         _ => target_language(text),
     }
 }
