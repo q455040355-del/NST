@@ -614,8 +614,8 @@ impl Panel {
             card = card.pair("其他", value);
         }
         if card.lines.len() == 1 {
-            // 这一秒全是零碎流量：说清楚为什么没有名字，别只留一个空标题
-            card = card.text(format!("刚才没有超过 {} 的进程", format_speed(MIN_RATE)));
+            // 这一秒全是零碎流量：说清楚「没有单个进程够门槛」，别只留一个空标题
+            card = card.text(format!("刚才没有单个进程超过 {}", format_speed(MIN_RATE)));
         }
         card
     }
