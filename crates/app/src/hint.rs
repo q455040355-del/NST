@@ -8,7 +8,8 @@
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, EndPaint, GetDC, InvalidateRect, ReleaseDC, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, EndPaint, GetDC, InvalidateRect, RedrawWindow, ReleaseDC, SelectClipRgn,
+    UpdateWindow, PAINTSTRUCT, RDW_INVALIDATE, RDW_NOERASE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -43,11 +44,25 @@ pub enum Line {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Hint {
     pub lines: Vec<Line>,
+    /// 同一类气泡的标识（"netproc-up" / "netproc-down" / "text"）。
+    ///
+    /// 数字每秒都在变，宽度跟着变就会每秒重排一次窗口；按这个标签记住这次悬停
+    /// 见过的最宽值，宽度只增不减，窗口就不再抖了。
+    pub tag: Option<&'static str>,
 }
 
 impl Hint {
     pub fn new() -> Self {
-        Self { lines: Vec::new() }
+        Self {
+            lines: Vec::new(),
+            tag: None,
+        }
+    }
+
+    /// 打上「同一类气泡」的标签：同一次悬停里宽度只增不减，避免每秒改窗口大小
+    pub fn tag(mut self, tag: &'static str) -> Self {
+        self.tag = Some(tag);
+        self
     }
 
     pub fn title(mut self, text: impl Into<String>) -> Self {
@@ -221,6 +236,10 @@ unsafe fn paint(hwnd: HWND) {
 unsafe fn blit(hwnd: HWND, dib: &ui::Dib, client: RECT) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
+    // BeginPaint 的 dc 只让画「更新区」。窗口每秒变高变宽时，系统只把新露出来的
+    // 那一溜标成更新区，剩下的还是上一秒的字——看起来就是「框和内容对不上」。
+    // 这里把裁剪区放宽到整个客户区，每一帧都是整帧重画。
+    SelectClipRgn(hdc, std::ptr::null_mut());
     BitBlt(hdc, 0, 0, client.right, client.bottom, dib.dc, 0, 0, SRCCOPY);
     EndPaint(hwnd, &mut ps);
 }
@@ -334,7 +353,7 @@ pub unsafe fn show_text(anchor: RECT, text: &str) {
         hide();
         return;
     }
-    show(anchor, &Hint::new().text(text));
+    show(anchor, &Hint::new().tag("text").text(text));
 }
 
 /// 在 `anchor`（屏幕坐标，一般传面板的窗口矩形）上方显示卡片；重复调用只更新内容。
@@ -351,6 +370,12 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
     };
     let scale = crate::scale_at(center);
     let (width, height) = measure(hint, scale);
+    // 同一次悬停里宽度只增不减：每秒刷新时数字长短一变就重排窗口的话，
+    // 会看到「框先变、内容后到」的半截画面（放大后的新区域要等下一次 WM_PAINT）
+    let width = match hint.tag {
+        Some(tag) => remember_width(tag, width),
+        None => width,
+    };
     let work = crate::work_area_at(center);
 
     // 横向贴着面板居中，纵向放在面板上方（面板本身在任务栏里，放下面会出屏）
@@ -393,9 +418,16 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
             top,
             width,
             height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            // NOCOPYBITS：放大时系统会把旧内容拷进新区域，那一帧就是「旧字 + 新框」
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS,
         );
-        InvalidateRect(HINT, std::ptr::null(), 0);
+        // 同步重画：只 InvalidateRect 的话重画要排队，中间那一帧还留着旧内容
+        RedrawWindow(
+            HINT,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
+        );
         return;
     }
 
@@ -444,7 +476,7 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
     ui::round_corners(hwnd);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    InvalidateRect(hwnd, std::ptr::null(), 0);
+    UpdateWindow(hwnd);
     HINT = hwnd;
 }
 
@@ -454,6 +486,36 @@ pub fn hide() {
             DestroyWindow(HINT);
         }
         HINT = std::ptr::null_mut();
+    }
+    forget_width();
+}
+
+/// 这次悬停见过的最宽值（同 tag 才累加）；`hide()` 时清零。
+fn remember_width(tag: &'static str, width: i32) -> i32 {
+    use std::sync::{Mutex, OnceLock};
+
+    static SLOT: OnceLock<Mutex<Option<(&'static str, i32)>>> = OnceLock::new();
+    let cell = SLOT.get_or_init(|| Mutex::new(None));
+
+    if let Ok(mut slot) = cell.lock() {
+        if let Some((saved, widest)) = *slot {
+            if saved == tag {
+                let widest = widest.max(width);
+                *slot = Some((tag, widest));
+                return widest;
+            }
+        }
+        *slot = Some((tag, width));
+    }
+    width
+}
+
+fn forget_width() {
+    use std::sync::{Mutex, OnceLock};
+
+    static SLOT: OnceLock<Mutex<Option<(&'static str, i32)>>> = OnceLock::new();
+    if let Ok(mut slot) = SLOT.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = None;
     }
 }
 

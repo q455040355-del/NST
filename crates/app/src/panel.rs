@@ -557,15 +557,17 @@ impl Panel {
             (&self.down_text, "下载")
         };
         let title = format!("{direction} {speed}");
+        let tag = if up { "netproc-up" } else { "netproc-down" };
 
         if !self.settings.netproc_enabled && !netproc::mock() {
             // 关着的时候至少把「为什么没有进程名」说清楚：一句话引导去菜单里打开
             return Hint::new()
+                .tag(tag)
                 .title(title)
                 .text("右键 → 进程明细（需一次管理员授权）");
         }
 
-        let card = Hint::new().title(title);
+        let card = Hint::new().tag(tag).title(title);
         let (status, note) = netproc::status();
         match status {
             Status::Off => return Hint::new(),

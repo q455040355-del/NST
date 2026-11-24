@@ -1085,8 +1085,9 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
 
-            // 悬浮说明开着就顺手刷一下数值（不动鼠标也能看到最新值）
-            if hint::visible() {
+            // 悬浮说明开着（或鼠标还停在面板上）就顺手刷一下数值：不动鼠标也能看到最新值；
+            // 中间某一秒数据变空把气泡收掉了，下一帧也能自己回来
+            if hint::visible() || cursor_over_panel(hwnd) {
                 update_hover_hint(hwnd);
             }
             0
@@ -1474,6 +1475,11 @@ fn inside(zone: &RECT, cursor: POINT) -> bool {
         && cursor.x < zone.right
         && cursor.y >= zone.top
         && cursor.y < zone.bottom
+}
+
+/// 鼠标正下方是不是面板（菜单/设置窗盖在上面时，别再往面板上方弹气泡）
+fn cursor_over_panel(hwnd: HWND) -> bool {
+    unsafe { WindowFromPoint(hint::cursor()) == hwnd }
 }
 
 fn show_menu(hwnd: HWND) {

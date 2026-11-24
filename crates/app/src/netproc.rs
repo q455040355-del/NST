@@ -402,19 +402,29 @@ fn run_mock_helper() {
         std::thread::sleep(Duration::from_millis(1000));
         tick += 1;
 
-        // 0.6 ~ 1.4 倍的缓慢起伏，数字不会一帧一个样
+        // 调试数据一秒一变，而且故意在「四行长名字 + M/s」和「一行短名字 + B/s」
+        // 之间来回跳：气泡的宽高每秒都要重排，正好用来验证它不会闪成半截
+        let big = tick % 2 == 0;
         let wave = 1.0 + (tick as f64 * 0.35).sin() * 0.4;
-        let up = vec![
-            ("chrome".to_string(), 920_000.0 * wave),
-            ("Code".to_string(), 140_000.0 * wave),
-            ("svchost".to_string(), 9_000.0),
-            ("OneDrive".to_string(), 4_000.0),
-        ];
-        let down = vec![
-            ("chrome".to_string(), 6_400_000.0 * wave),
-            ("Steam".to_string(), 1_100_000.0),
-            ("explorer".to_string(), 26_000.0),
-        ];
+        let up = if big {
+            vec![
+                ("chrome".to_string(), 920_000.0 * wave),
+                ("Code".to_string(), 140_000.0 * wave),
+                ("svchost".to_string(), 9_000.0),
+                ("OneDrive".to_string(), 4_000.0),
+            ]
+        } else {
+            vec![("chrome".to_string(), 140.0)]
+        };
+        let down = if big {
+            vec![
+                ("chrome".to_string(), 6_400_000.0 * wave),
+                ("Steam".to_string(), 1_100_000.0),
+                ("explorer".to_string(), 26_000.0),
+            ]
+        } else {
+            vec![("explorer".to_string(), 90.0)]
+        };
         let report = WireReport {
             up_total: up.iter().map(|(_, rate)| rate).sum(),
             down_total: down.iter().map(|(_, rate)| rate).sum(),
