@@ -421,6 +421,10 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
             // NOCOPYBITS：放大时系统会把旧内容拷进新区域，那一帧就是「旧字 + 新框」
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS,
         );
+        // Win10 没有 DWM 圆角，`round_corners` 是拿 `SetWindowRgn` 把窗口切圆的：
+        // 区域只按创建那一刻的尺寸切。窗口一变宽/变高，超出去的部分就被裁掉，
+        // 看起来正是「框变大了、内容却只有半截」。所以每次改尺寸都要重切一次。
+        ui::round_corners(HINT);
         // 同步重画：只 InvalidateRect 的话重画要排队，中间那一帧还留着旧内容
         RedrawWindow(
             HINT,
