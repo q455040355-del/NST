@@ -65,7 +65,7 @@ pub struct Settings {
     pub translate_model: String,
     /// Base URL；空 = 用服务商默认值
     pub translate_base: String,
-    /// 译成什么语言："auto"（中→英、其它→中）/ "zh" / "en" / "ja" / "ko" / "sr"（塞尔维亚语拉丁）
+    /// 译成什么语言：默认 "zh"（中文）/ "en" / "sr"（塞尔维亚语拉丁）
     pub translate_target: String,
     /// 三家服务商各自的 Key / 模型 / Base：切换服务商时照着搬，切回来还是上次填的
     pub translate_profiles: [TranslateProfile; TRANSLATE_PROVIDERS.len()],
@@ -134,7 +134,7 @@ impl Default for Settings {
             translate_key: String::new(),
             translate_model: String::new(),
             translate_base: String::new(),
-            translate_target: "auto".to_string(),
+            translate_target: "zh".to_string(),
             translate_profiles: Default::default(),
             extra: BTreeMap::new(),
         }
