@@ -34,6 +34,8 @@ pub struct Settings {
     pub ai_workbuddy_ai: bool,
     /// 开机自启（写 HKCU\…\Run）
     pub auto_start: bool,
+    /// 网速悬停时的「进程明细」：关着就完全不碰 ETW / 不提权
+    pub netproc_enabled: bool,
     /// 截图功能开关：关掉后菜单不显示、热键不注册
     pub shot_enabled: bool,
     /// 取字 / OCR 开关（默认关，开了才注册热键、截图工具栏才出现「OCR」）
@@ -119,6 +121,7 @@ impl Default for Settings {
             ai_workbuddy: true,
             ai_workbuddy_ai: true,
             auto_start: false,
+            netproc_enabled: false,
             shot_enabled: true,
             ocr_enabled: false,
             shot_hotkey: "Ctrl+Shift+A".to_string(),
@@ -196,6 +199,7 @@ impl Settings {
                 "AiWorkBuddy" => settings.ai_workbuddy = parse_bool(value),
                 "AiWorkBuddyAi" => settings.ai_workbuddy_ai = parse_bool(value),
                 "AutoStart" => settings.auto_start = parse_bool(value),
+                "NetProc" => settings.netproc_enabled = parse_bool(value),
                 "ShotEnabled" => settings.shot_enabled = parse_bool(value),
                 "OcrEnabled" => settings.ocr_enabled = parse_bool(value),
                 "ShotHotkey" => {
@@ -357,6 +361,7 @@ impl Settings {
         out.push_str(&format!("AiWorkBuddy={}\n", self.ai_workbuddy));
         out.push_str(&format!("AiWorkBuddyAi={}\n", self.ai_workbuddy_ai));
         out.push_str(&format!("AutoStart={}\n", self.auto_start));
+        out.push_str(&format!("NetProc={}\n", self.netproc_enabled));
         out.push_str(&format!("ShotEnabled={}\n", self.shot_enabled));
         out.push_str(&format!("OcrEnabled={}\n", self.ocr_enabled));
         out.push_str(&format!("ShotHotkey={}\n", self.shot_hotkey));
@@ -403,6 +408,7 @@ impl Settings {
                     | "AiWorkBuddy"
                     | "AiWorkBuddyAi"
                     | "AutoStart"
+                    | "NetProc"
                     | "ShotEnabled"
                     | "OcrEnabled"
                     | "ShotHotkey"
@@ -731,6 +737,7 @@ mod roundtrip_tests {
         settings.ai_workbuddy = true;
         settings.ai_workbuddy_ai = true;
         settings.auto_start = true;
+        settings.netproc_enabled = true;
         settings.shot_enabled = false;
         settings.ocr_enabled = true;
         settings.shot_hotkey = "Ctrl+Alt+Q".to_string();
@@ -781,6 +788,7 @@ mod roundtrip_tests {
         assert_eq!(loaded.ai_workbuddy, original.ai_workbuddy, "ai_workbuddy");
         assert_eq!(loaded.ai_workbuddy_ai, original.ai_workbuddy_ai, "ai_workbuddy_ai");
         assert_eq!(loaded.auto_start, original.auto_start, "auto_start");
+        assert_eq!(loaded.netproc_enabled, original.netproc_enabled, "netproc_enabled");
         assert_eq!(loaded.shot_enabled, original.shot_enabled, "shot_enabled");
         assert_eq!(loaded.ocr_enabled, original.ocr_enabled, "ocr_enabled");
         assert_eq!(loaded.shot_hotkey, original.shot_hotkey, "shot_hotkey");

@@ -7,6 +7,7 @@ pub mod format;
 pub mod history;
 pub mod memory;
 pub mod net;
+pub mod netproc;
 pub mod settings;
 pub mod temperature;
 
@@ -14,5 +15,6 @@ pub use ai::{format_speed as format_ai_speed, format_tokens, AiEngine, AiSnapsho
 pub use format::{format_bytes_gb, format_speed, format_temperature};
 pub use memory::MemorySnapshot;
 pub use net::{NetSample, NetSampler};
+pub use netproc::{NetProcessSnapshot, NetProcessWatcher, ProcTraffic, WireReport};
 pub use settings::Settings;
 pub use temperature::{append_watts, format_temperature as format_celsius, TemperatureMonitor, TemperatureSnapshot};

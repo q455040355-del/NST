@@ -10,6 +10,7 @@ mod dxgi;
 mod gifrec;
 mod history_ui;
 mod hint;
+mod netproc;
 mod autostart;
 mod menu;
 mod ocr;
@@ -140,9 +141,18 @@ const ID_PANEL_SNAP: usize = 1201;
 const ID_SHOT: usize = 1302;
 const ID_OCR: usize = 1303;
 const ID_GIF: usize = 1304;
+const ID_NETPROC: usize = 1305;
+const ID_NETPROC_RETRY: usize = 1307;
 const ID_QUIT: usize = 1099;
 
 fn main() {
+    // 提权助手模式：同一个 exe，只跑 ETW 采集 + 写管道，不开窗口、不抢单实例互斥体。
+    // 必须放在 DPI / 互斥体 / 托盘之前——它就是被面板 `runas` 拉起来的那个进程。
+    if std::env::args().any(|arg| arg == netproc::HELPER_ARG) {
+        netproc::run_helper();
+        return;
+    }
+
     install_panic_hook();
     unsafe {
         // 必须在任何窗口/坐标计算之前：否则进程是 DPI 不感知的，
@@ -1009,9 +1019,12 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_CREATE => {
             let settings = Settings::load();
+            let netproc_enabled = settings.netproc_enabled;
             let panel = Box::new(Panel::new(hwnd, settings));
             let ptr = Box::into_raw(panel);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            // 设置里开着「进程明细」才去提权拉助手（关着完全不碰 ETW / 不弹 UAC）
+            netproc::init(netproc_enabled);
             PostMessageW(hwnd, WM_APP_TICK, 0, 0);
             0
         }
@@ -1074,7 +1087,7 @@ unsafe extern "system" fn wnd_proc(
 
             // 悬浮说明开着就顺手刷一下数值（不动鼠标也能看到最新值）
             if hint::visible() {
-                update_gauge_hint(hwnd);
+                update_hover_hint(hwnd);
             }
             0
         }
@@ -1167,10 +1180,10 @@ unsafe extern "system" fn wnd_proc(
             // 鼠标停在底部指示条上 → 弹个说明
             if !DRAG_ACTIVE {
                 track_mouse_leave(hwnd);
-                update_gauge_hint(hwnd);
+                update_hover_hint(hwnd);
                 return 0;
             }
-            update_gauge_hint(hwnd);
+            update_hover_hint(hwnd);
             let mut cursor = POINT { x: 0, y: 0 };
             GetCursorPos(&mut cursor);
             let dx = cursor.x - DRAG_FROM.x;
@@ -1407,8 +1420,11 @@ fn track_mouse_leave(hwnd: HWND) {
     }
 }
 
-/// 光标在指示条上就弹说明，离开就收掉
-fn update_gauge_hint(hwnd: HWND) {
+/// 鼠标停在面板上时该显示什么：
+///
+/// * 底部指示条 → 这条指示条代表什么、现在多少；
+/// * 网速视图的上传 / 下载行 → 当前速度 + 哪个进程用得最多。
+fn update_hover_hint(hwnd: HWND) {
     let Some(panel) = panel_mut(hwnd) else {
         return;
     };
@@ -1417,21 +1433,7 @@ fn update_gauge_hint(hwnd: HWND) {
         return;
     }
 
-    let Some(zone) = panel.gauge_hot_rect() else {
-        hint::hide();
-        return;
-    };
-
     let cursor = hint::cursor();
-    let inside = cursor.x >= zone.left
-        && cursor.x < zone.right
-        && cursor.y >= zone.top
-        && cursor.y < zone.bottom;
-    if !inside {
-        hint::hide();
-        return;
-    }
-
     let mut frame = RECT {
         left: 0,
         top: 0,
@@ -1439,8 +1441,39 @@ fn update_gauge_hint(hwnd: HWND) {
         bottom: 0,
     };
     unsafe { GetWindowRect(hwnd, &mut frame) };
-    let text = panel.gauge_hint();
-    unsafe { hint::show(frame, &text) };
+
+    if let Some(zone) = panel.gauge_hot_rect() {
+        if inside(&zone, cursor) {
+            let text = panel.gauge_hint();
+            unsafe { hint::show_text(frame, &text) };
+            return;
+        }
+    }
+
+    // 上传（第 0 行）/ 下载（第 1 行）：只有网速视图才有这两行
+    for (index, up) in [(0usize, true), (1usize, false)] {
+        let Some(zone) = panel.speed_row_hot_rect(index) else {
+            continue;
+        };
+        if inside(&zone, cursor) {
+            let card = panel.process_hint(up);
+            if card.is_empty() {
+                hint::hide();
+                return;
+            }
+            unsafe { hint::show(frame, &card) };
+            return;
+        }
+    }
+
+    hint::hide();
+}
+
+fn inside(zone: &RECT, cursor: POINT) -> bool {
+    cursor.x >= zone.left
+        && cursor.x < zone.right
+        && cursor.y >= zone.top
+        && cursor.y < zone.bottom
 }
 
 fn show_menu(hwnd: HWND) {
@@ -1468,6 +1501,16 @@ fn show_menu(hwnd: HWND) {
         rows.push(menu::Entry::radio(ID_GAUGE_AI, "Token 速度", gauge == "ai"));
     }
     rows.push(menu::Entry::radio(ID_GAUGE_NONE, "关闭", gauge == "none"));
+    rows.push(menu::Entry::separator());
+    rows.push(menu::Entry::checked(
+        ID_NETPROC,
+        "进程明细（悬停看进程）",
+        panel.settings.netproc_enabled,
+    ));
+    if panel.settings.netproc_enabled && netproc::status().0 != netproc::Status::Running {
+        // 上次 UAC 被拒 / 助手被杀了：给一个不用先关再开的「重连」
+        rows.push(menu::Entry::item(ID_NETPROC_RETRY, "重新连接进程明细"));
+    }
     rows.push(menu::Entry::separator());
     if ai {
         rows.push(menu::Entry::item(ID_HISTORY, "Token 用量历史…"));
@@ -1519,6 +1562,21 @@ fn handle_command(hwnd: HWND, command: usize) {
             ID_GAUGE_NONE => panel.set_gauge("none"),
             ID_HISTORY => {
                 history_ui::open(hwnd);
+            }
+            ID_NETPROC => {
+                let enabled = !panel.settings.netproc_enabled;
+                panel.settings.netproc_enabled = enabled;
+                panel.settings.save();
+                if enabled {
+                    // 第一次开会弹一次 UAC：ETW 内核网络事件只有管理员能开
+                    netproc::enable();
+                } else {
+                    netproc::disable();
+                    hint::hide();
+                }
+            }
+            ID_NETPROC_RETRY => {
+                netproc::retry();
             }
             ID_SETTINGS => {
                 let settings = panel.settings.clone();

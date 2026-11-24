@@ -469,9 +469,6 @@ impl Panel {
 
     /// 指示条的悬浮热区（屏幕坐标）；指示条关掉时返回 None
     pub fn gauge_hot_rect(&self) -> Option<RECT> {
-        if !self.settings.gauge_visible() {
-            return None;
-        }
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -481,17 +478,136 @@ impl Panel {
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut rect);
         }
-        // 底边往上 12px 都算「指着指示条」，比 3px 的条本身好点
-        let band = scale(self.dpi, 12);
-        if rect.bottom - rect.top <= band {
+        self.gauge_band(&rect)
+    }
+
+    /// 底部指示条占的那一条（屏幕坐标）。
+    ///
+    /// 只算「条本体 + 上下各 2px」：以前一律取底边往上 12px，会把下载行
+    /// 最下面那几个像素抢走——鼠标刚移到「下」字下面，弹出来的却是内存说明。
+    fn gauge_band(&self, frame: &RECT) -> Option<RECT> {
+        if !self.settings.gauge_visible() {
+            return None;
+        }
+        let bar = scale(self.dpi, 3);
+        let gap = scale(self.dpi, 3);
+        let top = frame.bottom - bar - gap - scale(self.dpi, 2);
+        if top <= frame.top {
             return None;
         }
         Some(RECT {
-            left: rect.left,
-            top: rect.bottom - band,
-            right: rect.right,
-            bottom: rect.bottom,
+            left: frame.left,
+            top,
+            right: frame.right,
+            bottom: frame.bottom,
         })
+    }
+
+    /// 网速视图里第 `index` 行（0 = 上传，1 = 下载）的屏幕热区。
+    ///
+    /// 行高和 `row()` 里算的一模一样：面板高度减掉底部指示条，再对半分。
+    pub fn speed_row_hot_rect(&self, index: usize) -> Option<RECT> {
+        if self.settings.view != VIEW_SPEED || index > 1 {
+            return None;
+        }
+
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut frame);
+        }
+
+        let gauge = if self.settings.gauge_visible() { scale(self.dpi, 3) } else { 0 };
+        let row_height = ((frame.bottom - frame.top) - gauge) / 2;
+        if row_height <= 0 {
+            return None;
+        }
+
+        let top = frame.top + index as i32 * row_height;
+        let mut bottom = top + row_height;
+        // 下载行的下半截和底部指示条重叠：让给指示条，别一格热区两套说法
+        if let Some(band) = self.gauge_band(&frame) {
+            if top < band.top {
+                bottom = bottom.min(band.top);
+            }
+        }
+        Some(RECT {
+            left: frame.left,
+            top,
+            right: frame.right,
+            bottom,
+        })
+    }
+
+    /// 悬停上传 / 下载时的小卡片：当前速度 + 前几名进程。
+    ///
+    /// 进程明细要提权（ETW 内核网络事件），所以这里把「为什么没有数据」
+    /// 也照实写在卡片里，而不是弹个空气泡或者假装 0。
+    pub fn process_hint(&self, up: bool) -> crate::hint::Hint {
+        use crate::hint::Hint;
+        use crate::netproc::{self, Status};
+
+        let (speed, direction) = if up {
+            (&self.up_text, "上传")
+        } else {
+            (&self.down_text, "下载")
+        };
+        let title = format!("{direction} {speed}");
+
+        if !self.settings.netproc_enabled && !netproc::mock() {
+            // 关着的时候至少把「为什么没有进程名」说清楚：一句话引导去菜单里打开
+            return Hint::new()
+                .title(title)
+                .text("右键 → 进程明细（需一次管理员授权）");
+        }
+
+        let card = Hint::new().title(title);
+        let (status, note) = netproc::status();
+        match status {
+            Status::Off => return Hint::new(),
+            Status::Denied => return card.text(note).text("右键 → 进程明细 可重试"),
+            Status::Failed => return card.text(note).text("右键 → 重新连接进程明细"),
+            Status::Starting => {
+                return card.text(if note.is_empty() {
+                    "正在等管理员授权的助手…".to_string()
+                } else {
+                    note
+                });
+            }
+            Status::Running => {}
+        }
+
+        let Some((report, _)) = netproc::latest() else {
+            return card.text("助手没回数据（右键 → 进程明细 重试）");
+        };
+
+        let (items, total) = if up {
+            (&report.up, report.up_total)
+        } else {
+            (&report.down, report.down_total)
+        };
+        if items.is_empty() {
+            return card.text("刚才没有流量");
+        }
+
+        // 面板上只放得下三行 + 一行「其他」：多的并到「其他」里，占比照样加起来是 100%
+        let mut shown = 0.0;
+        let mut card = card;
+        for (name, rate) in items.iter().take(3) {
+            shown += *rate;
+            let value = format!("{}  {:.0}%", format_speed(*rate), share(*rate, total));
+            card = card.pair(shorten_name(name), value);
+        }
+        let rest = total - shown;
+        if rest > 1.0 {
+            let value = format!("{}  {:.0}%", format_speed(rest), share(rest, total));
+            card = card.pair("其他", value);
+        }
+        card
     }
 
     fn compute_gauge(&self) -> f32 {
@@ -907,6 +1023,26 @@ fn color_far_enough(a: u32, b: u32) -> bool {
         (av - bv).abs()
     };
     channel(0).max(channel(8)).max(channel(16)) > 10
+}
+
+/// 进程名太长会撑爆气泡：超过 14 个字符就截断加省略号（中英文都按字符数算）
+fn shorten_name(name: &str) -> String {
+    const LIMIT: usize = 14;
+    if name.chars().count() <= LIMIT {
+        return name.to_string();
+    }
+    let mut text: String = name.chars().take(LIMIT - 1).collect();
+    text.push('…');
+    text
+}
+
+/// 占比（0~100）；合计为 0 时返回 0，别出现 NaN
+fn share(rate: f64, total: f64) -> f64 {
+    if total > 0.0 {
+        (rate / total * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
 }
 
 fn blend(a: u32, b: u32, t: f32) -> u32 {
