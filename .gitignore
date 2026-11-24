@@ -2,3 +2,6 @@ target/
 *.exe
 *.pdb
 icons-export/
+
+# 本地草稿：设计稿、构建日志、临时截图，不进仓库
+.scratch/
