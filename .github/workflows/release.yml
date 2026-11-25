@@ -40,6 +40,10 @@ jobs:
           }
           Copy-Item -Recurse models $dir
 
+          # 截图工具栏的图标素材（27 格彩色拼图）。exe 里已经 include_bytes! 编了一份，
+          # 包里再带一份是为了让人能直接换图：exe 同目录的 icons.png 会覆盖内嵌的那份
+          Copy-Item icons.png $dir
+
           # 把这次构建的身份写进包里，省得看 exe 时间戳猜是不是最新：
           # exe 的时间就是「构建完成时间」，一定比 checkout 出来的源码新
           $exe = Get-Item target/release/netspeed.exe

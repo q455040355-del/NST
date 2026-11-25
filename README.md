@@ -328,12 +328,10 @@ powershell -File scripts\smoke.ps1 -Dark
 $env:NST_EDITOR_PREVIEW = "$PWD\target\editor.png"; .\target\release\netspeed.exe
 ```
 
-编辑窗的图标优先用 **exe 同目录的 `icons.png`**（19 格 × 176px 的灰度蒙版横向拼图：
-前 16 格是设计稿 01..16——矩形/圆形/表情/箭头/画笔/马赛克/文本/翻译/识图/滚动/撤销/保存/图钉/转发/取消/完成，
-第 17、18 格是按同一套画法补的「贴图（图钉钉住截图）」和「置顶（窗口+上箭头）」，
-第 19 格是「正方形画框」），有就贴图、没有就退回代码里自绘的那套。
-这份素材**不在仓库里**（版权原因只在部署目录放），换图标只要替换这个 png，不用重新编译。
-素材是从 `截图工具栏矢量图标设计稿.pdf` 的矢量预览格子渲染出来的（`target/make_design_sheet.py`，900 DPI）。
+编辑窗的图标来自 **`icons.png`**（27 格 × 96px 的彩色横向拼图：工具栏 24 个 + 最小化 / 关闭 / 完成）。
+这份素材已经**编进 exe 里**（`include_bytes!`），所以发布包解压到任何机器、甚至只拷一个 exe，
+工具栏都是同一套——以前只带 exe 时，别人机器上没有这个 png，就会退回代码自绘的线条图标，
+看着像两个软件。`exe 同目录` 再放一份 `icons.png` 会**覆盖**内嵌的那份：换图标只要替换这个 png，不用重新编译。
 
 CI（`.github/workflows/ci.yml`）在 `windows-latest` 上跑 `cargo test --workspace` 和
 `cargo check --workspace --all-targets`；界面相关的验证只能本地跑 smoke。

@@ -256,3 +256,4 @@ pub fn destroy_icon(icon: HICON) {
         }
     }
 }
+

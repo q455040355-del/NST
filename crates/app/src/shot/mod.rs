@@ -2429,12 +2429,19 @@ unsafe fn icon_dot(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color:
 }
 
 // ---------------------------------------------------------------- 图标素材包
-// exe 同目录下有 icons.png 时，优先用里面抠好的微信图标（蒙版 + 着色），
-// 没有就退回下面自绘的那套。素材包不在仓库里，只有本机部署目录放。
+// 截图工具栏用 icons.png 里的彩色素材（96×96 一格，共 27 格），
+// 找不到才退回下面自绘的那套线条图标。
 
 const PACK_CELL: i32 = 96;
 /// 27 格：工具栏 24 个 + 最小化 / 关闭 / 完成
 const PACK_COUNT: usize = 27;
+
+/// 编进 exe 的那份素材包（仓库根 `icons.png`）。
+///
+/// 发布包以前只带 exe：别人机器上同目录没有 icons.png，就退回自绘的线条图标，
+/// 截图工具栏看着像另一个软件。现在把素材包编进来，在哪儿跑都是同一套。
+/// 想改图标：换仓库根的 icons.png 重新编译；或者直接丢一份到 exe 同目录覆盖。
+const PACK_EMBEDDED: &[u8] = include_bytes!("../../../../icons.png");
 
 struct IconPack {
     /// 每格 PACK_CELL×PACK_CELL 的 RGBA 像素（彩色，直通 alpha）
@@ -2448,6 +2455,24 @@ fn icon_pack() -> &'static Option<IconPack> {
 }
 
 fn load_icon_pack() -> Option<IconPack> {
+    // exe 同目录的 icons.png 优先：调图标时换张图就行，不用重新编译
+    if let Some(bytes) = exe_dir_icons() {
+        if let Some(pack) = parse_pack(&bytes) {
+            crate::debug_log("editor: 图标用 exe 同目录的 icons.png");
+            return Some(pack);
+        }
+    }
+
+    let pack = parse_pack(PACK_EMBEDDED);
+    crate::debug_log(if pack.is_some() {
+        "editor: 图标用内嵌素材包"
+    } else {
+        "editor: 素材包解析失败，退回自绘图标"
+    });
+    pack
+}
+
+fn exe_dir_icons() -> Option<Vec<u8>> {
     unsafe {
         let mut buf = [0u16; 1024];
         let len = windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
@@ -2461,26 +2486,28 @@ fn load_icon_pack() -> Option<IconPack> {
         let mut path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
         path.pop();
         path.push("icons.png");
-        let bytes = std::fs::read(&path).ok()?;
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-        let (width, height) = img.dimensions();
-        if height != PACK_CELL as u32 || width < PACK_CELL as u32 * PACK_COUNT as u32 {
-            return None;
-        }
-        let mut cells = Vec::with_capacity(PACK_COUNT);
-        for index in 0..PACK_COUNT {
-            let mut cell = Vec::with_capacity((PACK_CELL * PACK_CELL * 4) as usize);
-            for y in 0..PACK_CELL as u32 {
-                for x in 0..PACK_CELL as u32 {
-                    let pixel = img.get_pixel(index as u32 * PACK_CELL as u32 + x, y).0;
-                    cell.extend_from_slice(&pixel);
-                }
-            }
-            cells.push(cell);
-        }
-        crate::debug_log("editor: 图标用 icons.png（彩色素材包）");
-        Some(IconPack { cells })
+        std::fs::read(&path).ok()
     }
+}
+
+fn parse_pack(bytes: &[u8]) -> Option<IconPack> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    if height != PACK_CELL as u32 || width < PACK_CELL as u32 * PACK_COUNT as u32 {
+        return None;
+    }
+    let mut cells = Vec::with_capacity(PACK_COUNT);
+    for index in 0..PACK_COUNT {
+        let mut cell = Vec::with_capacity((PACK_CELL * PACK_CELL * 4) as usize);
+        for y in 0..PACK_CELL as u32 {
+            for x in 0..PACK_CELL as u32 {
+                let pixel = img.get_pixel(index as u32 * PACK_CELL as u32 + x, y).0;
+                cell.extend_from_slice(&pixel);
+            }
+        }
+        cells.push(cell);
+    }
+    Some(IconPack { cells })
 }
 
 /// 动作 → 素材包里的第几格（顺序 = 工具栏顺序 + 窗口栏三个，见 .scratch/pack_extract2.py）
@@ -4584,5 +4611,22 @@ mod editor_geometry_tests {
             stroke: 0,
         };
         assert_eq!(shape_bounds(&pen), (10, 10, 30, 60));
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    /// 内嵌素材包必须能解析成 27 格：换 icons.png 时尺寸/格式不对，这里先炸
+    #[test]
+    fn embedded_pack_parses() {
+        let pack = parse_pack(PACK_EMBEDDED).expect("icons.png 应该能解析成 27 格");
+        assert_eq!(pack.cells.len(), PACK_COUNT);
+        // 每格 96×96×4 字节，而且得有透明像素（不是一整块实心方块）
+        for cell in &pack.cells {
+            assert_eq!(cell.len(), (PACK_CELL * PACK_CELL * 4) as usize);
+            assert!(cell.chunks(4).any(|pixel| pixel[3] == 0), "图标格子得透明底");
+        }
     }
 }
