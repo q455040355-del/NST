@@ -30,7 +30,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_DISABLE_PROVIDER, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
     EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
     PROCESS_TRACE_MODE_EVENT_RECORD,
     PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, WNODE_FLAG_TRACED_GUID,
@@ -322,6 +323,8 @@ pub struct NetProcessWatcher {
     previous: HashMap<u32, (u64, u64)>,
     last: Instant,
     names: HashMap<u32, String>,
+    /// provider 现在是不是开着（暂停时是 false）
+    enabled: bool,
 }
 
 impl NetProcessWatcher {
@@ -403,6 +406,7 @@ impl NetProcessWatcher {
             previous: HashMap::new(),
             last: Instant::now(),
             names: HashMap::new(),
+            enabled: true,
         })
     }
 
@@ -450,6 +454,51 @@ impl NetProcessWatcher {
             self.names.clear();
         }
         snapshot
+    }
+
+    /// 暂停 / 恢复采集。
+    ///
+    /// 暂停是真把 provider 关掉（不是「采了不报」）：内核不再为每个包产事件，
+    /// 全屏打游戏时开销归零。恢复时清掉累计——暂停期间计数器是空的，
+    /// 不清的话恢复第一秒会把「这段时间没数据」算成一个奇怪的值。
+    pub fn set_enabled(&mut self, on: bool) {
+        if self.enabled == on {
+            return;
+        }
+
+        let control = if on {
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER
+        } else {
+            EVENT_CONTROL_CODE_DISABLE_PROVIDER
+        };
+        let level = if on { 5 } else { 0 };
+        let status = unsafe {
+            EnableTraceEx2(
+                self.session,
+                &KERNEL_NETWORK,
+                control,
+                level,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            // 关不掉/开不回来就保持原状，下一轮再试
+            return;
+        }
+
+        self.enabled = on;
+        if let Ok(mut map) = counters().lock() {
+            map.clear();
+        }
+        self.previous.clear();
+        self.last = Instant::now();
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     fn name_of(&mut self, pid: u32) -> String {

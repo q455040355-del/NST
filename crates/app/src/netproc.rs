@@ -81,6 +81,31 @@ static STATE: Mutex<State> = Mutex::new(State {
 
 static WORKER: AtomicBool = AtomicBool::new(false);
 
+/// 面板这一侧记着「刚才是不是暂停着」：暂停时助手不写管道，恢复后第一秒
+/// 气泡里不该写「助手没回数据」吓人，而是说「刚恢复，等一秒」。
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static RESUMED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// 面板每次 tick 调一次：全屏 / 面板藏起来时，助手那边会停采集。
+pub fn note_paused(paused: bool) {
+    let was = PAUSED.swap(paused, Ordering::Relaxed);
+    if was && !paused {
+        if let Ok(mut slot) = RESUMED_AT.lock() {
+            *slot = Some(Instant::now());
+        }
+    }
+}
+
+/// 刚刚从「暂停」恢复过来（3 秒内）
+pub fn just_resumed() -> bool {
+    RESUMED_AT
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|at| at.elapsed() < Duration::from_secs(3))
+        .unwrap_or(false)
+}
+
 fn state() -> MutexGuard<'static, State> {
     // 管道线程 panic 过也别让面板跟着 panic：拿回里面还在的数据继续用
     STATE.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -376,8 +401,25 @@ pub fn run_helper() {
         return;
     };
 
+    // 全屏游戏/视频在前台、或者面板被藏起来了：没人看气泡，把 ETW 采集真的停掉
+    // （关 provider，内核不再为每个包产事件）。退出全屏后自动恢复。
+    let mut paused = false;
     loop {
         std::thread::sleep(Duration::from_millis(1000));
+
+        let idle = crate::panel_detection_paused();
+        if idle != paused {
+            watcher.set_enabled(!idle);
+            paused = idle;
+            crate::debug_log(&format!(
+                "netproc helper: 采集{}",
+                if idle { "暂停（全屏/面板隐藏）" } else { "恢复" }
+            ));
+        }
+        if idle {
+            continue;
+        }
+
         let snapshot = watcher.sample();
         let line = WireReport::from_snapshot(&snapshot).to_line();
         if !write_line(pipe, &line) {

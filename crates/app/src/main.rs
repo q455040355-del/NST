@@ -583,7 +583,7 @@ fn apply_dpi(hwnd: HWND, dpi: u32, suggested: *const RECT) {
                 top,
                 width,
                 height,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             );
         }
         InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -686,21 +686,34 @@ fn keep_on_top(hwnd: HWND) {
                     top,
                     width,
                     height,
-                    SWP_NOACTIVATE,
+                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                 );
                 return;
             }
         }
 
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        // 只要还是 TOPMOST 就别再动：对「owner 是任务栏」的窗口调 SetWindowPos(HWND_TOPMOST)
+        // 会连 owner 一起提前——表现就是网速一跳，任务栏闪到最前面。
+        // 真丢了置顶（全屏程序退出之类）才补一次，而且带上 SWP_NOOWNERZORDER。
+        if !is_topmost(hwnd) {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+    }
+}
+
+/// 窗口现在是不是置顶（WS_EX_TOPMOST）
+fn is_topmost(hwnd: HWND) -> bool {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        style & WS_EX_TOPMOST != 0
     }
 }
 
@@ -817,7 +830,7 @@ fn position_panel(hwnd: HWND, taskbar: HWND, width: i32, height: i32) {
             top,
             width,
             height,
-            SWP_NOACTIVATE,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         );
     }
 }
@@ -883,10 +896,6 @@ fn foreground_is_remote_client() -> bool {
     }
 }
 
-/// 周期刷新：后台线程每 500ms 投递一次 WM_APP_TICK。
-/// （本进程 SetTimer/WM_TIMER 实测完全收不到，改用线程投递最稳。）
-/// 前台是不是一个占满整块显示器的窗口（游戏、视频全屏）。
-/// 任务栏/桌面/有 owner 的弹窗都不算。
 /// 前台是不是一块屏上的真全屏窗口（游戏/视频）。
 ///
 /// 只在它和 `panel` 在**同一块屏**时才算数：主屏打游戏不该把副屏任务栏上的
@@ -947,6 +956,27 @@ fn fullscreen_foreground(panel: HWND) -> bool {
     }
 }
 
+/// 全屏程序（游戏/视频）在前台，或者面板自己被藏起来了：这会儿不用采样。
+///
+/// 面板自己（网卡计数）在 `WM_APP_TICK` 里已经直接返回了；提权助手每秒钟
+/// 也问一次这个函数，`true` 就把 ETW provider 关掉——内核不再为每个包产事件，
+/// 全屏打游戏时不会因为「记网速」白白吃掉 CPU。
+pub fn panel_detection_paused() -> bool {
+    unsafe {
+        let panel = FindWindowW(wide("NetSpeedTaskbarRs.Panel").as_ptr(), std::ptr::null());
+        // 面板还没建好（或正在退出）：别自作主张停
+        panel_detection_paused_for(panel)
+    }
+}
+
+/// 同 `panel_detection_paused`，但直接拿面板句柄（面板自己的 tick 用它）
+pub fn panel_detection_paused_for(panel: HWND) -> bool {
+    if panel.is_null() {
+        return false;
+    }
+    unsafe { IsWindowVisible(panel) == 0 || fullscreen_foreground(panel) }
+}
+
 /// 采样节拍（毫秒）：跟着设置里的刷新间隔走，2 秒档就不用每 500ms 醒一次
 static TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(500);
 
@@ -960,6 +990,8 @@ pub(crate) fn set_tick_interval(ms: i32) {
     }
 }
 
+/// 周期刷新：后台线程每 500ms 投递一次 WM_APP_TICK。
+/// （本进程 SetTimer/WM_TIMER 实测完全收不到，改用线程投递最稳。）
 fn start_ticker(hwnd: HWND) {
     let handle = hwnd as usize;
     std::thread::spawn(move || {
@@ -1051,20 +1083,26 @@ unsafe extern "system" fn wnd_proc(
                 std::process::exit(0);
             }
 
-            keep_on_top(hwnd);
-
-            // 全屏程序（游戏/视频）在前台时把自己藏起来，否则一个 TOPMOST 面板会糊在画面上
+            // 全屏程序（游戏/视频）在前台：先把自己藏起来，然后这一拍什么都不做。
+            // 顺序很关键——以前是先 keep_on_top 再判全屏，全屏里那一手 SetWindowPos
+            // 会把 owner（任务栏）顶到全屏画面前面，看起来就是任务栏隔一秒闪一下。
             let fullscreen = fullscreen_foreground(hwnd);
             let visible = IsWindowVisible(hwnd) != 0;
-            // 截图/编辑过程中不要把自己弹出来盖住遮罩
-            if !shot::active() && !fullscreen && !visible && !HIDDEN_BY_USER {
-                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            }
-            if fullscreen && visible {
-                ShowWindow(hwnd, SW_HIDE);
-            }
+            // 面板/助手都靠这个状态决定「要不要继续采」：全屏或自己藏着时一起停
+            netproc::note_paused(fullscreen || !visible);
             if fullscreen {
+                if visible {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                hint::hide();
                 return 0;
+            }
+
+            keep_on_top(hwnd);
+
+            // 截图/编辑过程中不要把自己弹出来盖住遮罩
+            if !shot::active() && !visible && !HIDDEN_BY_USER {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
 
             if let Some(panel) = panel_mut(hwnd) {
@@ -1200,7 +1238,7 @@ unsafe extern "system" fn wnd_proc(
                 DRAG_WINDOW.1 + dy,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             );
             0
         }

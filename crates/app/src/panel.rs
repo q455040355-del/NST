@@ -585,7 +585,12 @@ impl Panel {
         }
 
         let Some((report, _)) = netproc::latest() else {
-            return card.text("助手没回数据（右键 → 进程明细 重试）");
+            // 全屏/隐藏期间采集是停着的，刚回来这一两秒还没有新报文，别让人以为坏了
+            return card.text(if netproc::just_resumed() {
+                "刚恢复采集，等一秒…"
+            } else {
+                "助手没回数据（右键 → 进程明细 重试）"
+            });
         };
 
         let (items, total) = if up {
