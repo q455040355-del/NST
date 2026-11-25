@@ -261,7 +261,10 @@ pub(super) unsafe fn draw_marker(dc: HDC, scale: f32, points: &[(i32, i32)], str
     DeleteDC(mask_dc);
 }
 
+/// 马赛克：别的 draw_* 都吃「图片坐标 + scale」，这里也一样——内部自己换算成显示像素。
+/// （以前这个函数要调用方先 scaled() 再传，和其余工具不一致，很容易又踩一次「偏移算两遍」。）
 pub(super) fn draw_mosaic(dc: HDC, base: &Bitmap, a: (i32, i32), b: (i32, i32), scale: f32, block: i32) {
+    let (a, b) = (scaled(a, scale), scaled(b, scale));
     let left = a.0.min(b.0);
     let top = a.1.min(b.1);
     let right = a.0.max(b.0);
@@ -520,17 +523,14 @@ pub(super) fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
                     SelectObject(dc, old);
                 }
             }
-            Shape::Mosaic { a, b, stroke } => {
-                let (from, to) = (scaled(*a, scale), scaled(*b, scale));
-                draw_mosaic(
-                    dc,
-                    &editor.base,
-                    from,
-                    to,
-                    scale,
-                    mosaic_block(scale, *stroke),
-                )
-            }
+            Shape::Mosaic { a, b, stroke } => draw_mosaic(
+                dc,
+                &editor.base,
+                *a,
+                *b,
+                scale,
+                mosaic_block(scale, *stroke),
+            ),
         }
     }
 }
@@ -617,6 +617,222 @@ mod tests {
             assert!(near(right, 209), "导出右边应在 209 附近，实际 {right}");
             assert!(near(top, 91), "导出上边应在 91 附近，实际 {top}");
             assert!(near(bottom, 109), "导出下边应在 109 附近，实际 {bottom}");
+
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+        }
+    }
+
+    // ---------------------------------------------------------------- 坐标约定
+    // 所有标注都在「图片坐标系」里画，落点由调用方的视口原点（实时）或零原点（导出）决定。
+    // 这一组测试把「视口 + 缩放」都设上，任何「又加了一次偏移」或「忘了乘缩放」都会当场翻车。
+
+    const VIEW_X: i32 = 40;
+    const VIEW_Y: i32 = 30;
+    const CANVAS: i32 = 520;
+
+    unsafe fn fresh() -> (HDC, HBITMAP, *mut u8) {
+        let (dc, bitmap, bits) = make_dib(CANVAS, CANVAS);
+        assert!(!dc.is_null() && !bits.is_null(), "测试需要 GDI 会话");
+        std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+        let mut old = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        SetViewportOrgEx(dc, VIEW_X, VIEW_Y, &mut old);
+        (dc, bitmap, bits)
+    }
+
+    unsafe fn painted(bits: *mut u8) -> Option<(i32, i32, i32, i32)> {
+        let (mut left, mut top) = (i32::MAX, i32::MAX);
+        let (mut right, mut bottom) = (i32::MIN, i32::MIN);
+        for y in 0..CANVAS {
+            for x in 0..CANVAS {
+                let index = ((y * CANVAS + x) * 4) as usize;
+                let sum = *bits.add(index) as i32
+                    + *bits.add(index + 1) as i32
+                    + *bits.add(index + 2) as i32;
+                if sum > 30 {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+        (left < right && top < bottom).then_some((left, top, right, bottom))
+    }
+
+    fn near(actual: (i32, i32, i32, i32), expect: (i32, i32, i32, i32), slack: i32) -> bool {
+        (actual.0 - expect.0).abs() <= slack
+            && (actual.1 - expect.1).abs() <= slack
+            && (actual.2 - expect.2).abs() <= slack
+            && (actual.3 - expect.3).abs() <= slack
+    }
+
+    /// 每个工具都只吃图片坐标：视口 (40,30) + 缩放 1.5 之后，落点必须是 40 + 1.5×图片坐标
+    #[test]
+    fn every_tool_respects_viewport_and_scale() {
+        const SCALE: f32 = 1.5;
+        // 图片坐标 (100,100)-(200,150) → 设备坐标 (190,180)-(340,255)
+        let box_from = (100, 100);
+        let box_to = (200, 150);
+        let expected_box = (190, 180, 340, 255);
+        let width = stroke_width(SCALE, 1);
+
+        unsafe {
+            let (dc, bitmap, bits) = fresh();
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_rect(dc, box_from, box_to, width, SCALE);
+            let got = painted(bits).expect("矩形没画出来");
+            assert!(near(got, expected_box, 6), "矩形错位: {got:?} 期望 {expected_box:?}");
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_ellipse(dc, box_from, box_to, width, SCALE);
+            let got = painted(bits).expect("椭圆没画出来");
+            assert!(near(got, expected_box, 6), "椭圆错位: {got:?} 期望 {expected_box:?}");
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_line(dc, (100, 100), (200, 100), width, SCALE);
+            let got = painted(bits).expect("直线没画出来");
+            assert!(
+                near(got, (190, 180, 340, 180), 6),
+                "直线错位: {got:?} 期望 (190,180,340,180)"
+            );
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_arrow(dc, (100, 100), (200, 100), width, SCALE);
+            let got = painted(bits).expect("箭头没画出来");
+            // 箭头带个脑袋，纵向会宽一点；关键是起点/终点得落对
+            assert!(
+                (got.0 - 190).abs() <= 10 && (got.2 - 340).abs() <= 10,
+                "箭头横向错位: {got:?}"
+            );
+            assert!(
+                (got.1 - 180).abs() <= 24 && (got.3 - 180).abs() <= 24,
+                "箭头纵向错位: {got:?}"
+            );
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_numbered(dc, (100, 100), 1, SCALE);
+            let got = painted(bits).expect("序号没画出来");
+            let radius = (11.0 * SCALE).round() as i32;
+            let expect = (
+                190 - radius,
+                180 - radius,
+                190 + radius,
+                180 + radius,
+            );
+            assert!(near(got, expect, 6), "序号错位: {got:?} 期望 {expect:?}");
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_pen(dc, &[(100, 100), (150, 130), (200, 100)], width.max(6), SCALE);
+            let got = painted(bits).expect("画笔没画出来");
+            assert!(
+                near(got, (190, 180, 340, 225), 10),
+                "画笔错位: {got:?} 期望 (190,180,340,225) 附近"
+            );
+
+            std::ptr::write_bytes(bits, 0, (CANVAS * CANVAS * 4) as usize);
+            draw_marker(dc, SCALE, &[(100, 100), (200, 100)], 1);
+            let got = painted(bits).expect("高亮笔没画出来");
+            let half = ((9.0 * 1.8f32).round() * SCALE).max(4.0) as i32 / 2 + 1;
+            let expect = (
+                190 - half,
+                180 - half,
+                340 + half,
+                180 + half,
+            );
+            assert!(near(got, expect, 6), "高亮笔错位: {got:?} 期望 {expect:?}");
+
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+        }
+    }
+    /// 聚光灯压暗的区域必须正好是「框外」：框里保持原样，框外变暗。
+    /// 底子先铺成灰色——黑底上压黑是看不出来的（这也提醒以后别用纯黑画布测这类效果）。
+    #[test]
+    fn spotlight_dims_outside_the_box_only() {
+        unsafe {
+            let (dc, bitmap, bits) = fresh();
+            for index in 0..(CANVAS * CANVAS) as usize {
+                *bits.add(index * 4) = 128;
+                *bits.add(index * 4 + 1) = 128;
+                *bits.add(index * 4 + 2) = 128;
+            }
+
+            let mut editor = Editor::default();
+            editor.base = Bitmap::new(300, 200);
+            editor.scale = 1.5;
+
+            draw_spotlight(dc, (100, 100), (200, 150), 1.5, &editor);
+
+            let gray = |x: i32, y: i32| -> i32 {
+                let index = ((y * CANVAS + x) * 4) as usize;
+                *bits.add(index) as i32
+            };
+            // 框内：设备 (250,220) ≈ 图片 (140,127)
+            assert!(gray(250, 220) > 100, "框里不该被压暗（实际 {}）", gray(250, 220));
+            // 框外：设备 (60,60) ≈ 图片 (13,20)
+            assert!(gray(60, 60) < 100, "框外左上应该被压暗（实际 {}）", gray(60, 60));
+            // 框外右侧：设备 (500,220) ≈ 图片 (306,127)
+            assert!(gray(430, 220) < 100, "框外右侧应该被压暗（实际 {}）", gray(430, 220));
+
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+        }
+    }
+
+    /// 马赛克只改动框里的像素：框外原样、框里被抹平。
+    /// 底图用黑白棋盘格——马赛克之后相邻像素应该几乎一样，框外还是硬边。
+    #[test]
+    fn mosaic_sits_on_the_box_and_leaves_outside_alone() {
+        unsafe {
+            let (dc, bitmap, bits) = fresh();
+
+            let mut base = Bitmap::new(300, 200);
+            for y in 0..200i32 {
+                for x in 0..300i32 {
+                    let index = ((y * 300 + x) * 4) as usize;
+                    let value = if (x + y) % 2 == 0 { 0u8 } else { 255u8 };
+                    base.pixels[index] = value;
+                    base.pixels[index + 1] = value;
+                    base.pixels[index + 2] = value;
+                    base.pixels[index + 3] = 255;
+                }
+            }
+            // 画布上铺同一张底图（视口原点 + 1:1 取样）
+            for y in 0..CANVAS {
+                for x in 0..CANVAS {
+                    let (ix, iy) = (x - VIEW_X, y - VIEW_Y);
+                    if ix >= 0 && iy >= 0 && ix < 300 && iy < 200 {
+                        let index = ((y * CANVAS + x) * 4) as usize;
+                        let src = ((iy * 300 + ix) * 4) as usize;
+                        *bits.add(index) = base.pixels[src];
+                        *bits.add(index + 1) = base.pixels[src + 1];
+                        *bits.add(index + 2) = base.pixels[src + 2];
+                    }
+                }
+            }
+
+            // 图片坐标 (100,100)-(200,150) → 设备 (190,180)-(340,255)
+            draw_mosaic(dc, &base, (100, 100), (200, 150), 1.5, 9);
+
+            let red = |x: i32, y: i32| -> i32 {
+                let index = ((y * CANVAS + x) * 4) as usize;
+                *bits.add(index + 2) as i32
+            };
+
+            // 框外（设备 (60,60)）仍是棋盘格的硬边：左右相邻像素一个黑一个白
+            let (a, b) = (red(60, 60), red(61, 60));
+            assert!((a - b).abs() > 150, "框外不该被马赛克碰到（{a} vs {b}）");
+
+            // 框里已经被抹平：横着 8 个像素的值都挤在中间，没有黑白硬边
+            for x in 200..208 {
+                assert!(
+                    (40..=215).contains(&red(x, 200)),
+                    "框里应该是平均色，实际 ({x},200) = {}",
+                    red(x, 200)
+                );
+            }
 
             DeleteObject(bitmap as _);
             DeleteDC(dc);

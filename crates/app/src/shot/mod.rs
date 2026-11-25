@@ -2012,9 +2012,8 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
             Tool::Numbered => draw_numbered(dc, to, editor.next_number, editor.scale),
             Tool::Spotlight => draw_spotlight(dc, from, to, editor.scale, editor),
             Tool::Mosaic => {
-                // 实时看到打码效果，外面再套一层选框
-                let (from_px, to_px) = (scaled(from, editor.scale), scaled(to, editor.scale));
-                draw_mosaic(dc, &editor.base, from_px, to_px, editor.scale, mosaic_block(editor.scale, editor.stroke));
+                // 实时看到打码效果，外面再套一层选框（坐标就是图片坐标，换算交给 draw_mosaic）
+                draw_mosaic(dc, &editor.base, from, to, editor.scale, mosaic_block(editor.scale, editor.stroke));
                 draw_drag_frame(dc, from, to, editor.scale);
             }
             Tool::Text | Tool::Ocr | Tool::Translate => draw_drag_frame(dc, from, to, editor.scale),
@@ -3490,11 +3489,14 @@ unsafe fn start_text(parent: HWND, at: (i32, i32), box_width: i32) {
     }
 
     let instance = GetModuleHandleW(std::ptr::null());
-    let height = s(26.0);
-    let left = editor_ref.image_left + (at.0 as f32 * editor_ref.scale) as i32;
-    let top = editor_ref.image_top + (at.1 as f32 * editor_ref.scale) as i32;
+    let scale = editor_ref.scale;
+    // 输入框里的字必须和画上去的一样大：提交后 Shape::Text 用 12×scale 画，
+    // 输入时却用 12 号字的话，缩放一放大就会「打完字突然变大」
+    let height = (s(26.0) as f32 * scale).round().max(18.0) as i32;
+    let left = editor_ref.image_left + (at.0 as f32 * scale) as i32;
+    let top = editor_ref.image_top + (at.1 as f32 * scale) as i32;
     // 输入框至少 160，跟着拖出来的框宽（超长会横向滚动）
-    let width = ((box_width as f32 * editor_ref.scale) as i32).max(s(160.0));
+    let width = ((box_width as f32 * scale) as i32).max(s(160.0));
 
     let edit = CreateWindowExW(
         0,
@@ -3515,7 +3517,7 @@ unsafe fn start_text(parent: HWND, at: (i32, i32), box_width: i32) {
         return;
     }
 
-    let font = cached_font(12.0, 700);
+    let font = cached_font(12.0 * scale, 700);
     SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
     TEXT_OLD_PROC = SetWindowLongPtrW(edit, GWLP_WNDPROC, text_edit_proc as *const () as isize);
 
