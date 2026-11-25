@@ -146,21 +146,19 @@ pub(super) fn draw_numbered(dc: HDC, at: (i32, i32), n: i32, scale: f32) {
     }
 }
 
-pub(super) unsafe fn draw_marker(dc: HDC, editor: &Editor, points: &[(i32, i32)], stroke: u8) {
+pub(super) unsafe fn draw_marker(dc: HDC, scale: f32, points: &[(i32, i32)], stroke: u8) {
     if points.len() < 2 {
         return;
     }
-    let scale = editor.scale;
     let pen_width = ((9.0 * STROKE_FACTORS[stroke.min(2) as usize]).round() * scale)
         .max(4.0) as i32;
+    // 坐标只用「图片坐标系」：实时预览那边已经用 SetViewportOrgEx 把原点挪到图片左上角了，
+    // 这里再自己加 image_left/top 就会错位一倍（导出时 image_left=0，所以只有实时画面是歪的）
     let pts: Vec<POINT> = points
         .iter()
         .map(|p| {
             let (x, y) = scaled(*p, scale);
-            POINT {
-                x: x + editor.image_left,
-                y: y + editor.image_top,
-            }
+            POINT { x, y }
         })
         .collect();
 
@@ -503,7 +501,7 @@ pub(super) fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
                 draw_line(dc, *a, *b, stroke_width(scale, *stroke), scale)
             }
             Shape::Marker { points, stroke } => unsafe {
-                draw_marker(dc, editor, points, *stroke)
+                draw_marker(dc, scale, points, *stroke)
             },
             Shape::Spotlight { a, b } => unsafe { draw_spotlight(dc, *a, *b, scale, editor) },
             Shape::Numbered { at, n } => draw_numbered(dc, *at, *n, scale),
@@ -537,3 +535,91 @@ pub(super) fn draw_shapes(dc: HDC, editor: &Editor, from: usize) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 高亮笔只在「图片坐标系」里画：实时预览靠 SetViewportOrgEx 把原点挪到图片左上角，
+    /// 这里如果又自己加 image_left/top，整条笔迹就会错位一倍——导出时 image_left=0，
+    /// 所以只有屏幕上的实时画面是歪的（用户报的就是这个）。
+    #[test]
+    fn marker_lands_at_image_coordinates() {
+        unsafe {
+            let (dc, bitmap, bits) = make_dib(400, 300);
+            assert!(!dc.is_null() && !bits.is_null(), "测试需要 GDI 会话");
+            std::ptr::write_bytes(bits, 0, 400 * 300 * 4);
+
+            // 模拟「图片居中」：原点挪到 (40, 30)
+            let mut old = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            windows_sys::Win32::Graphics::Gdi::SetViewportOrgEx(dc, 40, 30, &mut old);
+
+            draw_marker(dc, 1.0, &[(100, 100), (200, 100)], 1);
+
+            let (mut left, mut top) = (i32::MAX, i32::MAX);
+            let (mut right, mut bottom) = (i32::MIN, i32::MIN);
+            for y in 0..300 {
+                for x in 0..400 {
+                    let index = ((y * 400 + x) * 4) as usize;
+                    let sum = *bits.add(index) as i32
+                        + *bits.add(index + 1) as i32
+                        + *bits.add(index + 2) as i32;
+                    if sum > 30 {
+                        left = left.min(x);
+                        top = top.min(y);
+                        right = right.max(x);
+                        bottom = bottom.max(y);
+                    }
+                }
+            }
+            assert!(left < right && top < bottom, "高亮笔什么都没画上去");
+
+            // 期望：视口原点 (40,30) + 图片坐标 (100..200, 100)，笔宽 16 → 上下各 9px
+            let near = |value: i32, expect: i32| (value - expect).abs() <= 8;
+            assert!(near(left, 131), "左边应在 131 附近（视口 40 + 图片 100 − 半笔宽），实际 {left}");
+            assert!(near(right, 249), "右边应在 249 附近，实际 {right}");
+            assert!(near(top, 121), "上边应在 121 附近（视口 30 + 图片 100 − 半笔宽），实际 {top}");
+            assert!(near(bottom, 139), "下边应在 139 附近，实际 {bottom}");
+
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+        }
+    }
+
+    /// 导出走的 composite：image_left=0、视口原点 (0,0)，同样的图片坐标应该原样落在原地。
+    #[test]
+    fn marker_export_maps_one_to_one() {
+        unsafe {
+            let (dc, bitmap, bits) = make_dib(400, 300);
+            assert!(!dc.is_null() && !bits.is_null(), "测试需要 GDI 会话");
+            std::ptr::write_bytes(bits, 0, 400 * 300 * 4);
+
+            draw_marker(dc, 1.0, &[(100, 100), (200, 100)], 1);
+
+            let (mut left, mut top) = (i32::MAX, i32::MAX);
+            let (mut right, mut bottom) = (i32::MIN, i32::MIN);
+            for y in 0..300 {
+                for x in 0..400 {
+                    let index = ((y * 400 + x) * 4) as usize;
+                    let sum = *bits.add(index) as i32
+                        + *bits.add(index + 1) as i32
+                        + *bits.add(index + 2) as i32;
+                    if sum > 30 {
+                        left = left.min(x);
+                        top = top.min(y);
+                        right = right.max(x);
+                        bottom = bottom.max(y);
+                    }
+                }
+            }
+            let near = |value: i32, expect: i32| (value - expect).abs() <= 8;
+            assert!(near(left, 91), "导出左边应在 91 附近，实际 {left}");
+            assert!(near(right, 209), "导出右边应在 209 附近，实际 {right}");
+            assert!(near(top, 91), "导出上边应在 91 附近，实际 {top}");
+            assert!(near(bottom, 109), "导出下边应在 109 附近，实际 {bottom}");
+
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+        }
+    }
+}

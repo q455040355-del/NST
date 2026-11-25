@@ -2025,7 +2025,7 @@ unsafe fn editor_draw(dc: HDC, editor: &mut Editor, client: RECT) {
         draw_pen(dc, &editor.pen_points, width, editor.scale);
     }
     if editor.tool == Tool::Marker && editor.pen_points.len() > 1 {
-        draw_marker(dc, editor, &editor.pen_points, editor.stroke);
+        draw_marker(dc, editor.scale, &editor.pen_points, editor.stroke);
     }
 
     // 正在输入文字：把位置框出来，免得白底白字看不见输入框在哪
