@@ -1,4 +1,4 @@
-# 构建 + 部署：cargo build --release -> 停掉正在跑的面板 -> 备份旧 exe -> 覆盖 -> 重启
+﻿# 构建 + 部署：cargo build --release -> 停掉正在跑的面板 -> 备份旧 exe -> 覆盖 -> 重启
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 #   powershell -File scripts\deploy.ps1 -Deploy "D:\Other\NST" -NoRestart
