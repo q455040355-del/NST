@@ -44,6 +44,9 @@ const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETSEL: u32 = 0x00B1;
 
+/// windows-sys 0.59 没导出 DT_SINGLELINE，量单行宽度要用
+const DT_SINGLELINE: u32 = 0x0020;
+
 /// 窗口逻辑尺寸（比原来宽一点：逐句要并排放下「原文 + 译文」还不挤）
 /// 上次用的看法：0 逐句 / 1 整段（只取字不记，那是临时看一眼）
 /// 上次用的看法：0 逐句 / 1 整段。默认整段（逐句要自己点）
@@ -72,6 +75,8 @@ enum Hit {
     ViewLines,
     ViewProse,
     ViewOcr,
+    /// 认出表格时头部多出来的「表格」胶囊
+    ViewTable,
     Target,
     Row(usize),
     RowCopy(usize),
@@ -82,6 +87,8 @@ enum View {
     Lines,
     Prose,
     Ocr,
+    /// 认出表格时的默认视图：按行列画成真表格
+    Table,
 }
 
 struct Row {
@@ -131,6 +138,17 @@ struct State {
     tracking_leave: bool,
     /// 几何上认出来的表格（没有就是普通文字）；「复制表格」按钮只在有时出现
     table: Option<netspeed_core::table::Table>,
+    /// 表格视图的排版缓存（正文宽度 / 缩放变了就重算）
+    table_layout: Option<TableLayout>,
+}
+
+/// 表格视图的排版结果：列宽、每行高度、总高
+struct TableLayout {
+    width: i32,
+    scale: f32,
+    cols: Vec<i32>,
+    rows: Vec<i32>,
+    height: i32,
 }
 
 struct Fonts {
@@ -139,6 +157,8 @@ struct Fonts {
     source: HFONT,
     small: HFONT,
     label: HFONT,
+    /// 表头用（比正文稍粗）
+    table_head: HFONT,
 }
 
 impl Fonts {
@@ -149,6 +169,7 @@ impl Fonts {
             source: font(12.5, 400, scale),
             small: font(12.0, 400, scale),
             label: font(11.0, 500, scale),
+            table_head: font(12.5, 600, scale),
         }
     }
 }
@@ -662,8 +683,16 @@ fn hit_test(state: &State, l: &Layout, point: POINT) -> Option<Hit> {
             return Some(Hit::Target);
         }
     }
-    if state.table.is_some() && contains(&l.copy_source, point) {
+    if state.table.is_some() && state.view != View::Table && contains(&l.copy_source, point) {
         return Some(Hit::CopyTable);
+    }
+    if !state.has_translation() && state.table.is_some() {
+        if contains(&l.view_prose, point) {
+            return Some(Hit::ViewTable);
+        }
+        if contains(&l.view_ocr, point) {
+            return Some(Hit::ViewOcr);
+        }
     }
     if state.view == View::Lines {
         if let Some(index) = hit_row(state, l, point) {
@@ -693,6 +722,39 @@ fn hit_row(state: &State, l: &Layout, point: POINT) -> Option<usize> {
         .rows
         .iter()
         .position(|row| y >= row.top && y < row.top + row.height)
+}
+
+/// 头部的小胶囊：选中填 chip 色，悬停给一层淡底
+unsafe fn draw_chip(
+    p: &Painter,
+    state: &State,
+    c: crate::theme::Ui,
+    rect: RECT,
+    label: &str,
+    active: bool,
+    hovered: bool,
+) {
+    if active || hovered {
+        p.round(
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            p.s(7.0),
+            if active { c.chip } else { c.row_tint },
+            if active { c.chip } else { c.row_tint },
+        );
+    }
+    p.text(
+        label,
+        state.fonts.small,
+        if active { c.accent } else { c.text2 },
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        DT_CENTER,
+    );
 }
 
 unsafe fn paint_into(hwnd: HWND, target: HDC) {
@@ -757,6 +819,16 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
             crate::translate::split_units(&state.source).len().max(1)
         };
         format!("{sentences} 句 · {} 字", state.unit_count())
+    } else if state.view == View::Table {
+        match state.table.as_ref() {
+            Some(table) => format!(
+                "{} 列 × {} 行 · {} 字",
+                table.cols(),
+                table.rows(),
+                state.unit_count()
+            ),
+            None => format!("{} 字", state.unit_count()),
+        }
     } else {
         format!("{} 字", state.unit_count())
     };
@@ -805,28 +877,32 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
             (l.view_prose, View::Prose, "整段", Hit::ViewProse),
             (l.view_ocr, View::Ocr, "只取字", Hit::ViewOcr),
         ] {
-            let active = state.view == view;
-            let hovered = state.hover == Some(hit);
-            if active || hovered {
-                p.round(
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    p.s(7.0),
-                    if active { c.chip } else { c.row_tint },
-                    if active { c.chip } else { c.row_tint },
-                );
-            }
-            p.text(
+            draw_chip(
+                &p,
+                state,
+                c,
+                rect,
                 label,
-                state.fonts.small,
-                if active { c.accent } else { c.text2 },
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                DT_CENTER,
+                state.view == view,
+                state.hover == Some(hit),
+            );
+        }
+    }
+
+    // 取字窗口认出表格时，头部换成「表格 / 文字」两粒（逐句、整段用不上）
+    if !state.has_translation() && state.table.is_some() {
+        for (rect, view, label, hit) in [
+            (l.view_prose, View::Table, "表格", Hit::ViewTable),
+            (l.view_ocr, View::Ocr, "文字", Hit::ViewOcr),
+        ] {
+            draw_chip(
+                &p,
+                state,
+                c,
+                rect,
+                label,
+                state.view == view,
+                state.hover == Some(hit),
             );
         }
     }
@@ -858,6 +934,7 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
     match state.view {
         View::Lines => paint_lines(&p, state, &l, c),
         View::Prose => paint_prose(&p, state, &l, c),
+        View::Table => paint_table(&p, &mut *state, &l, c),
         View::Ocr => {}
     }
 
@@ -924,7 +1001,7 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         );
     }
 
-    if state.table.is_some() && !state.has_translation() {
+    if state.table.is_some() && !state.has_translation() && state.view != View::Table {
         // 认出表格时，「复制表格」占住「复制原文」的位置（原来那个位置在纯取字窗里是空的）
         let hovered = state.hover == Some(Hit::CopyTable);
         p.round(
@@ -963,6 +1040,8 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         "重试"
     } else if state.view == View::Ocr {
         "复制"
+    } else if state.view == View::Table {
+        "复制表格"
     } else {
         "复制全部"
     };
@@ -1136,6 +1215,222 @@ unsafe fn paint_prose(p: &Painter, state: &State, l: &Layout, c: crate::theme::U
     }
 }
 
+// ---------------------------------------------------------------- 表格视图
+
+/// 表格正文区：左右各留 8px，返回 (左边, 可用宽度)
+fn table_viewport(state: &State, l: &Layout) -> (i32, i32) {
+    let pad = ui::s(8.0, state.scale);
+    (l.rows.left + pad, ((l.rows.right - l.rows.left) - pad * 2).max(1))
+}
+
+unsafe fn text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
+    let old = SelectObject(dc, font as HGDIOBJ);
+    let mut rect: RECT = std::mem::zeroed();
+    let units = wide(text);
+    DrawTextW(
+        dc,
+        units.as_ptr(),
+        (units.len() - 1) as i32,
+        &mut rect,
+        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    SelectObject(dc, old);
+    rect.right - rect.left
+}
+
+/// 量一张表：列宽先按内容给，太宽就从最宽的那列往回收；再按列宽折行算行高
+unsafe fn measure_table(
+    dc: HDC,
+    table: &netspeed_core::table::Table,
+    fonts: &Fonts,
+    avail: i32,
+    scale: f32,
+) -> TableLayout {
+    let cols = table.cols();
+    let mut layout = TableLayout {
+        width: avail,
+        scale,
+        cols: Vec::new(),
+        rows: Vec::new(),
+        height: 0,
+    };
+    if cols == 0 || table.rows() == 0 {
+        return layout;
+    }
+
+    let pad_x = ui::s(10.0, scale);
+    let pad_y = ui::s(8.0, scale);
+    let min_col = (avail / 2).min(ui::s(56.0, scale)).max(ui::s(36.0, scale));
+
+    let mut widths = vec![min_col; cols];
+    for (col, width) in widths.iter_mut().enumerate() {
+        for row in 0..table.rows() {
+            let text = table.cell(row, col);
+            if text.is_empty() {
+                continue;
+            }
+            let font = if row == 0 { fonts.table_head } else { fonts.source };
+            *width = (*width).max(text_width(dc, font, text) + pad_x * 2);
+        }
+    }
+
+    // 太宽：每次压最宽的那列，压到 min_col 为止；还超就让它出界被裁（列实在太多了）
+    let mut total: i32 = widths.iter().sum();
+    while total > avail {
+        let mut widest = 0usize;
+        for col in 1..cols {
+            if widths[col] > widths[widest] {
+                widest = col;
+            }
+        }
+        if widths[widest] <= min_col {
+            break;
+        }
+        let take = (total - avail).min(widths[widest] - min_col).max(1);
+        widths[widest] -= take;
+        total -= take;
+    }
+    // 没撑满：多出来的宽度平分给各列，表看起来才像表
+    if total < avail {
+        let extra = avail - total;
+        let each = extra / cols as i32;
+        for width in &mut widths {
+            *width += each;
+        }
+        widths[0] += extra - each * cols as i32;
+    }
+
+    let mut rows = Vec::with_capacity(table.rows());
+    for row in 0..table.rows() {
+        let mut height = 0;
+        for (col, width) in widths.iter().enumerate() {
+            let text = table.cell(row, col);
+            if text.is_empty() {
+                continue;
+            }
+            let font = if row == 0 { fonts.table_head } else { fonts.source };
+            let inner = (*width - pad_x * 2).max(1);
+            height = height.max(measure(dc, font, &soft_wrap(text), inner));
+        }
+        rows.push((height + pad_y * 2).max(ui::s(26.0, scale)));
+    }
+
+    layout.height = rows.iter().sum();
+    layout.cols = widths;
+    layout.rows = rows;
+    layout
+}
+
+/// 宽度或缩放变了才重新量；量完把总高/滚动范围一起更新
+unsafe fn table_relayout(state: &mut State, dc: HDC, width: i32) {
+    if state.table.is_none() {
+        state.table_layout = None;
+        state.content_h = 0;
+        state.max_scroll = 0;
+        state.scroll = 0;
+        return;
+    }
+    let fresh = state
+        .table_layout
+        .as_ref()
+        .is_some_and(|cached| cached.width == width && cached.scale == state.scale);
+    if !fresh {
+        let Some(table) = state.table.as_ref() else {
+            return;
+        };
+        let measured = measure_table(dc, table, &state.fonts, width, state.scale);
+        state.table_layout = Some(measured);
+    }
+    let height = state.table_layout.as_ref().map_or(0, |cached| cached.height);
+    state.content_h = height;
+    state.max_scroll = (height - state.viewport_h).max(0);
+    state.scroll = state.scroll.clamp(0, state.max_scroll);
+}
+
+unsafe fn paint_table(p: &Painter, state: &mut State, l: &Layout, c: crate::theme::Ui) {
+    let (left, width) = table_viewport(state, l);
+    table_relayout(state, p.dc, width);
+
+    let Some(table) = state.table.as_ref() else {
+        return;
+    };
+    let Some(layout) = state.table_layout.as_ref() else {
+        return;
+    };
+    if layout.cols.is_empty() || layout.rows.is_empty() {
+        return;
+    }
+
+    let pad_x = p.s(10.0);
+    let pad_y = p.s(8.0);
+    let table_w: i32 = layout.cols.iter().sum();
+    let top = l.rows.top + p.s(8.0) - state.scroll;
+
+    let saved = SaveDC(p.dc);
+    if saved != 0 {
+        IntersectClipRect(p.dc, l.rows.left, l.rows.top, l.rows.right, l.rows.bottom);
+    }
+
+    // 表头一层淡淡的底色，和正文分开
+    if let Some(header_h) = layout.rows.first() {
+        if top + header_h > l.rows.top && top < l.rows.bottom {
+            p.fill(left, top, left + table_w, top + header_h, c.row_tint);
+        }
+    }
+
+    let mut y = top;
+    for (row, row_h) in layout.rows.iter().enumerate() {
+        if y + row_h < l.rows.top {
+            y += row_h;
+            continue;
+        }
+        if y > l.rows.bottom {
+            break;
+        }
+        let mut x = left;
+        for (col, col_w) in layout.cols.iter().enumerate() {
+            // 竖线（第一列左边靠外框，不重复画）
+            if col > 0 {
+                p.fill(x, y, x + 1, y + row_h, c.border);
+            }
+            let text = table.cell(row, col);
+            if !text.is_empty() {
+                let font = if row == 0 {
+                    state.fonts.table_head
+                } else {
+                    state.fonts.source
+                };
+                p.text_block(
+                    &soft_wrap(text),
+                    font,
+                    c.text,
+                    x + pad_x,
+                    y + pad_y,
+                    x + col_w - pad_x,
+                    y + row_h - pad_y,
+                );
+            }
+            x += col_w;
+        }
+        // 行底：表头那根重一点
+        let ink = if row == 0 { c.text3 } else { c.border };
+        p.fill(left, y + row_h, left + table_w, y + row_h + 1, ink);
+        y += row_h;
+    }
+
+    // 外框（顶 + 左右）
+    let bottom = y.min(l.rows.bottom);
+    if top < l.rows.bottom {
+        p.fill(left, top, left + table_w, top + 1, c.border);
+        p.fill(left, top, left + 1, bottom, c.border);
+        p.fill(left + table_w - 1, top, left + table_w, bottom, c.border);
+    }
+
+    if saved != 0 {
+        RestoreDC(p.dc, saved);
+    }
+}
+
 impl State {
     fn has_translation(&self) -> bool {
         self.error.is_none() && !self.translated.is_empty()
@@ -1170,6 +1465,17 @@ unsafe fn layout_edit(hwnd: HWND) {
         state.content_h = prose_height(state, width);
         state.max_scroll = (state.content_h - state.viewport_h).max(0);
         state.scroll = state.scroll.clamp(0, state.max_scroll);
+    }
+    if state.view == View::Table {
+        // 滚动范围先在这里算好，否则滚轮第一次推不动
+        let (_, table_width) = table_viewport(state, &l);
+        let screen = GetDC(std::ptr::null_mut());
+        let dc = CreateCompatibleDC(screen);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if !dc.is_null() {
+            table_relayout(state, dc, table_width);
+            DeleteDC(dc);
+        }
     }
 
     if state.edit.is_null() {
@@ -1278,6 +1584,11 @@ unsafe fn copy_all(hwnd: HWND) {
         copy_from_edit(hwnd);
         return;
     }
+    if state.view == View::Table {
+        copy_table_state(state);
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+        return;
+    }
     let text = if state.translated.is_empty() {
         state.source.clone()
     } else {
@@ -1292,22 +1603,27 @@ unsafe fn copy_all(hwnd: HWND) {
 }
 
 /// 按表格复制：TSV 走文本格式，另附一份 HTML 表格，Excel / WPS / Word 都能直接落格
+fn copy_table_state(state: &mut State) -> bool {
+    let Some(table) = state.table.as_ref() else {
+        return false;
+    };
+    let shape = format!("{} 列 × {} 行", table.cols(), table.rows());
+    let copied = crate::ocr::copy_table(table);
+    state.status = if copied {
+        format!("已按 {shape} 表格复制 · 可直接粘贴进 Excel")
+    } else {
+        "剪贴板被别的程序占着，请再试一次".to_string()
+    };
+    copied
+}
+
 unsafe fn copy_as_table(hwnd: HWND) {
     let state = state_of(hwnd);
     if state.is_null() {
         return;
     }
     let state = &mut *state;
-    let Some(table) = state.table.as_ref() else {
-        return;
-    };
-    let shape = format!("{} 列 × {} 行", table.cols(), table.rows());
-    let copied = crate::ocr::copy_table(table);
-    if copied {
-        state.status = format!("已按 {shape} 表格复制 · 可直接粘贴进 Excel");
-    } else {
-        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
-    }
+    copy_table_state(state);
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -1363,6 +1679,7 @@ mod layout_tests {
             reveal_total: 0,
             tracking_leave: false,
             table: None,
+            table_layout: None,
         }
     }
 
@@ -1733,6 +2050,9 @@ fn open_inner(
                 1 => View::Prose,
                 _ => View::Lines,
             }
+        } else if table.is_some() {
+            // 认出表格就直接按表格排，别让人再看一遍挤在一起的文字
+            View::Table
         } else {
             View::Ocr
         };
@@ -1793,6 +2113,7 @@ fn open_inner(
             reveal_total: 0,
             tracking_leave: false,
             table: table.cloned(),
+            table_layout: None,
         }));
 
         let title = if translated.is_some() {
@@ -2145,9 +2466,28 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
-            if (*state).table.is_some() && contains(&l.copy_source, point) {
+            if (*state).table.is_some()
+                && (*state).view != View::Table
+                && contains(&l.copy_source, point)
+            {
                 copy_as_table(hwnd);
                 return 0;
+            }
+            if !(*state).has_translation() && (*state).table.is_some() {
+                if contains(&l.view_prose, point) {
+                    (*state).view = View::Table;
+                    (*state).scroll = 0;
+                    layout_edit(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
+                if contains(&l.view_ocr, point) {
+                    (*state).view = View::Ocr;
+                    (*state).scroll = 0;
+                    layout_edit(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
+                }
             }
             if (*state).has_translation() {
                 if contains(&l.copy_source, point) {
@@ -2261,7 +2601,12 @@ unsafe extern "system" fn window_proc(
                 let interactive = contains(&l.close, point)
                     || contains(&l.copy, point)
                     || ((*state).has_translation() && contains(&l.copy_source, point))
-                    || ((*state).table.is_some() && contains(&l.copy_source, point))
+                    || ((*state).table.is_some()
+                        && (*state).view != View::Table
+                        && contains(&l.copy_source, point))
+                    || (!(*state).has_translation()
+                        && (*state).table.is_some()
+                        && (contains(&l.view_prose, point) || contains(&l.view_ocr, point)))
                     || ((*state).has_translation()
                         && (contains(&l.view_lines, point)
                             || contains(&l.view_prose, point)
@@ -2332,9 +2677,20 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                 }
-                // 1 / 2 / 3：逐句 / 整段 / 只取字
+                // 1 / 2 / 3：逐句 / 整段 / 只取字（认出表格时是 1 表格 / 2 文字）
                 0x31 | 0x32 | 0x33 => {
-                    if state.has_translation() {
+                    if !state.has_translation() && state.table.is_some() {
+                        let next = match wparam as u32 {
+                            0x31 => View::Table,
+                            _ => View::Ocr,
+                        };
+                        if state.view != next {
+                            state.view = next;
+                            state.scroll = 0;
+                            layout_edit(hwnd);
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                        }
+                    } else if state.has_translation() {
                         let next = match wparam as u32 {
                             0x31 => View::Lines,
                             0x32 => View::Prose,
@@ -2345,7 +2701,7 @@ unsafe extern "system" fn window_proc(
                         match next {
                             View::Lines => LAST_VIEW.store(0, std::sync::atomic::Ordering::Relaxed),
                             View::Prose => LAST_VIEW.store(1, std::sync::atomic::Ordering::Relaxed),
-                            View::Ocr => {}
+                            View::Ocr | View::Table => {}
                         }
                         layout_edit(hwnd);
                         InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -2423,7 +2779,12 @@ unsafe extern "system" fn window_proc(
 pub unsafe fn preview_png(path: &str, view: &str) -> bool {
     let source = "Latency budget\nThe panel samples the taskbar twice a second.\nIf sampling fails, the last good color is kept for 30 seconds before we retry,\nso the background never flickers between two close shades.";
     let translated = "延迟预算\n面板每秒采样任务栏两次。\n如果采样失败，会保留上一次成功的颜色 30 秒再重试，\n所以背景不会在两种接近的色值之间来回跳。";
-    open_translate(std::ptr::null_mut(), source, translated, None);
+    if view == "table" || view == "table-ocr" {
+        let table = preview_table();
+        open(std::ptr::null_mut(), &table.tsv(), Some(&table), None);
+    } else {
+        open_translate(std::ptr::null_mut(), source, translated, None);
+    }
 
     // 找到刚创建的那个窗口，让它把第一帧画完
     let mut message: MSG = std::mem::zeroed();
@@ -2450,7 +2811,8 @@ pub unsafe fn preview_png(path: &str, view: &str) -> bool {
         if !state.is_null() {
             (*state).view = match view {
                 "prose" => View::Prose,
-                "ocr" => View::Ocr,
+                "ocr" | "table-ocr" => View::Ocr,
+                "table" => View::Table,
                 _ => View::Lines,
             };
             layout_edit(hwnd);
@@ -2490,6 +2852,34 @@ pub unsafe fn preview_png(path: &str, view: &str) -> bool {
     DeleteDC(dc);
     DestroyWindow(hwnd);
     saved
+}
+
+/// 预览用：造一张 4 列 × 4 行的示例表（走真实的 detect，不是手搓 Table）
+fn preview_table() -> netspeed_core::table::Table {
+    use netspeed_core::table::{detect, LineBox};
+
+    let cells: [[&str; 4]; 4] = [
+        ["姓名", "部门", "工号", "本月工时"],
+        ["张三", "平台研发", "A-1024", "168.5"],
+        ["李四", "前端体验组（含设计）", "A-2048", "152"],
+        ["王五", "数据平台", "A-3072", "176.5"],
+    ];
+    let columns = [16.0f32, 130.0, 330.0, 450.0];
+    let mut lines = Vec::new();
+    for (row, texts) in cells.iter().enumerate() {
+        let top = 16.0 + row as f32 * 40.0;
+        for (col, text) in texts.iter().enumerate() {
+            let left = columns[col];
+            lines.push(LineBox {
+                text: (*text).to_string(),
+                left,
+                top,
+                right: left + 96.0,
+                bottom: top + 26.0,
+            });
+        }
+    }
+    detect(&lines).expect("预览用的样例本身就得是表格")
 }
 
 unsafe extern "system" fn enum_preview(hwnd: HWND, lparam: LPARAM) -> i32 {
