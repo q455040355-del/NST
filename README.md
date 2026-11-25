@@ -218,6 +218,9 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 - **文字**：先拖一个框，输入框就开在框里（浅蓝底 + 虚线框），`Enter` 提交，宽度跟框一致；
 - **取字（框选区域）**：编辑窗点「OCR」→ 拖框选一块 → **只识别这块**；整图就拖满。
   `Ctrl+Shift+O` 则是先截图再取字（设置里开取字后才有），同样支持框选；结果窗多行可编辑、自动进剪贴板；
+  **认出来是表格时按表格复制**：剪贴板里是 TSV（`\t` 分列）+ 一份 HTML 表格，粘到 Excel / WPS 里直接落格、
+  粘到 Word / 网页里是一张真表；**三列及以上自动这么拷**，两列（可能只是并排的两栏文字）不擅自改默认粘贴，
+  结果窗底栏多一个「复制表格」按钮，点一下才按表格拷。普通文字照旧是纯文本；
 - **输出**：`Ctrl+C` 复制到剪贴板（CF_DIB）、`Ctrl+S` 另存为 PNG（标准另存为对话框）、`Ctrl+Z` 撤销、`Esc` 关闭；
   另存为对话框点「取消」就是取消，**不会**再弹「保存失败：没有写入权限」——只有真的写失败（磁盘满 / 路径无效）才提示；
 - **远程控制**：用 UU 远程 / ToDesk / 向日葵 / AnyDesk / TeamViewer / RustDesk / Parsec / mstsc 等控制另一台机器时，
@@ -261,6 +264,11 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 
 - 引擎在后台线程现建现用：模型加载 ~17 ms、720×220 识别 ~37 ms，不阻塞 UI；
 - 模型用 PaddleOCR v6 **tiny** 中文模型（det 1.78 MB + cls 1.02 MB + rec 4.46 MB + 字典），识别完把 `\n` 统一成 `\r\n` 再喂给 EDIT / 剪贴板；
+- **表格还原是纯几何**：引擎只给「一行文字 + 四角坐标」，没有表格线。`crates/core/src/table.rs` 把竖直中心相近的框子并成一行，
+  再把**任何一行都没压到的横向空白**切成列（窄缝有下限，防止把一行字切碎），最后按外框落格；
+  列里一格都没有、某格横跨列缝、或者多数行只有一格（分栏正文）都判成「不是表格」，宁可退回普通文字；
+- **剪贴板里给两份**：`CF_UNICODETEXT` 是 TSV（Excel / WPS / Word 表格里粘进去自动分格），另加 `HTML Format`
+  （CF_HTML 偏移头 + UTF-8 的 `<table>`，Word / 网页里是真表）。谁优先由目标程序自己挑，两份说的是同一张表；
 - 结果通过 `PostMessage(WM_APP_OCR_READY)` 回 UI 线程开窗，`Box<OcrOutcome>` 指针走 `wparam`，窗口里 `Box::from_raw` 收回。
 
 > ⚠️ Snow Shot 自己的 `snow-ocr-process` 那层包装是 GPL-3.0，**没有用**；只用 Apache-2.0 的引擎 crate，不传染授权。

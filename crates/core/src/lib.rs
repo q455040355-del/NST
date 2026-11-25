@@ -9,6 +9,7 @@ pub mod memory;
 pub mod net;
 pub mod netproc;
 pub mod settings;
+pub mod table;
 pub mod temperature;
 
 pub use ai::{format_speed as format_ai_speed, format_tokens, AiEngine, AiSnapshot};

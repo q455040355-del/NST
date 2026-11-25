@@ -1415,7 +1415,7 @@ unsafe extern "system" fn wnd_proc(
             let pointer = wparam as *mut ocr::OcrOutcome;
             if !pointer.is_null() {
                 let outcome = Box::from_raw(pointer);
-                ocr_ui::open(hwnd, &outcome.text, outcome.error.as_deref());
+                ocr_ui::open(hwnd, &outcome.text, outcome.table.as_ref(), outcome.error.as_deref());
             }
             0
         }

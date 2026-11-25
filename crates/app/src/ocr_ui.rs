@@ -64,6 +64,8 @@ const ROW_GAP: f32 = 5.0;
 enum Hit {
     Close,
     Copy,
+    /// 按表格复制（只在认出表格时出现，占「复制原文」那个位置）
+    CopyTable,
     /// 翻失败时，底栏那个按钮变成「重试」
     Retry,
     CopySource,
@@ -127,6 +129,8 @@ struct State {
     reveal_total: usize,
     /// 已经在等 WM_MOUSELEAVE 了
     tracking_leave: bool,
+    /// 几何上认出来的表格（没有就是普通文字）；「复制表格」按钮只在有时出现
+    table: Option<netspeed_core::table::Table>,
 }
 
 struct Fonts {
@@ -658,6 +662,9 @@ fn hit_test(state: &State, l: &Layout, point: POINT) -> Option<Hit> {
             return Some(Hit::Target);
         }
     }
+    if state.table.is_some() && contains(&l.copy_source, point) {
+        return Some(Hit::CopyTable);
+    }
     if state.view == View::Lines {
         if let Some(index) = hit_row(state, l, point) {
             // 行尾那块是「复制这句」，其余地方是选中这一行
@@ -907,6 +914,30 @@ unsafe fn paint_into(hwnd: HWND, target: HDC) {
         );
         p.text(
             "复制原文",
+            state.fonts.small,
+            if hovered { c.text } else { c.text2 },
+            l.copy_source.left,
+            l.copy_source.top,
+            l.copy_source.right,
+            l.copy_source.bottom,
+            DT_CENTER,
+        );
+    }
+
+    if state.table.is_some() && !state.has_translation() {
+        // 认出表格时，「复制表格」占住「复制原文」的位置（原来那个位置在纯取字窗里是空的）
+        let hovered = state.hover == Some(Hit::CopyTable);
+        p.round(
+            l.copy_source.left,
+            l.copy_source.top,
+            l.copy_source.right,
+            l.copy_source.bottom,
+            p.s(9.0),
+            c.surface,
+            if hovered { c.text3 } else { c.border },
+        );
+        p.text(
+            "复制表格",
             state.fonts.small,
             if hovered { c.text } else { c.text2 },
             l.copy_source.left,
@@ -1260,6 +1291,26 @@ unsafe fn copy_all(hwnd: HWND) {
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
+/// 按表格复制：TSV 走文本格式，另附一份 HTML 表格，Excel / WPS / Word 都能直接落格
+unsafe fn copy_as_table(hwnd: HWND) {
+    let state = state_of(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = &mut *state;
+    let Some(table) = state.table.as_ref() else {
+        return;
+    };
+    let shape = format!("{} 列 × {} 行", table.cols(), table.rows());
+    let copied = crate::ocr::copy_table(table);
+    if copied {
+        state.status = format!("已按 {shape} 表格复制 · 可直接粘贴进 Excel");
+    } else {
+        state.status = "剪贴板被别的程序占着，请再试一次".to_string();
+    }
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+}
+
 /// 复制原文
 unsafe fn copy_source(hwnd: HWND) {
     let state = state_of(hwnd);
@@ -1311,6 +1362,7 @@ mod layout_tests {
             reveal: usize::MAX,
             reveal_total: 0,
             tracking_leave: false,
+            table: None,
         }
     }
 
@@ -1594,7 +1646,12 @@ unsafe fn apply_update(hwnd: HWND, update: AsyncUpdate) {
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
-fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str>) {
+fn open_inner(
+    source: Option<&str>,
+    translated: Option<&str>,
+    table: Option<&netspeed_core::table::Table>,
+    error: Option<&str>,
+) {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class = wide(CLASS_NAME);
@@ -1681,17 +1738,31 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
         };
         let status = match error {
             Some(message) => message.to_string(),
-            None => {
-                let text = if translated_text.is_empty() {
-                    &source_text
-                } else {
-                    &translated_text
-                };
-                format!(
+            None => match (table, translated_text.is_empty()) {
+                // 三列以上基本不可能是分栏正文，直接按表格进剪贴板
+                (Some(grid), _) if grid.cols() >= 3 => format!(
+                    "已按 {} 列 × {} 行表格复制 · 可直接粘贴进 Excel",
+                    grid.cols(),
+                    grid.rows()
+                ),
+                // 两列可能是并排的两栏文字，不擅自改默认粘贴：给按钮，让人自己点
+                (Some(grid), _) => format!(
+                    "识别到 {} 列 × {} 行 · 点「复制表格」粘贴",
+                    grid.cols(),
+                    grid.rows()
+                ),
+                (None, true) => format!(
                     "已自动复制 · {} 字",
-                    text.chars().filter(|ch| !ch.is_whitespace()).count()
-                )
-            }
+                    source_text.chars().filter(|ch| !ch.is_whitespace()).count()
+                ),
+                (None, false) => format!(
+                    "已自动复制 · {} 字",
+                    translated_text
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace())
+                        .count()
+                ),
+            },
         };
 
         let state = Box::into_raw(Box::new(State {
@@ -1721,6 +1792,7 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             reveal: usize::MAX,
             reveal_total: 0,
             tracking_leave: false,
+            table: table.cloned(),
         }));
 
         let title = if translated.is_some() {
@@ -1786,7 +1858,10 @@ fn open_inner(source: Option<&str>, translated: Option<&str>, error: Option<&str
             } else {
                 translated_text.as_str()
             };
-            let copied = crate::ocr::copy_text(to_copy);
+            let copied = match table {
+                Some(grid) if grid.cols() >= 3 => crate::ocr::copy_table(grid),
+                _ => crate::ocr::copy_text(to_copy),
+            };
             if !copied {
                 (*state).status = "剪贴板被别的程序占着，点「复制」再试".to_string();
             }
@@ -2070,6 +2145,10 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
+            if (*state).table.is_some() && contains(&l.copy_source, point) {
+                copy_as_table(hwnd);
+                return 0;
+            }
             if (*state).has_translation() {
                 if contains(&l.copy_source, point) {
                     copy_source(hwnd);
@@ -2182,6 +2261,7 @@ unsafe extern "system" fn window_proc(
                 let interactive = contains(&l.close, point)
                     || contains(&l.copy, point)
                     || ((*state).has_translation() && contains(&l.copy_source, point))
+                    || ((*state).table.is_some() && contains(&l.copy_source, point))
                     || ((*state).has_translation()
                         && (contains(&l.view_lines, point)
                             || contains(&l.view_prose, point)
@@ -2423,13 +2503,18 @@ unsafe extern "system" fn enum_preview(hwnd: HWND, lparam: LPARAM) -> i32 {
     1
 }
 
-pub fn open(_parent: HWND, text: &str, error: Option<&str>) {
-    open_inner(Some(text), None, error);
+pub fn open(
+    _parent: HWND,
+    text: &str,
+    table: Option<&netspeed_core::table::Table>,
+    error: Option<&str>,
+) {
+    open_inner(Some(text), None, table, error);
 }
 
 /// 翻译结果：原文 + 译文分开给，窗口自己决定怎么排
 pub fn open_translate(_parent: HWND, source: &str, translated: &str, error: Option<&str>) {
-    open_inner(Some(source), Some(translated), error);
+    open_inner(Some(source), Some(translated), None, error);
 }
 
 /// OCR 出来就先开窗（只有原文 + 「翻译中…」），别让人对着空白等几秒
@@ -2441,7 +2526,7 @@ pub fn open_pending(source: &str) {
             DestroyWindow(previous);
         }
     }
-    open_inner(Some(source), None, None);
+    open_inner(Some(source), None, None, None);
     // 标记成「等译文」状态
     unsafe {
         let hwnd = last_hwnd_alive();
@@ -2468,7 +2553,7 @@ pub fn update_translation(
 ) {
     let hwnd = last_hwnd_alive();
     if hwnd.is_null() {
-        open_inner(Some(source), Some(translated), error);
+        open_inner(Some(source), Some(translated), None, error);
         return;
     }
     unsafe {
