@@ -1,4 +1,4 @@
-﻿# 构建 + 部署：cargo build --release -> 停掉正在跑的面板 -> 备份旧 exe -> 覆盖 -> 重启
+# 构建 + 部署：cargo build --release -> 停掉正在跑的面板 -> 备份旧 exe -> 覆盖 -> 重启
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 #   powershell -File scripts\deploy.ps1 -Deploy "D:\Other\NST" -NoRestart
@@ -28,10 +28,31 @@ foreach ($process in $running) {
     if ($process.Path -and $process.Path -ieq $target) { $restart = $true }
 }
 if ($running.Count -gt 0) {
-    $ids = ($running | ForEach-Object { $_.Id }) -join ","
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 800
-    Write-Output "stopped: $ids"
+    # 面板先停：提权助手（--netproc-helper）是面板用 runas 拉起来的、跑在管理员权限下，
+    # 面板一退它就自己退；反过来直接 Stop 它会被拒绝（Access denied），以前就卡在这一步。
+    $panel = @($running | Where-Object { $_.Path -and $_.Path -ieq $target })
+    $others = @($running | Where-Object { -not ($_.Path -and $_.Path -ieq $target) })
+    $stopped = @()
+    foreach ($process in @($panel + $others)) {
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            $stopped += $process.Id
+        } catch {
+            Write-Output ("  skip pid " + $process.Id + ": " + $_.Exception.Message)
+        }
+    }
+    # 助手写不进管道会自己退出，等它退干净再动 exe
+    $deadline = (Get-Date).AddSeconds(5)
+    $left = @(Get-Process netspeed -ErrorAction SilentlyContinue)
+    while ($left.Count -gt 0 -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        $left = @(Get-Process netspeed -ErrorAction SilentlyContinue)
+    }
+    if ($left.Count -gt 0) {
+        $leftIds = ($left | ForEach-Object { $_.Id }) -join ","
+        throw "还有 netspeed 进程没退出：$leftIds（提权助手要管理员权限，关掉面板或稍等再试）"
+    }
+    if ($stopped.Count -gt 0) { Write-Output ("stopped: " + ($stopped -join ",")) }
 }
 
 # 2) 构建（进程停了，target\release\netspeed.exe 才不会被占用）
