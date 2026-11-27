@@ -10,10 +10,10 @@ use netspeed_core::settings::{Settings, GAUGE_AI, GAUGE_MEMORY};
 use netspeed_core::{format_bytes_gb, format_speed, MemorySnapshot};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, FillRect, GetDC, GetPixel, GetTextExtentPoint32W, InvalidateRect,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DT_LEFT,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetPixel,
+    GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    BITMAPINFO, BITMAPINFOHEADER, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC,
+    HFONT, HGDIOBJ, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowRect, SetWindowPos, UpdateLayeredWindow, SWP_NOACTIVATE, SWP_NOMOVE,
@@ -76,10 +76,18 @@ pub struct Panel {
     last_anim: std::time::Instant,
     /// 上一次真正采样/重绘的时间（用来按设置的间隔限流）
     last_refresh: std::time::Instant,
-    /// 任务栏底色缓存：每帧 8 次 GetPixel 读屏没必要，位置没变就复用
+    /// 任务栏底色：启动/换主题时采一次就固定。
+    ///
+    /// 背景本身是透明的（见 `render`），这个颜色只负责三件事：给文字垫 ClearType 底、
+    /// 算指示条轨道、面板被拖到任务栏外面时当实底色。
     bg_color: u32,
-    bg_rect: (i32, i32, i32, i32),
-    bg_at: std::time::Instant,
+    /// 面板所在那块屏的任务栏矩形 + 量它的时间（决定背景要不要整块透明）
+    taskbar_rect: (i32, i32, i32, i32),
+    placed_at: std::time::Instant,
+    /// 面板是不是嵌在任务栏里：是就画透明背景，任务栏怎么变都直接透出来
+    embedded: bool,
+    /// 上一次「鼠标碰一下就补一帧」的时间（节流用）
+    last_repaint: std::time::Instant,
     /// 上一次真正画出来的内容指纹：一样就不重绘（数字常几十秒不动）
     last_frame: String,
 }
@@ -125,8 +133,10 @@ impl Panel {
             last_anim: std::time::Instant::now(),
             last_refresh: std::time::Instant::now(),
             bg_color: 0,
-            bg_rect: (0, 0, 0, 0),
-            bg_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            taskbar_rect: (0, 0, 0, 0),
+            placed_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            embedded: true,
+            last_repaint: std::time::Instant::now(),
             last_frame: String::new(),
         };
 
@@ -647,18 +657,16 @@ impl Panel {
         self.dpi = dpi;
         self.fonts = Fonts::create(dpi, self.settings.font_scale);
         self.colors = Colors::for_theme(crate::theme::taskbar_is_light(), 0x00F3F3F3);
-        // 尺寸马上会变：底色缓存和内容指纹都得作废，缓冲区下次绘制按新尺寸重建
-        self.bg_rect = (0, 0, 0, 0);
-        self.bg_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // 尺寸马上要变：下一次绘制要重新量任务栏，内容指纹也得作废
+        self.placed_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
         self.last_frame.clear();
         self.width = 0;
         self.height = 0;
     }
 
-    /// 系统主题 / 任务栏外观变了：底色缓存作废，下一帧重新采样
+    /// 系统主题 / 任务栏外观变了：底色作废，下一帧重新采一次
     pub fn forget_background(&mut self) {
-        self.bg_rect = (0, 0, 0, 0);
-        self.bg_at = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        self.bg_color = 0;
     }
 
     fn ensure_buffer(&mut self) {
@@ -713,12 +721,34 @@ impl Panel {
         self.render(std::ptr::null_mut());
     }
 
+    /// 鼠标在面板上划过时补一帧（600ms 节流）。
+    ///
+    /// 平时只在内容变了才重画；这一手是兜底：万一这一层的画面被系统丢了
+    /// （DWM 重启、显示器休眠回来、切分辨率），鼠标碰一下就能自己画回来，
+    /// 不用等下一次数字变化。
+    pub fn request_paint(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_repaint).as_millis() < 600 {
+            return;
+        }
+        self.last_repaint = now;
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
     /// 画到任意 DC：WM_PAINT 和 WM_PRINTCLIENT（截图/打印）共用。
+    ///
+    /// 背景改成「整块透明」，不再采样任务栏颜色涂一块实底：
+    /// 任务栏是半透明的，旁边那几个像素会随壁纸、悬停高亮、时间和图标一直变，
+    /// 采到的颜色只能贴近一小会儿，过一会儿就是一块对不上的色块（用户看到的就是
+    /// 「面板背景时不时变色」）。面板本来就嵌在任务栏里，留透明（alpha=1，肉眼
+    /// 看不见但鼠标还能点到）让任务栏自己透出来，就永远不会变色。
+    /// 被拖到任务栏外面（桌面上）时才退回实底，不然字直接飘在壁纸上。
     pub fn render(&mut self, hdc: HDC) {
         unsafe {
             self.ensure_buffer();
-            // 采样任务栏底色（取面板左右两侧的空隙，避开图标）。
-            // 动画时一帧一次太亏：位置没变就复用 2 秒内的结果（主题切换靠 TTL 兜底）
+
             let mut frame = RECT {
                 left: 0,
                 top: 0,
@@ -726,37 +756,34 @@ impl Panel {
                 bottom: 0,
             };
             GetWindowRect(self.hwnd, &mut frame);
-            let key = (frame.left, frame.top, frame.right, frame.bottom);
-            let now = std::time::Instant::now();
-            // 任务栏是半透明的：面板旁边那几个像素会随壁纸、悬停高亮、后面的窗口变来变去。
-            // 以前每 2 秒重新采样一次，于是面板颜色会「时不时闪一下」。
-            // 现在只有「面板挪了位置」或「过了很久」才采样，而且颜色差得不多就不认
-            // （主题切换是明暗互换，差值很大，不会被这道门槛挡住）。
-            let moved = key != self.bg_rect;
-            let stale = now.duration_since(self.bg_at).as_secs() >= 30;
-            if moved || stale {
-                let light = taskbar_is_light();
-                let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
-                let sampled = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
-                // 没采过样（0）就用这次的；之后差得不够多就不认，避免面板颜色自己抖
-                if self.bg_color == 0 || color_far_enough(sampled, self.bg_color) {
-                    self.bg_color = sampled;
-                }
-                self.bg_rect = key;
-                self.bg_at = now;
-            }
+            self.refresh_placement(&frame);
 
             let light = taskbar_is_light();
-            if self.colors.background != self.bg_color {
-                self.colors = Colors::for_theme(light, self.bg_color);
+            // 底色只在启动和换主题时采一次：它只给文字垫 ClearType 底、算轨道颜色，
+            // 谁也看不见它本身，所以没必要（也不能）跟着任务栏一直变。
+            if self.bg_color == 0 {
+                let fallback = if light { 0x00F3F3F3 } else { 0x001F1F1F };
+                self.bg_color = sample_taskbar_color(self.hwnd).unwrap_or(fallback);
             }
-
+            self.colors = Colors::for_theme(light, self.bg_color);
 
             let dc = self.back_dc;
             let width = self.width;
             let height = self.height;
-
-            fill(dc, 0, 0, width, height, self.colors.background);
+            let background = self.colors.background;
+            // alpha=1 而不是 0：alpha=0 的像素连鼠标都点不到，面板会变成任务栏上的一个洞
+            let background_alpha = if self.embedded { 1 } else { 255 };
+            fill_bits(
+                self.back_bits,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                background,
+                background_alpha,
+            );
 
             match self.settings.view.as_str() {
                 VIEW_MEMORY => {
@@ -777,20 +804,20 @@ impl Panel {
                 }
             }
 
+            // GDI 画字只写 RGB、不写 alpha：画完把「不是底色的像素」一律补成不透明，
+            // 剩下的留给任务栏透出来
+            seal_alpha(self.back_bits, width, height, background, background_alpha);
+
             if self.settings.gauge_visible() {
-                self.draw_gauge(dc, width, height);
-            }
-
-
-            // DIB 全量把 alpha 置 255，DWM 才会按不透明合成
-            if !self.back_bits.is_null() {
-                let count = (width * height) as usize;
-                for index in 0..count {
-                    *self.back_bits.add(index * 4 + 3) = 255;
-                }
+                self.draw_gauge(width, height, light);
             }
 
             if hdc.is_null() {
+                // UpdateLayeredWindow 收的是「预乘 alpha」：背景 alpha=1 如果不预乘，
+                // RGB 会被当成实色按 1/255 叠上去，整块面板会发白。文字 alpha=255，
+                // 预乘前后一模一样；半透明轨道正好是想要的效果。
+                premultiply(self.back_bits, width, height);
+
                 let mut rect = RECT {
                     left: 0,
                     top: 0,
@@ -830,6 +857,37 @@ impl Panel {
                 BitBlt(hdc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
             }
         }
+    }
+
+    /// 量一下面板所在那块屏的任务栏，判断它是不是还嵌在里面。
+    ///
+    /// 任务栏矩形 1 秒量一次就够（只有分辨率/DPI/任务栏位置变化时才会动），
+    /// 每帧都 FindWindow + EnumWindows 太亏；面板自己的矩形每帧比一次，拖动时立刻跟上。
+    fn refresh_placement(&mut self, frame: &RECT) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.placed_at).as_millis() >= 1000 {
+            self.placed_at = now;
+            unsafe {
+                let taskbar = crate::taskbar_for(self.hwnd);
+                let mut bar = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if !taskbar.is_null() && GetWindowRect(taskbar, &mut bar) != 0 {
+                    self.taskbar_rect = (bar.left, bar.top, bar.right, bar.bottom);
+                }
+            }
+        }
+
+        let (left, top, right, bottom) = self.taskbar_rect;
+        self.embedded = right > left
+            && bottom > top
+            && frame.left >= left
+            && frame.top >= top
+            && frame.right <= right
+            && frame.bottom <= bottom;
     }
 
     fn row(&self, dc: HDC, index: i32, label: &str, value: &str, is_down: bool) {
@@ -901,35 +959,52 @@ impl Panel {
         }
     }
 
-    fn draw_gauge(&self, dc: HDC, width: i32, height: i32) {
+    /// 底部指示条。
+    ///
+    /// 透明模式下轨道用「半透明黑/白」压上去：不管后面是任务栏的哪种底色、
+    /// 壁纸透出来是什么颜色，轨道看起来都是同一个「淡一档」的灰，不会有一块死色。
+    fn draw_gauge(&self, width: i32, height: i32, light: bool) {
         let pad = scale(self.dpi, 6);
         let bar_height = scale(self.dpi, 3);
         let top = height - bar_height - scale(self.dpi, 3);
         let track_width = width - pad * 2;
 
+        let (track, track_alpha) = if self.embedded {
+            if light {
+                (0x0000_0000, 40)
+            } else {
+                (0x00FF_FFFF, 40)
+            }
+        } else {
+            (blend(self.colors.background, 0x0000_0000, 0.12), 255)
+        };
+
         unsafe {
-            let track = CreateSolidBrush(blend(self.colors.background, 0x0000_0000, 0.12));
-            let rect = RECT {
-                left: pad,
+            fill_bits(
+                self.back_bits,
+                self.width,
+                self.height,
+                pad,
                 top,
-                right: pad + track_width,
-                bottom: top + bar_height,
-            };
-            FillRect(dc, &rect, track);
-            DeleteObject(track as *mut _);
+                pad + track_width,
+                top + bar_height,
+                track,
+                track_alpha,
+            );
 
             let filled = ((track_width as f32) * self.gauge).round() as i32;
             if filled > 0 {
-                let color = gauge_color(self.gauge);
-                let brush = CreateSolidBrush(color);
-                let rect = RECT {
-                    left: pad,
+                fill_bits(
+                    self.back_bits,
+                    self.width,
+                    self.height,
+                    pad,
                     top,
-                    right: pad + filled,
-                    bottom: top + bar_height,
-                };
-                FillRect(dc, &rect, brush);
-                DeleteObject(brush as *mut _);
+                    pad + filled,
+                    top + bar_height,
+                    gauge_color(self.gauge),
+                    255,
+                );
             }
         }
     }
@@ -973,17 +1048,86 @@ fn text_width(dc: HDC, text: &str, font: HFONT) -> i32 {
     }
 }
 
-fn fill(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
-    unsafe {
-        let brush = CreateSolidBrush(color);
-        let rect = RECT {
-            left,
-            top,
-            right,
-            bottom,
-        };
-        FillRect(dc, &rect, brush);
-        DeleteObject(brush as *mut _);
+/// 把一块矩形按「颜色 + alpha」直接写进 32bpp 背缓冲。
+///
+/// 不用 GDI 的 `FillRect`：GDI 会把 alpha 字节写成 0，透明背景（alpha=1）就没法做了。
+/// 内存布局是 B,G,R,A（COLORREF 的低字节是红，所以在第 2 个字节上）。
+unsafe fn fill_bits(
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: u32,
+    alpha: u8,
+) {
+    if bits.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    let left = left.max(0);
+    let top = top.max(0);
+    let right = right.min(width);
+    let bottom = bottom.min(height);
+    if left >= right || top >= bottom {
+        return;
+    }
+
+    let blue = ((color >> 16) & 0xFF) as u8;
+    let green = ((color >> 8) & 0xFF) as u8;
+    let red = (color & 0xFF) as u8;
+
+    for y in top..bottom {
+        let mut pixel = bits.add(((y * width + left) * 4) as usize);
+        for _ in left..right {
+            *pixel = blue;
+            *pixel.add(1) = green;
+            *pixel.add(2) = red;
+            *pixel.add(3) = alpha;
+            pixel = pixel.add(4);
+        }
+    }
+}
+
+/// 把 RGB 按 alpha 预乘（`UpdateLayeredWindow` 只认预乘后的 ARGB）。
+///
+/// alpha=1 的背景预乘后 RGB 几乎归零，DWM 合成出来就是「任务栏原样」；
+/// alpha=255 的文字不变；alpha=40 的轨道变成 16% 的黑/白，压在任何底色上都成立。
+unsafe fn premultiply(bits: *mut u8, width: i32, height: i32) {
+    if bits.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    let count = (width * height) as usize;
+    for index in 0..count {
+        let pixel = bits.add(index * 4);
+        let alpha = *pixel.add(3) as u32;
+        if alpha == 255 {
+            continue;
+        }
+        for channel in 0..3 {
+            let value = *pixel.add(channel) as u32 * alpha;
+            *pixel.add(channel) = ((value + 127) / 255) as u8;
+        }
+    }
+}
+
+/// 画完文字后定 alpha：不是底色的像素（字、指示条）一律不透明，剩下的保持背景 alpha。
+///
+/// GDI 画字只写 RGB，第 4 个字节是它自己的（多半是 0），不补的话字会整片透明。
+unsafe fn seal_alpha(bits: *mut u8, width: i32, height: i32, background: u32, background_alpha: u8) {
+    if bits.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    let blue = ((background >> 16) & 0xFF) as u8;
+    let green = ((background >> 8) & 0xFF) as u8;
+    let red = (background & 0xFF) as u8;
+
+    let count = (width * height) as usize;
+    for index in 0..count {
+        let pixel = bits.add(index * 4);
+        let untouched = *pixel == blue && *pixel.add(1) == green && *pixel.add(2) == red;
+        *pixel.add(3) = if untouched { background_alpha } else { 255 };
     }
 }
 
@@ -1028,16 +1172,6 @@ fn sample_taskbar_color(hwnd: HWND) -> Option<u32> {
 
         samples.get(samples.len() / 2).copied()
     }
-}
-
-/// 两个颜色的最大通道差是否超过阈值（小于阈值就当没变，别为了一点点色差重画）
-fn color_far_enough(a: u32, b: u32) -> bool {
-    let channel = |shift: u32| {
-        let av = ((a >> shift) & 0xFF) as i32;
-        let bv = ((b >> shift) & 0xFF) as i32;
-        (av - bv).abs()
-    };
-    channel(0).max(channel(8)).max(channel(16)) > 10
 }
 
 /// 进程名太长会撑爆气泡：超过 14 个字符就截断加省略号（中英文都按字符数算）
@@ -1210,5 +1344,132 @@ impl AiWorker {
 impl Drop for AiWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fill_bits, premultiply, seal_alpha};
+
+    /// 透明背景必须真的写进 alpha 字节：只用 GDI 的 FillRect 时 alpha 恒为 0，
+    /// 整块面板会被 DWM 合成成完全透明（连字都看不见）。
+    #[test]
+    fn transparent_background_keeps_alpha_byte() {
+        let (width, height) = (4_i32, 3_i32);
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+
+        // 0x00123456 = 红 0x56，绿 0x34，蓝 0x12
+        unsafe {
+            fill_bits(pixels.as_mut_ptr(), width, height, 1, 1, 3, 2, 0x0012_3456, 1);
+        }
+
+        let index = |x: i32, y: i32| ((y * width + x) * 4) as usize;
+        // 内存顺序是 B,G,R,A
+        assert_eq!(pixels[index(1, 1)], 0x12, "蓝");
+        assert_eq!(pixels[index(1, 1) + 1], 0x34, "绿");
+        assert_eq!(pixels[index(1, 1) + 2], 0x56, "红");
+        assert_eq!(pixels[index(1, 1) + 3], 1, "透明背景 alpha 是 1，不是 0");
+        assert_eq!(pixels[index(0, 0) + 3], 0, "矩形外面的像素不动");
+    }
+
+    /// 画完字之后：底色像素留 alpha=1（任务栏透出来），被字画过的地方补成 255。
+    #[test]
+    fn sealing_alpha_keeps_background_transparent_and_text_opaque() {
+        let (width, height) = (4_i32, 2_i32);
+        let background = 0x00F3_F3F3_u32; // 红 F3、绿 F3、蓝 F3
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+        unsafe {
+            fill_bits(
+                pixels.as_mut_ptr(),
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                background,
+                1,
+            );
+        }
+
+        // 模拟 GDI 画字：只写 RGB，alpha 被写成了 0
+        let index = |x: i32, y: i32| ((y * width + x) * 4) as usize;
+        let glyph = index(2, 1);
+        pixels[glyph] = 0x20;
+        pixels[glyph + 1] = 0x20;
+        pixels[glyph + 2] = 0x20;
+        pixels[glyph + 3] = 0;
+
+        unsafe {
+            seal_alpha(pixels.as_mut_ptr(), width, height, background, 1);
+        }
+
+        assert_eq!(pixels[index(0, 0) + 3], 1, "没画到的底色还是透明的");
+        assert_eq!(pixels[glyph + 3], 255, "字必须不透明，否则字会消失");
+    }
+
+    /// 实底模式（面板被拖到任务栏外面）整块不透明，字也看得清。
+    #[test]
+    fn solid_mode_seals_every_pixel() {
+        let (width, height) = (3_i32, 2_i32);
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+        unsafe {
+            fill_bits(
+                pixels.as_mut_ptr(),
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                0x001F_1F1F,
+                255,
+            );
+            seal_alpha(pixels.as_mut_ptr(), width, height, 0x001F_1F1F, 255);
+        }
+        for index in 0..(width * height) as usize {
+            assert_eq!(pixels[index * 4 + 3], 255, "实底不留透明像素");
+        }
+    }
+
+    /// UpdateLayeredWindow 要预乘 alpha：不预乘的话 alpha=1 的背景会被当成
+    /// 「0xF3 实色叠 1/255」加到任务栏上，整块面板发白（这就是线上看到的白块）。
+    #[test]
+    fn premultiply_keeps_transparent_background_clear() {
+        let (width, height) = (2_i32, 1_i32);
+        let mut pixels = vec![0_u8; (width * height * 4) as usize];
+        unsafe {
+            fill_bits(
+                pixels.as_mut_ptr(),
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                0x00F3_F3F3,
+                1,
+            );
+            fill_bits(
+                pixels.as_mut_ptr(),
+                width,
+                height,
+                1,
+                0,
+                2,
+                1,
+                0x00F3_F3F3,
+                255,
+            );
+            premultiply(pixels.as_mut_ptr(), width, height);
+        }
+
+        assert!(pixels[0] <= 1, "透明背景预乘后 RGB 归零（任务栏原样透出来）");
+        assert_eq!(pixels[3], 1, "alpha 不变");
+        // 第 2 个像素（B,G,R,A）：不透明白色预乘前后一样
+        assert_eq!(pixels[4], 0xF3, "蓝");
+        assert_eq!(pixels[5], 0xF3, "绿");
+        assert_eq!(pixels[6], 0xF3, "红");
+        assert_eq!(pixels[7], 255, "alpha 不变");
     }
 }

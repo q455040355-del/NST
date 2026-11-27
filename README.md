@@ -27,21 +27,39 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
 
 `models\` 里是 PaddleOCR 的 det/cls/rec 模型 + 字典（共 7 MB）；程序按 `exe 同级 models\` → `仓库根 models\` → `当前目录 models\` 的顺序查找，取字功能才可用。
 
-`cargo test -p netspeed-core` 跑核心逻辑单测（换算、设置规范化、区间聚合、多帧 zstd、跨文件去重等，41 个）。
+`cargo test -p netspeed-core` 跑核心逻辑单测（换算、设置规范化、区间聚合、多帧 zstd、跨文件去重等，77 个）；
+`cargo test -p netspeed-app` 跑 UI 层的纯逻辑单测（透明/预乘 alpha、滚动拼接、气泡量宽等，93 个）。
 
-单实例：互斥体 `Local\NetSpeedTaskbar.Rust`。配置：`%LOCALAPPDATA%\NetSpeedTaskbar\settings.ini`。
+单实例：互斥体 `Local\NetSpeedTaskbar.Rust`。**互斥体在 ≠ 真在跑**：还要能找到面板窗口才算，
+否则照常启动——崩溃/被强杀留下的残留句柄不能让用户再也打不开面板。
+配置：`%LOCALAPPDATA%\NetSpeedTaskbar\settings.ini`。
 
 ## 架构要点
 
 - **面板是顶层分层窗口**：`WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST`，
   `WS_POPUP | WS_VISIBLE`，**owner 设为 `Shell_TrayWnd`**——拥有窗口永远排在 owner 之上，
   Explorer 反复重绘任务栏也盖不住它（挂在任务栏下面的 `WS_CHILD` 子窗口会被 `MSTaskListWClass` 压住，点击全丢）。
-- **呈现**：背缓冲 `CreateDIBSection`（32bpp，行序 top-down）+ 全量 alpha=255，整体 `UpdateLayeredWindow` 推给 DWM。
+- **呈现**：背缓冲 `CreateDIBSection`（32bpp，行序 top-down），文字/指示条写 alpha=255，
+  背景写 alpha=1（见下条），整体 `UpdateLayeredWindow` 推给 DWM。
   普通 `CreateCompatibleBitmap` 的 alpha 恒为 0，合成后文字近乎透明，必须用 DIB 并手写 alpha。
+  ⚠️ `UpdateLayeredWindow` 收的是**预乘 alpha**：背景 alpha=1 必须先把 RGB 预乘掉（归零），
+  不预乘会把「0xF3 的实色」按 1/255 叠到任务栏上，整块面板发白。
   ⚠️ 分层窗口的 `WM_PAINT` 里必须自己 `ValidateRect`：`UpdateLayeredWindow` 不会清更新区，
   不清就会无穷重发 `WM_PAINT`（面板又是 TOPMOST，永远排在队首），把同线程其它窗口的
   `WM_PAINT` 全饿死 —— 截图编辑器拖箭头/马赛克发顿就是这个原因。
-- **底色**：在面板左右两侧的空隙各取 4 个点，按亮度取中位数作为背景色，和任务栏融为一体；采不到才回退到标准色。
+- **底色是「真透明」，不是采样涂色**：面板背景 alpha=1（肉眼看不见，但 alpha≠0 所以鼠标还点得到），
+  任务栏自己怎么画（亚克力、壁纸透出、悬停高亮、时间/图标变化）都原样透出来，永远不会出现
+  「面板和旁边任务栏对不上」的色块。以前是拿 `GetPixel` 采面板两侧的空隙、按亮度取中位数涂一块实底，
+  任务栏是半透明的，那颜色一会儿就过时 —— 表现就是背景时不时变一次色。现在只在启动/换主题时采一次，
+  只用来给文字垫 ClearType 底和算指示条轨道。面板被拖离任务栏（桌面上）时才退回实底，不然字会飘在壁纸上。
+- **z 序**：面板是「owner = 任务栏」的置顶窗口，平时**不要周期性重设置顶**——对 owner 是任务栏的窗口调
+  `SetWindowPos(HWND_TOPMOST)` 会把 owner 一起提到最前（全屏游戏里就是任务栏隔一秒闪一下）。
+  只在真丢了 `WS_EX_TOPMOST` 时补一次（带 `SWP_NOOWNERZORDER`，全屏时连这一下都不做）。
+  ⚠️ 任务栏被系统/Explorer 重新提前时仍可能把面板整块盖住（「面板不见了，鼠标划过任务栏又冒出来」）。
+  每拍只做一次**只读**检查：从面板往上走 z 序，碰到任务栏就是被盖了，这时才提一次
+  `HWND_TOPMOST`（`SWP_NOOWNERZORDER`，只抬面板不抬任务栏）。状态变化会写一行调试日志，
+  带 `covered=true`；正常运行时一行都不写。测试通道：`PostMessage(面板, WM_APP + 14)` 可以把面板自己压到
+  任务栏下面，验证下一拍能自己抬回来。
 - **DPI**：启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`；
   窗口里取 DPI 一律走 `GetDpiForWindow`（分层窗口未显示时 `GetDC(hwnd)+LOGPIXELSX` 会返回 96，会把面板算成未缩放尺寸）。
   面板收到 `WM_DPICHANGED` 会按新 DPI 重建字体/尺寸/背缓冲（拖到缩放不同的屏或改缩放都立即生效）；
@@ -51,9 +69,6 @@ cargo build --release          # 先结束 netspeed 进程，否则 os error 5
   悬浮气泡、右键菜单也按出现位置那块屏的 DPI 和可用区域摆；设置窗拖到缩放不同的屏会重排（字号/尺寸/布局全部按新 DPI 重算）。
   设置窗和历史窗都可以 `Esc` 关闭。
   竖排任务栏（Win10 侧边）：面板是横条塞不进 48px 宽的竖栏，会贴在栏的外侧、纵向对齐托盘。
-- **z 序**：面板是「owner = 任务栏」的置顶窗口，**不要再周期性重设置顶**——对 owner 是任务栏的窗口调
-  `SetWindowPos(HWND_TOPMOST)` 会把 owner 一起提到最前（全屏游戏里就是任务栏隔一秒闪一下）。
-  现在只在真丢了 `WS_EX_TOPMOST` 时补一次，而且带 `SWP_NOOWNERZORDER`；全屏时连这一下都不做。
 - **全屏暂停**：全屏程序（游戏/视频，且和面板同一块屏）在前台时，面板藏起来并**整个停掉网速采样**：
   面板不再读网卡计数，提权助手也把 ETW provider 关掉（内核不再为每个包产事件），开销归零；
   退出全屏自动恢复，恢复后一两秒气泡里写「刚恢复采集，等一秒…」而不是「助手没回数据」。

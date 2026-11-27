@@ -28,7 +28,9 @@ mod update;
 use netspeed_core::settings::{parse_hotkey, Settings};
 use panel::Panel;
 use std::ffi::c_void;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
@@ -70,10 +72,17 @@ const WM_APP_REVEAL: u32 = WM_APP + 7;
 /// 冒烟测试用：模拟「换到另一块屏」的 DPI 变化。
 /// （WM_DPICHANGED 是系统消息，跨进程 PostMessage 会被系统挡掉，测不了）
 const WM_APP_DPI_TEST: u32 = WM_APP + 8;
+/// 冒烟测试用：把面板自己压到任务栏下面，复现「面板被任务栏盖住」。
+/// 外部进程调 SetWindowPos 压不动（系统不让改别人 owner 窗口的 z 序），只能自己压。
+const WM_APP_COVER_TEST: u32 = WM_APP + 14;
 
 /// windows-sys 0.59 没导出 WM_MOUSELEAVE，自己补一个
 /// （不能省：漏了会变成变量绑定模式，把后面的消息分支全吃掉）
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// DWM 重启 / 桌面合成重开：分层窗口的画面必须重新提交一次
+const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
+/// 系统主题（明暗）换了
+const WM_THEMECHANGED: u32 = 0x031A;
 const HOTKEY_SHOT: i32 = 1;
 const HOTKEY_OCR: i32 = 2;
 const HOTKEY_GIF: i32 = 3;
@@ -97,6 +106,9 @@ static TICK_WAKE: std::sync::OnceLock<(std::sync::Mutex<()>, std::sync::Condvar)
     std::sync::OnceLock::new();
 /// 是否已经向系统登记了 WM_MOUSELEAVE
 static mut TRACKING_LEAVE: bool = false;
+
+/// 上一次 tick 记下的显示状态：诊断日志只在变化时写一行（不刷屏）
+static mut LAST_STATE: (bool, bool, bool, bool) = (false, false, false, false);
 
 fn tick_wake() -> &'static (std::sync::Mutex<()>, std::sync::Condvar) {
     TICK_WAKE.get_or_init(|| (std::sync::Mutex::new(()), std::sync::Condvar::new()))
@@ -303,12 +315,30 @@ fn main() {
         );
 
         let mutex_name = wide("Local\\NetSpeedTaskbar.Rust");
+        // 先清掉上一次调用留下的错误码：不然上一次的 183 会被当成「已经有一个在跑」
+        SetLastError(0);
         let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
-        if mutex.is_null() || GetLastError() == 183 {
-            // 已经在跑了：把已有面板叫出来，别让用户双击了没反应
-            reveal_existing();
-            return;
+        let mutex_error = GetLastError();
+        if mutex.is_null() {
+            // 互斥体都建不出来：单实例是保证不了了，但更不能让用户双击了没反应
+            debug_log(&format!(
+                "start: 建互斥体失败（err={mutex_error}），照常启动"
+            ));
+        } else if mutex_error == 183 {
+            // 互斥体在，但要真有面板窗口才算「已经在跑」。残留句柄（崩溃/被强杀、
+            // 或者别的进程拿着这个名字）会让后面每一次双击都静默退出——用户再也打不开。
+            if existing_panel().is_null() {
+                debug_log("start: 互斥体在但没有面板窗口（残留），照常启动");
+            } else {
+                // 已经在跑了：把已有面板叫出来，别让用户双击了没反应
+                debug_log(&format!(
+                    "start: 已有实例在跑（mutex={mutex:?} err={mutex_error}），不再重复启动"
+                ));
+                reveal_existing();
+                return;
+            }
         }
+        debug_log(&format!("start: pid={}", std::process::id()));
 
         let instance = GetModuleHandleW(std::ptr::null());
 
@@ -329,6 +359,7 @@ fn main() {
 
         let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
         if taskbar.is_null() {
+            debug_log("start: 找不到 Shell_TrayWnd（Explorer 没起来？），面板不启动");
             return;
         }
         TASKBAR = taskbar;
@@ -357,11 +388,16 @@ fn main() {
         );
 
         if hwnd.is_null() {
+            debug_log(&format!(
+                "start: CreateWindowExW 失败（err={}），面板不启动",
+                GetLastError()
+            ));
             return;
         }
 
         position_panel(hwnd, taskbar, width, height);
         keep_on_top(hwnd);
+        keep_above_taskbar(hwnd);
         add_tray(hwnd);
 
         // 注意：本进程里的 SetTimer / WM_TIMER 完全不可靠（实测 set 成功但永不触发，
@@ -440,7 +476,7 @@ fn scale_for_dpi(value: i32) -> i32 {
 ///
 /// 主屏是 `Shell_TrayWnd`，副屏是各自的 `Shell_SecondaryTrayWnd`——以前一律拿主任务栏，
 /// 面板拖到副屏后位置会按主屏的托盘算，跑偏。
-fn taskbar_for(hwnd: HWND) -> HWND {
+pub(crate) fn taskbar_for(hwnd: HWND) -> HWND {
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let primary = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
@@ -717,14 +753,126 @@ fn is_topmost(hwnd: HWND) -> bool {
     }
 }
 
+/// 面板必须紧贴在任务栏上面。
+///
+/// `owner = 任务栏` 理论上保证「拥有窗口永远排在 owner 之上」，但任务栏被系统/Explorer
+/// 重新提前时（切全屏、显示/隐藏任务栏、任务栏自己的置顶轮询、分辨率变化），面板可能
+/// 落到它后面被整块盖住——用户看到的就是「面板不见了，鼠标划过任务栏才又冒出来」。
+///
+/// 平时一拍都不动（`SetWindowPos` 会牵动 owner，能少一次是一次）；真检测到被盖住了，
+/// 才把面板提到置顶层最前面。带 `SWP_NOOWNERZORDER`：只抬面板，不把任务栏一起顶到最前
+/// （那样全屏游戏里任务栏会闪）。
+fn keep_above_taskbar(hwnd: HWND) {
+    unsafe {
+        let taskbar = TASKBAR;
+        if taskbar.is_null() || IsWindow(taskbar) == 0 {
+            return;
+        }
+        if !taskbar_covers(hwnd, taskbar) {
+            return;
+        }
+        // 只有真被盖住才走到这里：记一笔现场（排查「面板不见了」就看这几行）
+        diag_state("covered", hwnd);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+        diag_state("recovered", hwnd);
+    }
+}
+
+/// 任务栏是不是压在面板上面。
+///
+/// 从面板往上走 z 序（GW_HWNDPREV 是更靠前的窗口）：先碰到任务栏就是被盖了；
+/// 碰到第一个非置顶窗口就说明已经走出置顶层——任务栏也是置顶的，不可能更靠后。
+fn taskbar_covers(hwnd: HWND, taskbar: HWND) -> bool {
+    unsafe {
+        let mut previous = GetWindow(hwnd, GW_HWNDPREV);
+        for _ in 0..256 {
+            if previous.is_null() {
+                return false;
+            }
+            if previous == taskbar {
+                return true;
+            }
+            if !is_topmost(previous) {
+                return false;
+            }
+            previous = GetWindow(previous, GW_HWNDPREV);
+        }
+        false
+    }
+}
+
+/// 记一行面板当前的显示状态：排查「面板不见了 / 被盖住」时一条日志就够定位。
+///
+/// 只在显示状态真的变了的时候调用（tick 里拿状态跟上一拍比），平时不写日志。
+pub(crate) fn diag_state(tag: &str, hwnd: HWND) {
+    unsafe {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(hwnd, &mut rect);
+        let point = POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        };
+        let under = WindowFromPoint(point);
+        let mut name = [0u16; 96];
+        let length = GetClassNameW(under, name.as_mut_ptr(), name.len() as i32);
+        let under_name = String::from_utf16_lossy(&name[..length.max(0) as usize]);
+        let previous = GetWindow(hwnd, GW_HWNDPREV);
+        let mut above = [0u16; 96];
+        let above_length = GetClassNameW(previous, above.as_mut_ptr(), above.len() as i32);
+        // DWM 有没有把窗口「cloak」掉（虚拟桌面切换、系统遮罩时会），
+        // 这种时候 IsWindowVisible 还是 true，但屏幕上什么都没有
+        let mut cloaked: u32 = 0;
+        windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            14, // DWMWA_CLOAKED
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        debug_log(&format!(
+            "{tag} visible={} topmost={} cloaked={cloaked} rect=({},{},{},{}) under={} above={} taskbar_visible={} covered={}",
+            IsWindowVisible(hwnd),
+            is_topmost(hwnd),
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            under_name,
+            String::from_utf16_lossy(&above[..above_length.max(0) as usize]),
+            IsWindowVisible(TASKBAR),
+            taskbar_covers(hwnd, TASKBAR),
+        ));
+    }
+}
+
+/// 已经在跑的面板窗口（没有就返回空）
+fn existing_panel() -> HWND {
+    unsafe {
+        let mut found: HWND = std::ptr::null_mut();
+        EnumWindows(Some(find_panel), &mut found as *mut HWND as isize);
+        found
+    }
+}
+
 /// 有第二个实例启动时：找到已经在跑的面板，让它自己亮一下。
 ///
 /// 单实例互斥体挡住重复启动是对的，但以前是静默 `return`——用户双击
 /// 快捷方式什么都没发生，会以为程序坏了。
 fn reveal_existing() {
     unsafe {
-        let mut found: HWND = std::ptr::null_mut();
-        EnumWindows(Some(find_panel), &mut found as *mut HWND as isize);
+        let found = existing_panel();
         if found.is_null() {
             return;
         }
@@ -1058,7 +1206,17 @@ unsafe extern "system" fn wnd_proc(
             // 设置里开着「进程明细」才去提权拉助手（关着完全不碰 ETW / 不弹 UAC）
             netproc::init(netproc_enabled);
             PostMessageW(hwnd, WM_APP_TICK, 0, 0);
+            diag_state("created", hwnd);
             0
+        }
+        // 面板被藏 / 被显示（自己 ShowWindow、切全屏、Explorer 重启…）
+        WM_SHOWWINDOW => {
+            debug_log(&format!("WM_SHOWWINDOW show={} reason={}", wparam, lparam));
+            if wparam != 0 {
+                // 重新显示时不一定还压在任务栏上面，顺手补一次
+                keep_above_taskbar(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // 面板被拖到另一块显示器 / 那块屏的缩放被改了
         WM_DPICHANGED => {
@@ -1068,6 +1226,22 @@ unsafe extern "system" fn wnd_proc(
         // 测试通道：和 WM_DPICHANGED 走同一段逻辑
         WM_APP_DPI_TEST => {
             apply_dpi(hwnd, (wparam & 0xFFFF) as u32, std::ptr::null());
+            0
+        }
+        // 测试通道：把面板压到任务栏下面，验证下一拍能自己抬回来
+        WM_APP_COVER_TEST => {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    TASKBAR,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+            }
+            diag_state("cover-test", hwnd);
             0
         }
         // 分辨率 / 显示器布局变了：重新贴回任务栏
@@ -1080,6 +1254,7 @@ unsafe extern "system" fn wnd_proc(
             // Explorer 重启后我们的窗口会跟着销毁，这时直接退出进程，
             // 否则会留下「没有窗口但占着互斥体」的僵尸进程，导致再也打不开。
             if !TASKBAR.is_null() && IsWindow(TASKBAR) == 0 {
+                debug_log("tick: 任务栏没了（Explorer 重启），面板退出");
                 std::process::exit(0);
             }
 
@@ -1099,10 +1274,25 @@ unsafe extern "system" fn wnd_proc(
             }
 
             keep_on_top(hwnd);
+            // 任务栏被系统/Explorer 提前时会把面板盖住，这里补回 owner 正上方
+            keep_above_taskbar(hwnd);
 
             // 截图/编辑过程中不要把自己弹出来盖住遮罩
             if !shot::active() && !visible && !HIDDEN_BY_USER {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+
+            // 状态变了就记一行：面板「自己不见了 / 被任务栏盖住 / 掉了置顶」
+            // 都能在日志里对上时间点（平时状态不变，不写盘）
+            let state = (
+                IsWindowVisible(hwnd) != 0,
+                is_topmost(hwnd),
+                taskbar_covers(hwnd, TASKBAR),
+                fullscreen,
+            );
+            if state != LAST_STATE {
+                LAST_STATE = state;
+                diag_state("tick", hwnd);
             }
 
             if let Some(panel) = panel_mut(hwnd) {
@@ -1196,6 +1386,16 @@ unsafe extern "system" fn wnd_proc(
             InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
+        // DWM 重启 / 主题切换：桌面合成从头来过，分层窗口得把画面重新交一遍，
+        // 不然这一层就空着（看起来就是「面板不见了」，直到下一次数据变化才画回来）
+        WM_DWMCOMPOSITIONCHANGED | WM_THEMECHANGED => {
+            debug_log(&format!("WM 0x{msg:04X}: 重新提交面板画面"));
+            if let Some(panel) = panel_mut(hwnd) {
+                panel.forget_background();
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
         WM_LBUTTONDOWN => {
             hint::hide();
             // 拖面板挪位置：按下先记起点，移动超过 3px 才算拖动，否则松手还是切视图
@@ -1220,6 +1420,11 @@ unsafe extern "system" fn wnd_proc(
             if !DRAG_ACTIVE {
                 track_mouse_leave(hwnd);
                 update_hover_hint(hwnd);
+                // 顺手补一帧（节流）：万一面板这一层的画面被系统丢了
+                // （DWM 重启、显示器休眠回来、切分辨率），鼠标碰一下就能画回来
+                if let Some(panel) = panel_mut(hwnd) {
+                    panel.request_paint();
+                }
                 return 0;
             }
             update_hover_hint(hwnd);
