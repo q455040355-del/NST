@@ -513,11 +513,15 @@ impl Panel {
         })
     }
 
-    /// 网速视图里第 `index` 行（0 = 上传，1 = 下载）的屏幕热区。
+    /// 面板第 `index` 行（0 = 上面那行，1 = 下面那行）的屏幕热区。
     ///
     /// 行高和 `row()` 里算的一模一样：面板高度减掉底部指示条，再对半分。
-    pub fn speed_row_hot_rect(&self, index: usize) -> Option<RECT> {
-        if self.settings.view != VIEW_SPEED || index > 1 {
+    ///
+    /// 以前只在网速视图里给热区（进程明细是网速视图的东西），结果面板停在内存/温度/AI
+    /// 视图时，鼠标划过去一点反应都没有——用户看到的正是「悬停看进程无效了」。
+    /// 现在任何视图都给热区：上面那行看上传、下面那行看下载，视图只影响画什么字。
+    pub fn row_hot_rect(&self, index: usize) -> Option<RECT> {
+        if index > 1 {
             return None;
         }
 

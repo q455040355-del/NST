@@ -1694,9 +1694,10 @@ fn update_hover_hint(hwnd: HWND) {
         }
     }
 
-    // 上传（第 0 行）/ 下载（第 1 行）：只有网速视图才有这两行
+    // 上面那行 = 上传，下面那行 = 下载。任何视图都生效：
+    // 面板停在内存/温度/AI 视图时以前整块都没热区，鼠标划过去毫无反应
     for (index, up) in [(0usize, true), (1usize, false)] {
-        let Some(zone) = panel.speed_row_hot_rect(index) else {
+        let Some(zone) = panel.row_hot_rect(index) else {
             continue;
         };
         if inside(&zone, cursor) {

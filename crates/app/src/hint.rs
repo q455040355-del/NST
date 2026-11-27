@@ -484,12 +484,25 @@ pub unsafe fn show(anchor: RECT, hint: &Hint) {
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
     HINT = hwnd;
+    crate::debug_log(&format!("hint: 新建 {hwnd:?} tag={:?} rect=({left},{top}) {width}x{height}", hint.tag));
 }
 
 pub fn hide() {
     unsafe {
-        if !HINT.is_null() && IsWindow(HINT) != 0 {
-            DestroyWindow(HINT);
+        let current_hint = HINT;
+        if !current_hint.is_null() {
+            // 只在真的有一个气泡可收时记一行：鼠标停在面板上时每拍都会调到这里，
+            // 空收不能刷屏
+            crate::debug_log(&format!("hint: hide {current_hint:?}"));
+        }
+        if !current_hint.is_null() && IsWindow(current_hint) != 0 {
+            let ok = DestroyWindow(current_hint);
+            if ok == 0 {
+                crate::debug_log(&format!(
+                    "hint: DestroyWindow 失败 {current_hint:?} err={}",
+                    windows_sys::Win32::Foundation::GetLastError()
+                ));
+            }
         }
         HINT = std::ptr::null_mut();
     }
