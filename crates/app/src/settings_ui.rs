@@ -192,6 +192,14 @@ impl Drop for Fonts {
     }
 }
 
+/// NST_TIMING=1 时把打开设置窗 / 首帧的耗时写进调试日志（排查「打开慢」用）。
+///
+/// 绘制路径上每帧都会问一次，所以读一次就缓存，别每帧去碰环境变量。
+fn timing() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("NST_TIMING").is_some())
+}
+
 fn font(points: f32, weight: i32, scale: f32) -> HFONT {
     let height = -((points * scale * 96.0 / 72.0).round() as i32);
     unsafe {
@@ -489,6 +497,22 @@ struct State {
     popup: HWND,
     /// 弹出的下拉是第几行（0 = 没开）——只高亮那一行，别让四个下拉一起变灰
     popup_row: usize,
+}
+
+/// 双缓冲是裸 GDI 句柄，`Box<State>` 析构不会替你回收。
+///
+/// 不删的话每开一次设置窗就漏掉一个内存 DC + 一张整窗 DIB（150% 缩放下约 4.4 MB），
+/// 实测开/关 10 次：GDI 句柄 56 → 76、私有内存 52 MB → 96 MB。面板是长期驻留的进程，
+/// 漏得越多创建窗口/绘屏越慢，最后连整个桌面都发涩 —— 所以必须在这里收尾。
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some((dc, dib)) = self.back.take() {
+            unsafe {
+                DeleteObject(dib as *mut _);
+                DeleteDC(dc);
+            }
+        }
+    }
 }
 
 struct Layout {
@@ -952,6 +976,7 @@ unsafe fn paint(hwnd: HWND) {
 
 /// 把界面画到任意 DC（窗口的 WM_PAINT、WM_PRINTCLIENT、离屏预览共用）
 unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
+    let frame_start = timing().then(std::time::Instant::now);
     let c = crate::theme::ui();
 
     // 尺寸没变就复用上一帧的缓冲；变了才重建
@@ -2154,6 +2179,16 @@ unsafe fn paint_into(hdc: HDC, state: &mut State, client: RECT) {
 
     // 提交（缓冲是常驻的，由 state.back 管，这里不能删）
     BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+
+    if let Some(start) = frame_start {
+        PAINTS.with(|cell| {
+            let n = cell.get();
+            cell.set(n.saturating_add(1));
+            if n < 4 {
+                crate::debug_log(&format!("settings paint#{n} {}us", start.elapsed().as_micros()));
+            }
+        });
+    }
 }
 
 const DT_CENTER_ALIGN: u32 = 0x0001;
@@ -2582,6 +2617,18 @@ unsafe fn open_popup(settings: HWND, row: usize, models_mode: bool) {
 
 pub fn open(parent: HWND, settings: &Settings) {
     unsafe {
+        // NST_TIMING=1 时把打开设置窗各阶段的耗时写进日志（排查「打开慢」用）
+        let trace = timing();
+        let t0 = std::time::Instant::now();
+        let mark = |label: &str| {
+            if trace {
+                crate::debug_log(&format!(
+                    "settings open[{label}] {}us",
+                    t0.elapsed().as_micros()
+                ));
+            }
+        };
+
         // 已经开着就提到前面（同一时间只允许一个）
         let mut found: HWND = std::ptr::null_mut();
         EnumThreadWindows(
@@ -2633,6 +2680,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             .into_iter()
             .map(|adapter| adapter.alias)
             .collect();
+        mark("adapters");
 
         let gauge = GAUGE_OPTIONS
             .iter()
@@ -2741,6 +2789,7 @@ pub fn open(parent: HWND, settings: &Settings) {
             popup: std::ptr::null_mut(),
             popup_row: 0,
         }));
+        mark("state+fonts");
 
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -2766,17 +2815,22 @@ pub fn open(parent: HWND, settings: &Settings) {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         (*state).hwnd = hwnd;
         LAST_HWND.with(|cell| cell.set(hwnd as isize));
+        mark("create");
         round_corners(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         SetFocus(hwnd);
+        mark("show");
         UpdateWindow(hwnd);
+        mark("first-paint");
     }
 }
 
 thread_local! {
     /// 最近一次打开的设置窗（离屏预览用）
     static LAST_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// 已经画过几帧（NST_TIMING 只记最前面几帧，别刷日志）
+    static PAINTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// 最近一次打开的设置窗句柄
